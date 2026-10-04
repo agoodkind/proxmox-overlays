@@ -1,14 +1,37 @@
-From eefd811cd279787afb1bd99fe59aefce043e3df0 Mon Sep 17 00:00:00 2001
-From: Alexander Goodkind <alex@goodkind.io>
-Date: Sat, 3 Oct 2026 21:57:19 -0700
-Subject: [PATCH] Add Sys.ACME.Account permission checks to ACME account API
- methods
-
-Co-authored-by: Claude <noreply@anthropic.com>
----
- PVE/API2/ACMEAccount.pm | 46 +++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 44 insertions(+), 2 deletions(-)
-
+diff --git a/PVE/API2/ACME.pm b/PVE/API2/ACME.pm
+index a948a72a..d5e65a38 100644
+--- a/PVE/API2/ACME.pm
++++ b/PVE/API2/ACME.pm
+@@ -160,7 +160,8 @@ __PACKAGE__->register_method({
+     path => 'certificate',
+     method => 'POST',
+     permissions => {
+-        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
++        check =>
++            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Order'], any => 1],
+     },
+     description => "Order a new certificate from ACME-compatible CA.",
+     protected => 1,
+@@ -232,7 +233,8 @@ __PACKAGE__->register_method({
+     path => 'certificate',
+     method => 'PUT',
+     permissions => {
+-        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
++        check =>
++            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Renew'], any => 1],
+     },
+     description => "Renew existing certificate from CA.",
+     protected => 1,
+@@ -319,7 +321,8 @@ __PACKAGE__->register_method({
+     path => 'certificate',
+     method => 'DELETE',
+     permissions => {
+-        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
++        check =>
++            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Revoke'], any => 1],
+     },
+     description => "Revoke existing certificate from CA.",
+     protected => 1,
 diff --git a/PVE/API2/ACMEAccount.pm b/PVE/API2/ACMEAccount.pm
 index 86946ec6..2023cc31 100644
 --- a/PVE/API2/ACMEAccount.pm
@@ -116,8 +139,280 @@ index 86946ec6..2023cc31 100644
      protected => 1,
      parameters => {
          additionalProperties => 0,
-
-base-commit: 58350116c198b838dfb50739e886bc92bcc751c3
--- 
-2.55.0
-
+diff --git a/PVE/API2/ACMEPlugin.pm b/PVE/API2/ACMEPlugin.pm
+index 2f210903..0b780254 100644
+--- a/PVE/API2/ACMEPlugin.pm
++++ b/PVE/API2/ACMEPlugin.pm
+@@ -10,13 +10,44 @@ use PVE::ACME::Challenge;
+ use PVE::ACME::DNSChallenge;
+ use PVE::ACME::StandAlone;
+ use PVE::Cluster qw(cfs_read_file cfs_write_file cfs_register_file cfs_lock_file);
++use PVE::Exception qw(raise_perm_exc);
+ use PVE::JSONSchema qw(register_standard_option get_standard_option);
++use PVE::RPCEnvironment;
+ use PVE::Tools qw(extract_param);
+ 
+ use base qw(PVE::RESTHandler);
+ 
+ my $plugin_config_file = "priv/acme/plugins.cfg";
+ 
++# The plugin property with the DNS API credentials.
++my $secret_property = 'data';
++
++# Sys.Modify on / grants every plugin operation. Each Sys.ACME.Plugin privilege
++# grants one operation on one plugin through /acme/plugins/<id>.
++my $has_plugin_privilege = sub {
++    my ($pluginid, $privilege) = @_;
++
++    my $rpcenv = PVE::RPCEnvironment::get();
++    my $authuser = $rpcenv->get_user();
++
++    return 1 if $authuser eq 'root@pam';
++    return 1 if $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
++    return $rpcenv->check($authuser, "/acme/plugins/$pluginid", [$privilege], 1);
++};
++
++my $assert_plugin_privilege = sub {
++    my ($pluginid, $privilege) = @_;
++
++    raise_perm_exc("/acme/plugins/$pluginid, $privilege")
++        if !$has_plugin_privilege->($pluginid, $privilege);
++};
++
++my $plugin_permissions = {
++    description => "Requires Sys.Modify on / or the Sys.ACME.Plugin privilege for the"
++        . " operation on /acme/plugins/<id>.",
++    user => 'all',
++};
++
+ cfs_register_file(
+     $plugin_config_file,
+     sub { PVE::ACME::Challenge->parse_config(@_); },
+@@ -47,6 +78,9 @@ my $modify_cfg_for_api = sub {
+     $plugin_cfg->{plugin} = $pluginid;
+     $plugin_cfg->{digest} = $cfg->{digest};
+ 
++    delete $plugin_cfg->{$secret_property}
++        if !$has_plugin_privilege->($pluginid, 'Sys.ACME.Plugin.Secret.Audit');
++
+     return $plugin_cfg;
+ };
+ 
+@@ -67,7 +101,9 @@ __PACKAGE__->register_method({
+     path => '',
+     method => 'GET',
+     permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
++        description => "Only plugins where the user has Sys.Modify on / or"
++            . " Sys.ACME.Plugin.Audit on /acme/plugins/<id> are listed.",
++        user => 'all',
+     },
+     description => "ACME plugin index.",
+     protected => 1,
+@@ -94,6 +130,7 @@ __PACKAGE__->register_method({
+ 
+         my $res = [];
+         foreach my $pluginid (keys %{ $cfg->{ids} }) {
++            next if !$has_plugin_privilege->($pluginid, 'Sys.ACME.Plugin.Audit');
+             my $plugin_cfg = $modify_cfg_for_api->($cfg, $pluginid);
+             next if $param->{type} && $param->{type} ne $plugin_cfg->{type};
+             push @$res, $plugin_cfg;
+@@ -108,9 +145,7 @@ __PACKAGE__->register_method({
+     path => '{id}',
+     method => 'GET',
+     description => "Get ACME plugin configuration.",
+-    permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
+-    },
++    permissions => $plugin_permissions,
+     protected => 1,
+     parameters => {
+         additionalProperties => 0,
+@@ -122,6 +157,8 @@ __PACKAGE__->register_method({
+     code => sub {
+         my ($param) = @_;
+ 
++        $assert_plugin_privilege->($param->{id}, 'Sys.ACME.Plugin.Audit');
++
+         my $cfg = load_config();
+         return $modify_cfg_for_api->($cfg, $param->{id});
+     },
+@@ -132,9 +169,7 @@ __PACKAGE__->register_method({
+     path => '',
+     method => 'POST',
+     description => "Add ACME plugin configuration.",
+-    permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
+-    },
++    permissions => $plugin_permissions,
+     protected => 1,
+     parameters => $acme_challenge_create_schema,
+     returns => {
+@@ -146,6 +181,10 @@ __PACKAGE__->register_method({
+         my $id = extract_param($param, 'id');
+         my $type = extract_param($param, 'type');
+ 
++        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Create');
++        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Secret.Modify')
++            if defined($param->{$secret_property});
++
+         cfs_lock_file(
+             $plugin_config_file,
+             undef,
+@@ -173,9 +212,7 @@ __PACKAGE__->register_method({
+     path => '{id}',
+     method => 'PUT',
+     description => "Update ACME plugin configuration.",
+-    permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
+-    },
++    permissions => $plugin_permissions,
+     protected => 1,
+     parameters => PVE::ACME::Challenge->updateSchema(),
+     returns => {
+@@ -188,6 +225,16 @@ __PACKAGE__->register_method({
+         my $delete = extract_param($param, 'delete');
+         my $digest = extract_param($param, 'digest');
+ 
++        # A request that changes the credentials needs the secret privilege. A
++        # request that changes another property, or no property, needs the
++        # modify privilege.
++        my @changed_properties = (keys %$param, PVE::Tools::split_list($delete // ''));
++        my $changes_secret = grep { $_ eq $secret_property } @changed_properties;
++        my $changes_other = grep { $_ ne $secret_property } @changed_properties;
++        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Secret.Modify') if $changes_secret;
++        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Modify')
++            if $changes_other || !$changes_secret;
++
+         cfs_lock_file(
+             $plugin_config_file,
+             undef,
+@@ -230,9 +277,7 @@ __PACKAGE__->register_method({
+     path => '{id}',
+     method => 'DELETE',
+     description => "Delete ACME plugin configuration.",
+-    permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
+-    },
++    permissions => $plugin_permissions,
+     protected => 1,
+     parameters => {
+         additionalProperties => 0,
+@@ -248,6 +293,8 @@ __PACKAGE__->register_method({
+ 
+         my $id = extract_param($param, 'id');
+ 
++        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Remove');
++
+         cfs_lock_file(
+             $plugin_config_file,
+             undef,
+diff --git a/PVE/API2/NodeConfig.pm b/PVE/API2/NodeConfig.pm
+index cc726dac..f0b774ad 100644
+--- a/PVE/API2/NodeConfig.pm
++++ b/PVE/API2/NodeConfig.pm
+@@ -3,12 +3,40 @@ package PVE::API2::NodeConfig;
+ use strict;
+ use warnings;
+ 
++use PVE::Exception qw(raise_perm_exc);
+ use PVE::JSONSchema qw(get_standard_option);
+ use PVE::NodeConfig;
++use PVE::RPCEnvironment;
+ use PVE::Tools qw(extract_param);
+ 
+ use base qw(PVE::RESTHandler);
+ 
++my $acme_domain_key_re = qr/^acmedomain\d+$/;
++
++# Returns the scoped privilege that authorizes a change to one node config key,
++# or undef for a key that only Sys.Modify on / may change.
++my $acme_key_privilege = sub {
++    my ($key, $is_delete) = @_;
++
++    return 'Sys.ACME.Config.Account.Modify' if $key eq 'acme';
++    return undef if $key !~ $acme_domain_key_re;
++    return $is_delete ? 'Sys.ACME.Config.Domain.Remove' : 'Sys.ACME.Config.Domain.Modify';
++};
++
++# Checks a request from a user without Sys.Modify on /. Every changed key must
++# be an ACME key, and the user needs the scoped privilege for that change on
++# the node.
++my $check_scoped_change = sub {
++    my ($rpcenv, $authuser, $node, $set_keys, $deleted_keys) = @_;
++
++    raise_perm_exc("/, Sys.Modify") if !@$set_keys && !@$deleted_keys;
++
++    for my $change ((map { [$_, 0] } @$set_keys), (map { [$_, 1] } @$deleted_keys)) {
++        my $privilege = $acme_key_privilege->(@$change) // raise_perm_exc("/, Sys.Modify");
++        $rpcenv->check($authuser, "/nodes/$node", [$privilege]);
++    }
++};
++
+ my $node_config_schema = PVE::NodeConfig::get_nodeconfig_schema();
+ my $node_config_keys = [sort keys %$node_config_schema];
+ my $node_config_return_properties = {
+@@ -38,7 +66,9 @@ __PACKAGE__->register_method({
+     method => 'GET',
+     description => "Get node configuration options.",
+     permissions => {
+-        check => ['perm', '/', ['Sys.Audit']],
++        description => "Requires Sys.Audit on /. With Sys.ACME.Config.Audit on"
++            . " /nodes/{node}, only the 'acme' and 'acmedomain' options are returned.",
++        user => 'all',
+     },
+     proxyto => 'node',
+     parameters => {
+@@ -61,7 +91,23 @@ __PACKAGE__->register_method({
+     code => sub {
+         my ($param) = @_;
+ 
+-        my $config = PVE::NodeConfig::load_config($param->{node});
++        my $rpcenv = PVE::RPCEnvironment::get();
++        my $authuser = $rpcenv->get_user();
++        my $node = $param->{node};
++
++        my $reads_all_keys =
++            $authuser eq 'root@pam' || $rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
++        $rpcenv->check($authuser, "/nodes/$node", ['Sys.ACME.Config.Audit'])
++            if !$reads_all_keys;
++
++        my $config = PVE::NodeConfig::load_config($node);
++
++        if (!$reads_all_keys) {
++            for my $key (keys %$config) {
++                next if $key eq 'digest' || $key eq 'acme' || $key =~ $acme_domain_key_re;
++                delete $config->{$key};
++            }
++        }
+ 
+         if (defined(my $prop = $param->{property})) {
+             return {} if !exists $config->{$prop};
+@@ -78,7 +124,10 @@ __PACKAGE__->register_method({
+     method => 'PUT',
+     description => "Set node configuration options.",
+     permissions => {
+-        check => ['perm', '/', ['Sys.Modify']],
++        description => "Requires Sys.Modify on /. A request that changes only 'acme' and"
++            . " 'acmedomain' options requires the matching Sys.ACME.Config privilege on"
++            . " /nodes/{node}.",
++        user => 'all',
+     },
+     protected => 1,
+     proxyto => 'node',
+@@ -94,6 +143,15 @@ __PACKAGE__->register_method({
+         my $node = extract_param($param, 'node');
+         my $digest = extract_param($param, 'digest');
+ 
++        my $rpcenv = PVE::RPCEnvironment::get();
++        my $authuser = $rpcenv->get_user();
++        my $changes_all_keys =
++            $authuser eq 'root@pam' || $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
++        if (!$changes_all_keys) {
++            my $deleted_keys = [PVE::Tools::split_list($delete // '')];
++            $check_scoped_change->($rpcenv, $authuser, $node, [keys %$param], $deleted_keys);
++        }
++
+         my $code = sub {
+             my $conf = PVE::NodeConfig::load_config($node);
+ 
