@@ -1,0 +1,29 @@
+diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
+index f199371d..00edea8c 100644
+--- a/src/PVE/QemuServer.pm
++++ b/src/PVE/QemuServer.pm
+@@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
+ NOTE: this option is for experts only.
+ EODESCR
+     },
++    vsock => {
++        optional => 1,
++        type => 'boolean',
++        description => "Enable a virtio vsock device with the VM ID as its guest CID.",
++        default => 0,
++    },
+     tablet => {
+         optional => 1,
+         type => 'boolean',
+@@ -3297,6 +3303,11 @@ sub config_to_command {
+         push @$devices, '-device', 'vmgenid,guid=' . $conf->{vmgenid};
+     }
+ 
++    if ($conf->{vsock}) {
++        push @$devices, '-device',
++            "vhost-vsock-pci,id=vsock0,guest-cid=$vmid" . print_pci_addr('vsock', $arch);
++    }
++
+     # add usb controllers
+     my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
+     push @$devices, @usbcontrollers if @usbcontrollers;
