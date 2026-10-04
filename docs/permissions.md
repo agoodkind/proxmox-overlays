@@ -13,16 +13,39 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.ACME.Account.Create` | `/acme/accounts/<name>` | Register an ACME account with that name |
 | `Sys.ACME.Account.Modify` | `/acme/accounts/<name>` | Update or refresh one ACME account |
 | `Sys.ACME.Account.Remove` | `/acme/accounts/<name>` | Deactivate and delete one ACME account |
+| `Sys.ACME.Plugin.Audit` | `/acme/plugins/<id>` | Read one plugin without its credentials and see it in the plugin list |
+| `Sys.ACME.Plugin.Secret.Audit` | `/acme/plugins/<id>` | Read the `data` option of one plugin, which stores the DNS API credentials |
+| `Sys.ACME.Plugin.Create` | `/acme/plugins/<id>` | Add a plugin with that id |
+| `Sys.ACME.Plugin.Modify` | `/acme/plugins/<id>` | Change every plugin option except `data` |
+| `Sys.ACME.Plugin.Secret.Modify` | `/acme/plugins/<id>` | Set, replace, or delete the `data` option of one plugin |
+| `Sys.ACME.Plugin.Remove` | `/acme/plugins/<id>` | Delete one plugin |
+| `Sys.ACME.Certificate.Order` | `/nodes/<node>` | Order a node certificate |
+| `Sys.ACME.Certificate.Renew` | `/nodes/<node>` | Renew the node certificate |
+| `Sys.ACME.Certificate.Revoke` | `/nodes/<node>` | Revoke the node certificate |
+| `Sys.ACME.Config.Audit` | `/nodes/<node>` | Read the `acme` and `acmedomain<n>` options of the node config |
+| `Sys.ACME.Config.Account.Modify` | `/nodes/<node>` | Set or delete the `acme` option of the node config |
+| `Sys.ACME.Config.Domain.Modify` | `/nodes/<node>` | Set an `acmedomain<n>` option of the node config |
+| `Sys.ACME.Config.Domain.Remove` | `/nodes/<node>` | Delete an `acmedomain<n>` option of the node config |
 
 ## ACL paths
 
 | Path | Scope |
 | --- | --- |
-| `/acme` | Every ACME account, with propagation |
+| `/acme` | Every ACME account and plugin, with propagation |
 | `/acme/accounts` | Every ACME account, with propagation |
 | `/acme/accounts/<name>` | One ACME account |
+| `/acme/plugins` | Every ACME plugin, with propagation |
+| `/acme/plugins/<id>` | One ACME plugin |
 
-An account name starts with a letter and continues with one or more letters, digits, `_`, or `-`. The access control module rejects every other path under `/acme`.
+An account name or plugin id starts with a letter and continues with one or more letters, digits, `_`, or `-`. The access control module rejects every other path under `/acme`.
+
+## ACME plugins, certificates, and node options
+
+`Sys.Modify` grants the same operations as before: on `/` for plugins and node options, and on `/nodes/<node>` for certificates. `Sys.Audit` on `/` still reads the whole node config.
+
+A plugin request needs one privilege for each kind of change. A `POST` or `PUT` that sets `data` needs `Sys.ACME.Plugin.Secret.Modify` in addition to `Create` or `Modify`. A `PUT` that changes only `data` needs only `Sys.ACME.Plugin.Secret.Modify`.
+
+A node config request from a user without `Sys.Modify` on `/` may change only `acme` and `acmedomain<n>` options. One other option in the request fails the whole request.
 
 ## Container feature flags
 
@@ -63,7 +86,7 @@ Container creation and restore use the same `features` check with no stored flag
 | `PUT` | `/cluster/acme/account/{name}` | `Sys.ACME.Account.Modify` on `/acme/accounts/{name}` |
 | `DELETE` | `/cluster/acme/account/{name}` | `Sys.ACME.Account.Remove` on `/acme/accounts/{name}` |
 
-`root@pam` passes every check. The overlay changes no other ACME method. DNS plugin methods require `Sys.Modify` on `/`. Certificate order, renewal, and revocation require `Sys.Modify` on `/nodes/{node}`.
+`root@pam` passes every check. An account privilege grants no plugin, certificate, or node option operation.
 
 ## Tokens
 

@@ -10,12 +10,15 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - `VM.Config.Keyctl` changes the `keyctl` flag of a container.
 - `VM.Config.Vsock` enables a virtio vsock device on a VM. The guest CID equals the VM ID.
 - `Sys.ACME.Account.Audit`, `Create`, `Modify`, and `Remove` read, register, update, and remove one named ACME account.
+- Six `Sys.ACME.Plugin` privileges read, add, change, and delete one DNS plugin. The stored credentials have one privilege for reads and one for writes.
+- `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.
+- Four `Sys.ACME.Config` privileges read and change only the ACME options of one node.
 
 The [permission reference](docs/permissions.md) lists the ACL path and the API method for each privilege.
 
 ## How it works
 
-The `patches` directory has one patch for each of four Proxmox components: `pve-access-control`, `pve-container`, `qemu-server`, and `pve-manager`. Each patch is the signed commit on the `overlays` branch of the `agoodkind` fork of that component. The patch header records the fork commit, and the last lines record the upstream base commit. Together the patches change seven Perl modules.
+The `patches` directory has one patch for each of four Proxmox components: `pve-access-control`, `pve-container`, `qemu-server`, and `pve-manager`. Each patch is the diff between the upstream base commit and the head of the `overlays` branch in the `agoodkind` fork of that component. Together the patches change ten Perl modules.
 
 `pve-overlay` reads each packaged module from `/usr/share/perl5`, applies the patch, and writes the result to `/etc/perl`. Debian Perl searches `/etc/perl` before `/usr/share/perl5`, also in taint mode. Every Proxmox service and command loads the patched copy. `pve-overlay` does not write to packaged files.
 
@@ -51,4 +54,4 @@ The `drift` workflow runs daily, on each pull request, and on each push to `main
 
 The packages are installed in a container image in GHCR, built from `image/Dockerfile`. The image tag includes a hash of the Proxmox package index. The workflow builds a new image only when Proxmox publishes a package.
 
-To update a patch after a rebase, run `git format-patch -1 --base=<upstream commit> --output=<patch file>` on the `overlays` branch of the fork.
+To update a patch, run `git diff <upstream base commit> HEAD --output=<patch file>` on the `overlays` branch of the fork.
