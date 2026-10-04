@@ -217,13 +217,21 @@ sub command_compile {
     for my $module (read_module_diffs()) {
         my $relative_path = $module->{relative_path};
         my $target_path = "$target_dir/$relative_path";
-        my $program = 'require $ARGV[0]; print $INC{$ARGV[0]}';
-        my $loaded_path = qx{$^X -T -e '$program' $relative_path};
+        # Taint mode rejects a module path from the command line. The program
+        # text includes the path instead.
+        my $program = "require q{$relative_path}; print \$INC{q{$relative_path}}";
+        my $loaded_path = qx{$^X -T -e '$program'};
         die "pve-overlay: $relative_path does not compile\n" if $? != 0;
         die "pve-overlay: Perl loaded $loaded_path instead of $target_path\n"
             if $loaded_path ne $target_path;
         print "compiled $target_path\n";
     }
+}
+
+# The drift check: writes the patched copies, then loads each one.
+sub command_verify {
+    command_apply();
+    command_compile();
 }
 
 sub usage {
@@ -235,6 +243,7 @@ usage: pve-overlay <command> [options]
   status   compare the patched copies with the packaged modules
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process
+  verify   run apply, then compile
 
   --source-root DIR  read packaged modules below DIR instead of /
   --target-dir DIR   write patched copies to DIR instead of $DEFAULT_TARGET_DIR
@@ -257,6 +266,7 @@ my %commands = (
     status => \&command_status,
     check => \&command_check,
     compile => \&command_compile,
+    verify => \&command_verify,
 );
 my $handler = $commands{$command} or usage();
 

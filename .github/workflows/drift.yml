@@ -1,7 +1,11 @@
 name: drift
 
-# Applies the patches to the newest published Proxmox VE packages and compiles
+# Applies the patches to the newest published Proxmox VE packages and loads
 # the patched modules. A failure means a patch no longer fits a release.
+#
+# The Proxmox packages are installed in a container image in GHCR. The image
+# tag includes a hash of the Proxmox package index, and the job builds a new
+# image only when Proxmox publishes a package.
 
 on:
   pull_request:
@@ -13,37 +17,48 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   drift:
+    name: drift (${{ matrix.component }})
     runs-on: ubuntu-24.04
-    container: debian:trixie
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         component: [pve-no-subscription, pve-test]
     env:
-      DEBIAN_FRONTEND: noninteractive
       PVE_COMPONENT: ${{ matrix.component }}
-      PVE_KEYRING: /usr/share/keyrings/proxmox-archive-keyring.gpg
+      IMAGE: ghcr.io/${{ github.repository }}/pve
     steps:
       - uses: actions/checkout@v4
-      - name: Install the newest Proxmox VE packages
+      - name: Hash the Proxmox package index
+        id: index
         run: |
-          apt-get update
-          apt-get install --yes --no-install-recommends ca-certificates curl
-          curl --fail --silent --show-error --location --output "$PVE_KEYRING" \
-            https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg
-          echo "deb [signed-by=$PVE_KEYRING] http://download.proxmox.com/debian/pve trixie $PVE_COMPONENT" \
-            > /etc/apt/sources.list.d/pve.list
-          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
-          chmod 0755 /usr/sbin/policy-rc.d
-          apt-get update
-          apt-get install --yes --no-install-recommends pve-manager
+          index_url="http://download.proxmox.com/debian/pve/dists/trixie/$PVE_COMPONENT/binary-amd64/Packages.gz"
+          index_hash="$(curl --fail --silent --show-error --location "$index_url" | sha256sum | cut -c1-16)"
+          echo "tag=$PVE_COMPONENT-$index_hash" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the image for this package index, or build and push it
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: |
+          if docker pull "$IMAGE:$TAG"; then
+            echo "reused $IMAGE:$TAG"
+          else
+            docker build --build-arg "PVE_COMPONENT=$PVE_COMPONENT" --tag "$IMAGE:$TAG" image
+            docker push "$IMAGE:$TAG"
+          fi
       - name: Show the package versions
-        run: dpkg-query --show pve-manager qemu-server pve-container libpve-access-control
-      - name: Apply the patches to the packaged modules
-        run: ./pve-overlay apply --no-system
-      - name: Load the patched modules in taint mode
-        run: ./pve-overlay compile
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: docker run --rm "$IMAGE:$TAG" dpkg-query --show pve-manager qemu-server pve-container libpve-access-control
+      - name: Apply the patches and load the patched modules
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" /overlay/pve-overlay verify --no-system
