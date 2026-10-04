@@ -1,9 +1,0 @@
-# Component forks that the patches derive from.
-# Columns: package, fork repository, upstream repository, upstream base commit,
-# signed fork commit. Separate columns with one tab.
-# Each patch is the diff of one module between the base commit and the fork
-# commit.
-libpve-access-control	https://github.com/agoodkind/pve-access-control	https://git.proxmox.com/git/pve-access-control.git	dff26b458651b4e1141ff0a41a296d2904b16228	9c4a75d6ee55b3bc7b79328cbb0e2fbdc1c363e6
-pve-container	https://github.com/agoodkind/pve-container	https://git.proxmox.com/git/pve-container.git	de0ddd657525ef5c4bb0fd5783d0f585aa9034c1	aaf46f09b1c644f615a84e2eca79672e4fc4f438
-qemu-server	https://github.com/agoodkind/qemu-server	https://git.proxmox.com/git/qemu-server.git	a7b4240bba1dd493d6c76daad1e70af62b2ebcc8	0fd4687a520db523e0c2df8180e3fc1743ae505c
-pve-manager	https://github.com/agoodkind/pve-manager	https://git.proxmox.com/git/pve-manager.git	58350116c198b838dfb50739e886bc92bcc751c3	eefd811cd279787afb1bd99fe59aefce043e3df0

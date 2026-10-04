@@ -1,3 +1,28 @@
+From aaf46f09b1c644f615a84e2eca79672e4fc4f438 Mon Sep 17 00:00:00 2001
+From: Alexander Goodkind <alex@goodkind.io>
+Date: Sat, 3 Oct 2026 21:57:16 -0700
+Subject: [PATCH] Authorize container nesting and keyctl changes with
+ VM.Config.Nesting and VM.Config.Keyctl in check_ct_modify_config_perm
+
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ src/PVE/API2/LXC/Config.pm |   2 +
+ src/PVE/LXC.pm             | 110 +++++++++++++++++++++++--------------
+ 2 files changed, 71 insertions(+), 41 deletions(-)
+
+diff --git a/src/PVE/API2/LXC/Config.pm b/src/PVE/API2/LXC/Config.pm
+index 805eac0..6263034 100644
+--- a/src/PVE/API2/LXC/Config.pm
++++ b/src/PVE/API2/LXC/Config.pm
+@@ -106,6 +106,8 @@ my $vm_config_perm_list = [
+     'VM.Config.Memory',
+     'VM.Config.Network',
+     'VM.Config.Options',
++    'VM.Config.Nesting',
++    'VM.Config.Keyctl',
+ ];
+ 
+ __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
 index dee073d..e794285 100644
 --- a/src/PVE/LXC.pm
@@ -130,3 +155,8 @@ index dee073d..e794285 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
+
+base-commit: de0ddd657525ef5c4bb0fd5783d0f585aa9034c1
+-- 
+2.55.0
+

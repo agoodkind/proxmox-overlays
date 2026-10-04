@@ -1,3 +1,14 @@
+From eefd811cd279787afb1bd99fe59aefce043e3df0 Mon Sep 17 00:00:00 2001
+From: Alexander Goodkind <alex@goodkind.io>
+Date: Sat, 3 Oct 2026 21:57:19 -0700
+Subject: [PATCH] Add Sys.ACME.Account permission checks to ACME account API
+ methods
+
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ PVE/API2/ACMEAccount.pm | 46 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
 diff --git a/PVE/API2/ACMEAccount.pm b/PVE/API2/ACMEAccount.pm
 index 86946ec6..2023cc31 100644
 --- a/PVE/API2/ACMEAccount.pm
@@ -105,3 +116,8 @@ index 86946ec6..2023cc31 100644
      protected => 1,
      parameters => {
          additionalProperties => 0,
+
+base-commit: 58350116c198b838dfb50739e886bc92bcc751c3
+-- 
+2.55.0
+

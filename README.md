@@ -15,7 +15,7 @@ The [permission reference](docs/permissions.md) lists the ACL path and the API m
 
 ## How it works
 
-The `patches` directory has one patch for each of seven Proxmox Perl modules. The patches come from signed commits on the `overlays` branch of four forks. `components.list` records each fork, the upstream base commit, and the fork commit.
+The `patches` directory has one patch for each of four Proxmox components: `pve-access-control`, `pve-container`, `qemu-server`, and `pve-manager`. Each patch is the signed commit on the `overlays` branch of the `agoodkind` fork of that component. The patch header records the fork commit, and the last lines record the upstream base commit. Together the patches change seven Perl modules.
 
 `pve-overlay` reads each packaged module from `/usr/share/perl5`, applies the patch, and writes the result to `/etc/perl`. Debian Perl searches `/etc/perl` before `/usr/share/perl5`, also in taint mode. Every Proxmox service and command loads the patched copy. `pve-overlay` does not write to packaged files.
 
@@ -47,4 +47,4 @@ Both grants are required. The token cannot change another option or another gues
 
 The `drift` workflow runs daily and on each pull request. It installs the newest published Proxmox VE packages from the stable and test repositories, applies the patches, and compiles the patched modules. A failed run means a patch needs a rebase in its fork.
 
-To update a patch after a rebase, record the new commits in `components.list` and run `git diff <base> <commit> -- <module path>` in the fork. Save the output as the patch file.
+To update a patch after a rebase, run `git format-patch -1 --base=<upstream commit> --output=<patch file>` on the `overlays` branch of the fork.
