@@ -13,7 +13,13 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Getopt::Long qw(GetOptions);
 
-my $PATCHES_DIR = dirname(abs_path($0)) . '/patches';
+# The repository has the patches in a directory beside the script. A host has
+# them as flat files in a directory that Debian creates, because the OpenTofu
+# file resource writes a file only into an existing directory.
+my @PATCH_GLOBS = (
+    dirname(abs_path($0)) . '/patches/*.patch',
+    '/usr/local/share/pve-overlay-*.patch',
+);
 my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
@@ -49,14 +55,20 @@ sub write_file {
 # and the diff of that file. Each patch file is the commit of one fork. Files
 # outside PVE/*.pm, such as tests, are not installed and are skipped.
 sub read_module_diffs {
+    my @patch_paths;
+    for my $patch_glob (@PATCH_GLOBS) {
+        @patch_paths = sort glob($patch_glob);
+        last if @patch_paths;
+    }
+
     my @modules;
-    for my $patch_path (sort glob("$PATCHES_DIR/*.patch")) {
+    for my $patch_path (@patch_paths) {
         for my $file_diff (split(/^(?=diff --git )/m, read_file($patch_path))) {
             next if $file_diff !~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/};
             push @modules, { relative_path => $1, diff => $file_diff };
         }
     }
-    die "pve-overlay: $PATCHES_DIR has no module patches\n" if !@modules;
+    die "pve-overlay: no module patches match @PATCH_GLOBS\n" if !@modules;
     return @modules;
 }
 
