@@ -104,12 +104,19 @@ Each method runs in `pvedaemon` as root on the node that hosts the container. Th
 | Method | Path | Requirement |
 | --- | --- | --- |
 | `POST` | `/nodes/{node}/lxc/{vmid}/exec` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/lxc/{vmid}/exec-status` | `VM.Guest.Exec` on `/vms/{vmid}` |
 | `POST` | `/nodes/{node}/lxc/{vmid}/file-write` | `VM.Guest.FileWrite` on `/vms/{vmid}` |
 | `GET` | `/nodes/{node}/lxc/{vmid}/file-read` | `VM.Guest.FileRead` on `/vms/{vmid}` |
 
 `VM.Guest.Exec` runs any program as root in the container and can read or write any file there. The existing `VM.GuestAgent.*` privileges apply to the QEMU guest agent of a VM and do not authorize these methods.
 
-`exec` starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. It returns `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` when an output exceeds 1 MiB. A command that a signal ends returns 128 plus the signal number. `timeout` defaults to 120 seconds and accepts 1 to 3600. After the timeout, `pvedaemon` terminates `lxc-attach` and returns an error.
+`exec` returns `pid` at once and runs the command in a task worker that `pvedaemon` detaches with `fork_worker`. The worker survives the end of the `pvedaemon` process that started it and appears in the task list as `lxcexec`. `pid` is a random number, not a process ID, because a process ID can repeat before a caller reads the result.
+
+The worker starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. `timeout` defaults to 120 seconds and accepts 1 to 3600. After the timeout the worker sends `TERM` to `lxc-attach`, then `KILL` after 5 seconds.
+
+`exec-status` returns `exited: 0` while the command runs. After the command exits, it returns `exited: 1`, `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` when an output exceeds 1 MiB, then deletes the stored result. A command that a signal ends returns 128 plus the signal number. A command that exceeded its timeout returns `exitcode` 124 and `timed-out`. A `pid` that is unknown, already read, or started for another container returns an error.
+
+The worker stores the result in `/run/pve/lxc-exec/<vmid>/<pid>`, which only `root` can read (mode 0700). Each `exec` and `exec-status` call, for any container, deletes results that no caller read within one hour. It also deletes a directory without a status file after two hours.
 
 `file-write` writes the decoded `content` to the absolute path `file` with `tee` in the container and replaces an existing file. `file-read` reads the file with `head` and returns base64 `content`. It sets `truncated` when the file exceeds 4 MiB.
 
