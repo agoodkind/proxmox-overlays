@@ -13,7 +13,7 @@ index 805eac0..2973b92 100644
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..9c010cf 100644
+index dee073d..faaa870 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -694,6 +694,30 @@ sub make_apparmor_config {
@@ -237,7 +237,7 @@ index dee073d..9c010cf 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2532,169 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2438,6 +2532,166 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -252,9 +252,7 @@ index dee073d..9c010cf 100644
 +    attachs => 'delegate_attachs',
 +};
 +
-+# Reads the 'kind=name:name' arguments of the generated lxc.hook.start-host entry and returns
-+# the validated name lists by kind. Other arguments, such as the ones that LXC appends, are
-+# skipped.
++# LXC appends arguments that are not delegation lists. Ignore those arguments.
 +sub parse_bpf_delegate_hook_args {
 +    my (@args) = @_;
 +
@@ -269,10 +267,11 @@ index dee073d..9c010cf 100644
 +    return $lists;
 +}
 +
-+# The bpf fs context must belong to the container user namespace. A child process enters that
-+# namespace and opens the context. The parent keeps the host privileges, configures the
-+# delegate_* options on a duplicate of the context, and mounts the result. The parent forks
-+# first and calls setns only after the mount exists.
++# The BPF filesystem context must use the container's user namespace.
++# The child opens that context after entering the container namespaces.
++# The parent duplicates the descriptor with pidfd_getfd, sets delegate_* options,
++# and creates the mount with host privileges. It enters the container's mount
++# namespace after fsmount succeeds.
 +sub bpf_delegate_mount {
 +    my ($lxc_pid, $lists) = @_;
 +
@@ -303,7 +302,7 @@ index dee073d..9c010cf 100644
 +            my $reply = "fd " . fileno($fs_context) . "\n";
 +            syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
 +
-+            # The parent closes its end of this pipe after it is done with the fs context.
++            # The child must stay alive while the parent uses the filesystem context.
 +            my $unused = <$release_reader>;
 +            $exit_code = 0;
 +        };
@@ -346,11 +345,11 @@ index dee073d..9c010cf 100644
 +        # setns on a mount namespace needs an fs_struct that this process does not share.
 +        PVE::Tools::unshare($CLONE_FS) or die "unshare of the fs_struct failed: $!\n";
 +
-+        # The profile helper does not check the setns result. Without this check, a failed
-+        # setns would mount the bpffs on the host.
++        # Verify the mount namespace after the helper calls setns.
++        # The helper does not report setns failures.
 +        my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
-+        # The lxc-start profile allows a change to a profile named lxc-*. pve-overlay
-+        # installs this profile, which allows the move mount.
++        # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
++        # The lxc-pve-overlay-mount profile permits the BPF mount operation.
 +        $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
 +        my ($current_dev, $current_ino) = (stat('/proc/self/ns/mnt'))[0, 1];
 +        die "failed to enter the container mount namespace\n"
@@ -373,11 +372,9 @@ index dee073d..9c010cf 100644
 +    return;
 +}
 +
-+# Runs as lxc.hook.start-host. The arguments are the container ID and one 'kind=name:name'
-+# argument for each list that the bpfdelegate option sets. The hook mounts a bpffs with the
-+# delegate_* options at /sys/fs/bpf in the container. A failure appends a line to
-+# /run/pve/ct-<vmid>.warnings, which the start task prints, and makes the hook exit with
-+# status 1.
++# lxc.hook.start-host invokes this entry point with the container ID and configured lists.
++# A failure prints to stderr, attempts to append /run/pve/ct-<vmid>.warnings,
++# and exits with status 1.
 +sub bpf_delegate_start_host {
 +    my ($vmid, @args) = @_;
 +
@@ -408,7 +405,7 @@ index dee073d..9c010cf 100644
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
-index 3eb1905..65b22ec 100644
+index 3eb1905..1d63c28 100644
 --- a/src/PVE/LXC/Config.pm
 +++ b/src/PVE/LXC/Config.pm
 @@ -6,6 +6,7 @@ use warnings;
@@ -419,7 +416,7 @@ index 3eb1905..65b22ec 100644
  use PVE::Cluster qw(cfs_register_file);
  use PVE::DataCenterConfig;
  use PVE::GuestHelpers;
-@@ -510,6 +511,84 @@ my $features_desc = {
+@@ -510,6 +511,81 @@ my $features_desc = {
      },
  };
  
@@ -469,42 +466,39 @@ index 3eb1905..65b22ec 100644
 +        type => 'string',
 +        format => 'pve-lxc-bpf-delegate-cmds',
 +        format_description => 'cmd;cmd;...',
-+        description => "BPF commands that the container may use through a BPF token."
-+            . " Each value is the lowercase name of a bpf_cmd constant without the BPF_ prefix.",
++        description => "The container may execute these BPF commands using a BPF token."
++            . " Use lowercase bpf_cmd constants without the BPF_ prefix.",
 +    },
 +    maps => {
 +        optional => 1,
 +        type => 'string',
 +        format => 'pve-lxc-bpf-delegate-maps',
 +        format_description => 'maptype;maptype;...',
-+        description => "BPF map types that the container may create through a BPF token."
-+            . " Each value is the lowercase name of a bpf_map_type constant without the"
-+            . " BPF_MAP_TYPE_ prefix.",
++        description => "The container may create these BPF map types using a BPF token."
++            . " Use lowercase bpf_map_type constants without the BPF_MAP_TYPE_ prefix.",
 +    },
 +    progs => {
 +        optional => 1,
 +        type => 'string',
 +        format => 'pve-lxc-bpf-delegate-progs',
 +        format_description => 'progtype;progtype;...',
-+        description => "BPF program types that the container may load through a BPF token."
-+            . " Each value is the lowercase name of a bpf_prog_type constant without the"
-+            . " BPF_PROG_TYPE_ prefix.",
++        description => "The container may load these BPF program types using a BPF token."
++            . " Use lowercase bpf_prog_type constants without the BPF_PROG_TYPE_ prefix.",
 +    },
 +    attachs => {
 +        optional => 1,
 +        type => 'string',
 +        format => 'pve-lxc-bpf-delegate-attachs',
 +        format_description => 'attachtype;attachtype;...',
-+        description => "BPF attach types that the container may use through a BPF token."
-+            . " Each value is the lowercase name of a bpf_attach_type constant without the"
-+            . " BPF_ prefix.",
++        description => "The container may use these BPF attach types using a BPF token."
++            . " Use lowercase bpf_attach_type constants without the BPF_ prefix.",
 +    },
 +};
 +
  my $confdesc = {
      lock => {
          optional => 1,
-@@ -694,6 +773,14 @@ my $confdesc = {
+@@ -694,6 +770,14 @@ my $confdesc = {
          format => $features_desc,
          description => "Allow containers access to advanced features.",
      },
@@ -512,14 +506,14 @@ index 3eb1905..65b22ec 100644
 +        optional => 1,
 +        type => 'string',
 +        format => $bpf_delegate_desc,
-+        description => "For unprivileged containers only: mount a bpffs with BPF token"
-+            . " delegation at /sys/fs/bpf when the container starts. Every listed value"
-+            . " needs its own VM.Config.BPFDelegate privilege to change.",
++        description => "Configure BPF token delegation for unprivileged containers."
++            . " The start hook mounts bpffs at /sys/fs/bpf. The API requires the corresponding"
++            . " VM.Config.BPFDelegate privilege for each listed name added or removed.",
 +    },
      env => {
          type => 'string',
          description => 'The container runtime environment as NUL-separated list.'
-@@ -1591,6 +1678,12 @@ sub parse_features {
+@@ -1591,6 +1675,12 @@ sub parse_features {
      return PVE::JSONSchema::parse_property_string($features_desc, $data);
  }
  
@@ -589,10 +583,10 @@ index 0000000..4012b8e
 +acl:1:/vms/100:dave@pve:audit_only:
 diff --git a/src/test/bpfdelegate-test.pl b/src/test/bpfdelegate-test.pl
 new file mode 100755
-index 0000000..2f83469
+index 0000000..a49d6ae
 --- /dev/null
 +++ b/src/test/bpfdelegate-test.pl
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,143 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -635,7 +629,6 @@ index 0000000..2f83469
 +    print "PARSE REJECTED:$value\n";
 +}
 +
-+# A new value of undef deletes the option.
 +sub run_perm_check {
 +    my ($user, $old_value, $new_value, $unprivileged) = @_;
 +
@@ -691,7 +684,6 @@ index 0000000..2f83469
 +check_parse_rejected('maps=prog_load');
 +check_parse_rejected('unknown=hash');
 +
-+# The hook line uses the kernel syntax, which joins the names with ':'.
 +my $conf = { bpfdelegate => $full_value };
 +my $hook_line = PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 1);
 +my $expected_hook_line =
@@ -709,26 +701,22 @@ index 0000000..2f83469
 +eval { PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 0) };
 +die "a privileged container got a hook line\n" if !$@;
 +
-+# Setting the option needs the privilege of every name.
 +check_perm_ok('root@pam', undef, $full_value, 1);
 +check_perm_ok('alice@pve', undef, $full_value, 1);
 +check_perm_denied('bob@pve', undef, $full_value, 1);
 +check_perm_denied('carol@pve', undef, $full_value, 1);
 +check_perm_denied('alice@pve', undef, $full_value, 0);
 +
-+# A name in both the old and the new value needs no privilege.
 +check_perm_ok('bob@pve', $full_value, $full_value, 1);
 +check_perm_ok('carol@pve', $full_value, $full_value, 1);
 +check_perm_ok('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load', 1);
 +check_perm_denied('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load;btf_load', 1);
 +
-+# A removed name needs its privilege, and a delete removes every name.
 +check_perm_denied('bob@pve', 'cmds=prog_load;map_create', 'cmds=prog_load', 1);
 +check_perm_ok('alice@pve', $full_value, undef, 1);
 +check_perm_denied('bob@pve', $full_value, undef, 1);
 +check_perm_ok('bob@pve', 'cmds=prog_load', undef, 1);
 +
-+# The API level check admits a caller with any one privilege of the list.
 +my $method_info = PVE::API2::LXC::Config->map_method_by_name('update_vm');
 +my $api_privileges = $method_info->{permissions}->{check}->[2];
 +for my $user ('bob@pve', 'carol@pve') {

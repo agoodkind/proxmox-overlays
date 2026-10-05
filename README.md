@@ -8,7 +8,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 
 - `VM.Config.Nesting` changes the `nesting` flag of a container.
 - `VM.Config.Keyctl` changes the `keyctl` flag of a container.
-- 164 `VM.Config.BPFDelegate` privileges change the `bpfdelegate` option of an unprivileged container. Each privilege covers one BPF command, map type, program type, or attach type.
+- `VM.Config.BPFDelegate` privileges change the `bpfdelegate` option of an unprivileged container. Each privilege covers one BPF command, map type, program type, or attach type.
 - `VM.Config.Vsock` enables a virtio vsock device on a VM. The guest CID equals the VM ID.
 - `Sys.ACME.Account.Audit`, `Create`, `Modify`, and `Remove` read, register, update, and remove one named ACME account.
 - Six `Sys.ACME.Plugin` privileges read, add, change, and delete one DNS plugin. The stored credentials have one privilege for reads and one for writes.
@@ -19,11 +19,9 @@ The [permission reference](docs/permissions.md) lists the ACL path and the API m
 
 ## How it works
 
-The `patches` directory has one patch for each of four Proxmox components: `pve-access-control`, `pve-container`, `qemu-server`, and `pve-manager`. Each patch is the diff between the upstream base commit and the head of the `overlays` branch in the `agoodkind` fork of that component. Together the patches change eleven Perl modules.
-
 `pve-overlay` reads each packaged module from `/usr/share/perl5`, applies the patch, and writes the result to `/etc/perl`. Debian Perl searches `/etc/perl` before `/usr/share/perl5`, also in taint mode. Every Proxmox service and command loads the patched copy. `pve-overlay` does not write to packaged files.
 
-A patch can also add a host file below `overlay-root/`. `pve-overlay` installs `overlay-root/<path>` at `/<path>` and accepts only paths below `etc/apparmor.d/`. It loads each installed AppArmor profile with `apparmor_parser`.
+`pve-overlay` installs `overlay-root/<path>` at `/<path>`. It rejects host files outside `etc/apparmor.d/` and loads installed profiles with `apparmor_parser`.
 
 A dpkg hook runs `pve-overlay apply` after each package operation. The hook builds new copies from the upgraded modules. When a patch does not apply to an upgraded module, the hook deletes all patched copies and Proxmox runs the packaged modules.
 

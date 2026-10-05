@@ -69,13 +69,15 @@ Container creation and restore use the same `features` check with no stored flag
 
 ## Container BPF delegation
 
-`bpfdelegate` is a property string option of unprivileged containers. The keys `cmds`, `maps`, `progs`, and `attachs` each take a `;` separated list of names. When the container starts, a `lxc.hook.start-host` hook mounts a bpffs at `/sys/fs/bpf` in the container with the matching `delegate_cmds`, `delegate_maps`, `delegate_progs`, or `delegate_attachs` mount option. The overlay generates the hook entry because Proxmox rejects a raw `lxc.hook.start-host` entry.
+The `bpfdelegate` option applies to unprivileged containers. Each of `cmds`, `maps`, `progs`, and `attachs` accepts names separated by semicolons.
+
+At container startup, the generated `lxc.hook.start-host` hook mounts bpffs at `/sys/fs/bpf` inside the container. The hook converts the configured lists to `delegate_cmds`, `delegate_maps`, `delegate_progs`, and `delegate_attachs` mount options. Proxmox rejects a directly configured `lxc.hook.start-host` entry.
 
 ```
 bpfdelegate: cmds=prog_load;map_create;btf_load,maps=hash,progs=sched_cls;socket_filter,attachs=tcx_ingress;tcx_egress;cgroup_inet_ingress
 ```
 
-A name is the lowercase enum constant of `include/uapi/linux/bpf.h` in Linux v7.0 without its prefix: `BPF_` for commands and attach types, `BPF_MAP_TYPE_` for map types, and `BPF_PROG_TYPE_` for program types. The option rejects `any`, numbers, `unspec`, duplicates, names of another list, and constants that alias another constant. The accepted names are 39 commands, 34 map types, 32 program types, and 59 attach types.
+Use the lowercase Linux v7.0 enum constant without its prefix. Remove `BPF_` from command and attach constants, `BPF_MAP_TYPE_` from map constants, and `BPF_PROG_TYPE_` from program constants. The option rejects `any`, numeric values, `unspec`, duplicate entries, entries from another list, and enum aliases.
 
 | Key | Privilege | Example |
 | --- | --- | --- |
@@ -84,11 +86,13 @@ A name is the lowercase enum constant of `include/uapi/linux/bpf.h` in Linux v7.
 | `progs` | `VM.Config.BPFDelegate.Prog.<Name>` | `sched_cls` needs `VM.Config.BPFDelegate.Prog.SchedCls` |
 | `attachs` | `VM.Config.BPFDelegate.Attach.<Name>` | `tcx_ingress` needs `VM.Config.BPFDelegate.Attach.TcxIngress` |
 
-`<Name>` is the name in CamelCase. Each of the 164 names has its own privilege. A request that sets, changes, or deletes `bpfdelegate` needs the privilege of every name that is in only one of the old and the new value. A name in both values does not require a privilege. Proxmox rejects the option on a privileged container, and a privileged container with the option fails at start.
+Construct each privilege suffix by converting the option value from snake_case to CamelCase. The container API requires the corresponding privilege for each name added to or removed from `bpfdelegate`. It does not require privileges for unchanged names.
+
+Proxmox rejects `bpfdelegate` for privileged containers. Container startup also rejects a privileged container that already has this option configured.
 
 `PUT /nodes/{node}/lxc/{vmid}/config` accepts a caller with any of these privileges on `/vms/{vmid}`. The patched `PVE::AccessControl` defines the names, and the patched `PVE::LXC::Config` and the API privilege list read the names from it. The container patch depends on the access control patch.
 
-The hook changes to the AppArmor profile `lxc-pve-overlay-mount` before it moves the mount into the container. `pve-overlay` installs that profile as `/etc/apparmor.d/lxc-pve-overlay-mount`.
+The hook selects the `lxc-pve-overlay-mount` AppArmor profile before calling `move_mount`. `pve-overlay` installs the profile at `/etc/apparmor.d/lxc-pve-overlay-mount`.
 
 ## VM vsock option
 

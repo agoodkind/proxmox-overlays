@@ -63,9 +63,7 @@ sub host_file_dir_allows {
     return scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
 }
 
-# Returns one entry per installed file. A module entry has the path below the
-# module directory. A host file entry has the path below /. Each patch file is
-# the commit of one fork. Other files, such as tests, are skipped.
+# Patch files also include tests, which the installer does not install.
 sub read_file_diffs {
     my @patch_paths;
     for my $patch_glob (@PATCH_GLOBS) {
@@ -174,8 +172,6 @@ sub apply_diff {
     return join("\n", @lines);
 }
 
-# Returns the text of a file that a patch adds. The hunk of a new file has
-# no old lines, and its new lines are the whole file.
 sub new_file_text {
     my ($diff, $label) = @_;
     my @hunks = parse_hunks($diff);
@@ -184,14 +180,12 @@ sub new_file_text {
     return join("\n", @{ $hunks[0]{new} }) . "\n";
 }
 
-# Returns the text of every installed file, keyed by target path.
 sub build_patched_files {
     my %patched;
     for my $entry (read_file_diffs()) {
         my $relative_path = $entry->{relative_path};
         if ($entry->{is_new}) {
-            # A package that starts to ship this module is drift. apply then
-            # removes the copies, and Proxmox loads the packaged module.
+            # A newly packaged module requires a patch against the package version.
             die "$relative_path: the patch adds a module that a package now ships\n"
                 if defined($entry->{source_path}) && -e $entry->{source_path};
             $patched{ $entry->{target_path} } = new_file_text($entry->{diff}, $relative_path);
