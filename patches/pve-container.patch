@@ -1,5 +1,5 @@
 diff --git a/src/PVE/API2/LXC.pm b/src/PVE/API2/LXC.pm
-index 5f94d5a..fbc40e0 100644
+index 5f94d5a..e3df48a 100644
 --- a/src/PVE/API2/LXC.pm
 +++ b/src/PVE/API2/LXC.pm
 @@ -3,9 +3,14 @@ package PVE::API2::LXC;
@@ -12,7 +12,7 @@ index 5f94d5a..fbc40e0 100644
 +use IO::Select;
  use IO::Socket::UNIX;
 +use MIME::Base64 qw(decode_base64 encode_base64);
-+use POSIX qw(WNOHANG);
++use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
  use Socket qw(SOCK_STREAM);
 +use Time::HiRes qw();
  use JSON;
@@ -29,7 +29,7 @@ index 5f94d5a..fbc40e0 100644
          ];
  
          return $res;
-@@ -3075,6 +3084,677 @@ __PACKAGE__->register_method({
+@@ -3075,6 +3084,694 @@ __PACKAGE__->register_method({
      },
  });
  
@@ -482,16 +482,33 @@ index 5f94d5a..fbc40e0 100644
 +        my $exec_id = $create_exec_directory->($vmid);
 +
 +        my $rpcenv = PVE::RPCEnvironment::get();
-+        my $authuser = $rpcenv->get_user();
++        # A request that ends in the same pvedaemon process clears the user of the environment.
++        # The task label is root@pam in that case, the user that runs the method.
++        my $authuser = $rpcenv->get_user(1) // 'root@pam';
 +
-+        $rpcenv->fork_worker(
-+            'lxcexec',
-+            $vmid,
-+            $authuser,
-+            sub {
-+                $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-+            },
-+        );
++        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
++        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
++        # fork_worker returns, and the signal arrives afterwards.
++        my $sigchld = POSIX::SigSet->new(SIGCHLD);
++        my $previous_signals = POSIX::SigSet->new();
++        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
++            or die "unable to block SIGCHLD: $!\n";
++        eval {
++            $rpcenv->fork_worker(
++                'lxcexec',
++                $vmid,
++                $authuser,
++                sub {
++                    # The worker inherits the blocked signal, and lxc-attach inherits it
++                    # from the worker.
++                    sigprocmask(SIG_UNBLOCK, $sigchld);
++                    $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
++                },
++            );
++        };
++        my $fork_error = $@;
++        sigprocmask(SIG_SETMASK, $previous_signals);
++        die $fork_error if $fork_error;
 +
 +        return { pid => 0 + $exec_id };
 +    },
@@ -1250,7 +1267,7 @@ index 0000000..2e13592
 +  mount options=(move),
 +}
 diff --git a/src/test/Makefile b/src/test/Makefile
-index 91ae6ff..072ef67 100644
+index 91ae6ff..faa7034 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -2,7 +2,7 @@ RUN_USERNS := lxc-usernsexec -m "u:0:`id -u`:1" -m "g:0:`id -g`:1" --
@@ -1258,16 +1275,19 @@ index 91ae6ff..072ef67 100644
  all: test
  
 -test: test_setup test_snapshot test_bindmount test_idmap
-+test: test_setup test_snapshot test_bindmount test_idmap test_bpfdelegate
++test: test_setup test_snapshot test_bindmount test_idmap test_bpfdelegate test_exec_concurrency
  
  test_setup: run_setup_tests.pl
  	if test -e /run/lock/sbuild; then \
-@@ -24,5 +24,8 @@ test_bindmount: bindmount_test.pl
+@@ -24,5 +24,11 @@ test_bindmount: bindmount_test.pl
  test_idmap: run_idmap_tests.pl
  	./run_idmap_tests.pl
  
 +test_bpfdelegate: bpfdelegate-test.pl
 +	./bpfdelegate-test.pl
++
++test_exec_concurrency: exec-concurrency-test.pl
++	./exec-concurrency-test.pl
 +
  clean:
  	rm -rf tmprootfs
@@ -1493,3 +1513,164 @@ index 0000000..390edbc
 +print "all tests passed\n";
 +
 +exit(0);
+diff --git a/src/test/exec-concurrency-test.pl b/src/test/exec-concurrency-test.pl
+new file mode 100755
+index 0000000..06a3ad7
+--- /dev/null
++++ b/src/test/exec-concurrency-test.pl
+@@ -0,0 +1,141 @@
++#!/usr/bin/perl -T
++
++# Starts commands through the exec method of PVE::API2::LXC from several processes at the same
++# time, as the workers of pvedaemon do, and requires every start to return a pid.
++# Each process runs the production code of exec and PVE::RESTEnvironment::fork_worker. The test
++# replaces the container lookup and lxc-attach, which need a node, and the process start time
++# check, which fails under the emulation of the amd64 test image.
++
++use strict;
++use warnings;
++
++use Cwd qw(abs_path);
++use File::Path qw(make_path);
++use File::Temp qw(tempdir);
++use JSON;
++use POSIX;
++use Time::HiRes qw();
++
++use lib qw(..);
++
++use AnyEvent;
++
++use PVE::API2::LXC;
++use PVE::LXC;
++use PVE::LXC::Config;
++use PVE::ProcFSTools;
++use PVE::RPCEnvironment;
++
++my $PROCESS_COUNT = 4;
++my $CALLS_PER_PROCESS = 15;
++my $VMID = 9004;
++my $TOKEN_USER = 'svc@pve!deploy';
++my $POLL_SECONDS = 30;
++
++{
++    no warnings 'redefine';
++    *PVE::LXC::Config::load_config = sub { return {} };
++    *PVE::LXC::check_running = sub { return 1 };
++    *PVE::ProcFSTools::read_proc_starttime = sub { return 1 };
++}
++
++my $fake_attach = abs_path('exec-fake-lxc-attach');
++die "missing exec-fake-lxc-attach\n" if !defined($fake_attach) || $fake_attach !~ m/\A(\S+)\z/;
++$fake_attach = $1;
++
++my $bin_directory = tempdir(CLEANUP => 1);
++die "unexpected temporary directory\n" if $bin_directory !~ m/\A(\S+)\z/;
++$bin_directory = $1;
++symlink($fake_attach, "$bin_directory/lxc-attach") or die "symlink failed: $!\n";
++$ENV{PATH} = "$bin_directory:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
++delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
++
++# pvedaemon runs on AnyEvent, and the SIGCHLD handler of the environment then postpones the
++# reaping of finished workers to the event loop.
++AnyEvent::detect();
++
++# fork_worker writes the task log below this directory, which exists on a node.
++make_path('/var/log/pve/tasks');
++
++my $exec_info = PVE::API2::LXC->map_method_by_name('exec');
++my $status_info = PVE::API2::LXC->map_method_by_name('exec_status');
++
++# One process: calls exec repeatedly, then polls every started command until it exits.
++# Every second call runs with no user in the environment, the state that follows a request
++# that cleared the user.
++sub run_process {
++    my ($write_handle) = @_;
++
++    my $rpcenv = PVE::RPCEnvironment->init('priv');
++    my @started;
++    my @errors;
++    for my $call (1 .. $CALLS_PER_PROCESS) {
++        if ($call % 2) {
++            $rpcenv->set_user($TOKEN_USER);
++        } else {
++            $rpcenv->set_user(undef);
++        }
++        my $result = eval {
++            $exec_info->{code}->({ vmid => $VMID, command => ['true'], timeout => 30 });
++        };
++        $rpcenv->set_user(undef);
++        if (my $error = $@) {
++            chomp($error);
++            push @errors, $error;
++            next;
++        }
++        push @started, $result->{pid};
++    }
++
++    my $deadline = Time::HiRes::time() + $POLL_SECONDS;
++    for my $pid (@started) {
++        my $exited = 0;
++        while (!$exited && Time::HiRes::time() < $deadline) {
++            my $status = $status_info->{code}->({ vmid => $VMID, pid => $pid });
++            $exited = $status->{exited};
++            Time::HiRes::sleep(0.05) if !$exited;
++        }
++        push @errors, "command $pid did not exit" if !$exited;
++    }
++
++    print {$write_handle} encode_json({ started => scalar(@started), errors => \@errors }), "\n";
++}
++
++my @readers;
++my @pids;
++for my $index (1 .. $PROCESS_COUNT) {
++    pipe(my $reader, my $writer) or die "pipe failed: $!\n";
++    my $pid = fork() // die "fork failed: $!\n";
++    if (!$pid) {
++        close($reader);
++        run_process($writer);
++        close($writer);
++        POSIX::_exit(0);
++    }
++    close($writer);
++    push @readers, $reader;
++    push @pids, $pid;
++}
++
++my $started_total = 0;
++my @all_errors;
++for my $index (0 .. $#pids) {
++    my $reader = $readers[$index];
++    my $line = <$reader>;
++    waitpid($pids[$index], 0);
++    die "process $index returned no result\n" if !defined($line);
++    my $summary = decode_json($line);
++    $started_total += $summary->{started};
++    push @all_errors, @{ $summary->{errors} };
++}
++
++my $expected_total = $PROCESS_COUNT * $CALLS_PER_PROCESS;
++print "started $started_total of $expected_total commands\n";
++for my $error (@all_errors) {
++    print "error: $error\n";
++}
++die "not every exec call started a command\n" if @all_errors || $started_total != $expected_total;
++
++print "all tests passed\n";
++
++exit(0);
+diff --git a/src/test/exec-fake-lxc-attach b/src/test/exec-fake-lxc-attach
+new file mode 100755
+index 0000000..ff63547
+--- /dev/null
++++ b/src/test/exec-fake-lxc-attach
+@@ -0,0 +1,8 @@
++#!/bin/bash
++# Test replacement for lxc-attach on a host without containers. It runs the arguments that
++# follow the double dash on the test host.
++while [[ "$1" != "--" ]]; do
++    shift
++done
++shift
++exec "$@"
