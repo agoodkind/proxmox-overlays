@@ -235,7 +235,8 @@ sub state_path {
     return "$host_root/$STATE_FILE";
 }
 
-# Returns a hash of recorded path to kind. A host without the record has an empty one.
+# read_state returns a hash of recorded path to kind. A host without the record
+# file returns an empty hash.
 sub read_state {
     my $state_path = state_path();
     return {} if !-e $state_path;
@@ -428,7 +429,7 @@ sub usage {
 usage: pve-overlay <command> [options]
 
   apply    write patched copies of the packaged modules to $DEFAULT_TARGET_DIR
-  remove   delete every installed path that the record lists
+  remove   delete every recorded path and every path the current patches produce
   status   compare the patched copies with the packaged modules
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process

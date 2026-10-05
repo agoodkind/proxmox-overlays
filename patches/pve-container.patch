@@ -722,7 +722,7 @@ index 805eac0..2973b92 100644
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..faaa870 100644
+index dee073d..fbf3f92 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -694,6 +694,30 @@ sub make_apparmor_config {
@@ -946,7 +946,7 @@ index dee073d..faaa870 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2532,166 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2438,6 +2532,167 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1011,7 +1011,8 @@ index dee073d..faaa870 100644
 +            my $reply = "fd " . fileno($fs_context) . "\n";
 +            syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
 +
-+            # The child must stay alive while the parent uses the filesystem context.
++            # The child must stay alive until the parent duplicates the filesystem context
++            # descriptor.
 +            my $unused = <$release_reader>;
 +            $exit_code = 0;
 +        };
