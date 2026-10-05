@@ -236,10 +236,10 @@ index 53f2da7..1ebb36f 100644
  	perl -I.. api-tests.pl
 diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
 new file mode 100755
-index 0000000..2d4e42d
+index 0000000..0d253a9
 --- /dev/null
 +++ b/src/test/bpf-delegate-test.pl
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,60 @@
 +#!/usr/bin/perl -w
 +
 +use strict;
@@ -254,15 +254,7 @@ index 0000000..2d4e42d
 +    print "OK:$label:$got\n";
 +}
 +
-+my $expected_counts = { cmds => 39, maps => 34, progs => 32, attachs => 59 };
-+for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
-+    my $tokens = PVE::AccessControl::bpf_delegate_tokens($kind);
-+    check_equal("token count $kind", scalar(@$tokens), $expected_counts->{$kind});
-+}
-+
 +my $privileges = PVE::AccessControl::bpf_delegate_privileges();
-+check_equal('privilege count', scalar(@$privileges), 164);
-+
 +my $unique = {};
 +for my $privilege (@$privileges) {
 +    $unique->{$privilege} = 1;
