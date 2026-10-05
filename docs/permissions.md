@@ -112,7 +112,7 @@ Each method runs in `pvedaemon` as root on the node that hosts the container. Th
 
 `exec` returns `pid` at once and runs the command in a task worker that `pvedaemon` detaches with `fork_worker`. The worker survives the end of the `pvedaemon` process that started it and appears in the task list as `lxcexec`. `pid` is a random number, not a process ID, because a process ID can repeat before a caller reads the result.
 
-The worker starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. `timeout` defaults to 120 seconds and accepts 1 to 3600. After the timeout the worker sends `TERM` to `lxc-attach`, then `KILL` after 5 seconds.
+The worker starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. `timeout` defaults to 120 seconds and accepts 1 to 3600. `lxc-attach` starts as the leader of a new process group. After the timeout the worker sends `TERM` to that group, then `KILL` after 5 seconds. A command that calls `setsid` leaves the group and keeps running. The `lxcexec` task of a timed-out command ends with the error `command timed out after <n> seconds` after the worker stores the result.
 
 `exec-status` returns `exited: 0` while the command runs. After the command exits, it returns `exited: 1`, `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` when an output exceeds 1 MiB, then deletes the stored result. A command that a signal ends returns 128 plus the signal number. A command that exceeded its timeout returns `exitcode` 124 and `timed-out`. A `pid` that is unknown, already read, or started for another container returns an error.
 
