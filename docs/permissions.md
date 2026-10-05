@@ -13,6 +13,9 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `VM.Config.BPFDelegate.Map.<Name>` | `/vms/<vmid>` | Add or remove one BPF map type in the `bpfdelegate` option of an unprivileged container |
 | `VM.Config.BPFDelegate.Prog.<Name>` | `/vms/<vmid>` | Add or remove one BPF program type in the `bpfdelegate` option of an unprivileged container |
 | `VM.Config.BPFDelegate.Attach.<Name>` | `/vms/<vmid>` | Add or remove one BPF attach type in the `bpfdelegate` option of an unprivileged container |
+| `VM.Guest.Exec` | `/vms/<vmid>` | Run a command as root in a running container |
+| `VM.Guest.FileRead` | `/vms/<vmid>` | Read a file as root in a running container |
+| `VM.Guest.FileWrite` | `/vms/<vmid>` | Write a file as root in a running container |
 | `Sys.ACME.Account.Audit` | `/acme/accounts/<name>` | Read one ACME account and see it in the account list |
 | `Sys.ACME.Account.Create` | `/acme/accounts/<name>` | Register an ACME account with that name |
 | `Sys.ACME.Account.Modify` | `/acme/accounts/<name>` | Update or refresh one ACME account |
@@ -93,6 +96,24 @@ Proxmox rejects `bpfdelegate` for privileged containers. Container startup also 
 `PUT /nodes/{node}/lxc/{vmid}/config` accepts a caller with any of these privileges on `/vms/{vmid}`. The patched `PVE::AccessControl` defines the names, and the patched `PVE::LXC::Config` and the API privilege list read the names from it. The container patch depends on the access control patch.
 
 The hook selects the `lxc-pve-overlay-mount` AppArmor profile before calling `move_mount`. `pve-overlay` installs the profile at `/etc/apparmor.d/lxc-pve-overlay-mount`.
+
+## Container guest methods
+
+Each method runs in `pvedaemon` as root on the node that hosts the container. The container must be running. A stopped container returns an error with its VM ID.
+
+| Method | Path | Requirement |
+| --- | --- | --- |
+| `POST` | `/nodes/{node}/lxc/{vmid}/exec` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `POST` | `/nodes/{node}/lxc/{vmid}/file-write` | `VM.Guest.FileWrite` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/lxc/{vmid}/file-read` | `VM.Guest.FileRead` on `/vms/{vmid}` |
+
+`VM.Guest.Exec` runs any program as root in the container and can read or write any file there. The existing `VM.GuestAgent.*` privileges apply to the QEMU guest agent of a VM and do not authorize these methods.
+
+`exec` starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. It returns `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` when an output exceeds 1 MiB. A command that a signal ends returns 128 plus the signal number. `timeout` defaults to 120 seconds and accepts 1 to 3600. After the timeout, `pvedaemon` terminates `lxc-attach` and returns an error.
+
+`file-write` writes the decoded `content` to the absolute path `file` with `tee` in the container and replaces an existing file. `file-read` reads the file with `head` and returns base64 `content`. It sets `truncated` when the file exceeds 4 MiB.
+
+`input-data` and `content` accept at most 128 KiB of base64, which is 96 KiB of data. `pve-http-server` rejects a request body above 512 KiB, and form encoding expands a base64 value to at most three times its length.
 
 ## VM vsock option
 
