@@ -8,7 +8,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 
 - `VM.Config.Nesting` changes the `nesting` flag of a container.
 - `VM.Config.Keyctl` changes the `keyctl` flag of a container.
-- `VM.Config.BPFDelegate` privileges change the `bpfdelegate` option of an unprivileged container. Each privilege covers one BPF command, map type, program type, or attach type.
+- The container API requires `VM.Config.BPFDelegate` privileges to change `bpfdelegate` on an unprivileged container. Each privilege authorizes one BPF command, map type, program type, or attach type.
 - `VM.Config.Vsock` enables a virtio vsock device on a VM. The guest CID equals the VM ID.
 - `Sys.ACME.Account.Audit`, `Create`, `Modify`, and `Remove` read, register, update, and remove one named ACME account.
 - Six `Sys.ACME.Plugin` privileges read, add, change, and delete one DNS plugin. The stored credentials have one privilege for reads and one for writes.
