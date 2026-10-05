@@ -24,11 +24,17 @@ my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
 
+# A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
+# at /<path>. Only a path below one of these directories is installed.
+my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
+my $APPARMOR_DIR = 'etc/apparmor.d/';
+
 # Units that load the patched modules at start.
 my @UNITS = qw(pvedaemon pveproxy pvestatd pvescheduler pve-ha-lrm);
 
 my $source_root = '';
 my $target_dir = $DEFAULT_TARGET_DIR;
+my $host_root = '';
 my $hook_mode = 0;
 my $system_mode = 1;
 
@@ -51,25 +57,55 @@ sub write_file {
     rename($temporary_path, $path) or die "cannot rename $temporary_path: $!\n";
 }
 
-# Returns one entry per patched module: the path below the module directory
-# and the diff of that file. Each patch file is the commit of one fork. Files
-# outside PVE/*.pm, such as tests, are not installed and are skipped.
-sub read_module_diffs {
+sub host_file_dir_allows {
+    my ($relative_path) = @_;
+    return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
+    return scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
+}
+
+# Returns one entry per installed file. A module entry has the path below the
+# module directory. A host file entry has the path below /. Each patch file is
+# the commit of one fork. Other files, such as tests, are skipped.
+sub read_file_diffs {
     my @patch_paths;
     for my $patch_glob (@PATCH_GLOBS) {
         @patch_paths = sort glob($patch_glob);
         last if @patch_paths;
     }
 
-    my @modules;
+    my @entries;
     for my $patch_path (@patch_paths) {
         for my $file_diff (split(/^(?=diff --git )/m, read_file($patch_path))) {
-            next if $file_diff !~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/};
-            push @modules, { relative_path => $1, diff => $file_diff };
+            my $is_new = $file_diff =~ /^new file mode /m ? 1 : 0;
+            if ($file_diff =~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/}) {
+                push @entries, {
+                    kind => 'module',
+                    relative_path => $1,
+                    source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
+                    target_path => "$target_dir/$1",
+                    diff => $file_diff,
+                    is_new => $is_new,
+                };
+            } elsif ($file_diff =~ m{^diff --git a/(?:src/)?overlay-root/(\S+) b/}) {
+                my $relative_path = $1;
+                die "pve-overlay: $patch_path adds $relative_path outside @HOST_FILE_DIRS\n"
+                    if !host_file_dir_allows($relative_path);
+                die "pve-overlay: $patch_path changes $relative_path, and a host file must be new\n"
+                    if !$is_new;
+                push @entries, {
+                    kind => 'host',
+                    relative_path => $relative_path,
+                    source_path => undef,
+                    target_path => "$host_root/$relative_path",
+                    diff => $file_diff,
+                    is_new => 1,
+                };
+            }
         }
     }
-    die "pve-overlay: no module patches match @PATCH_GLOBS\n" if !@modules;
-    return @modules;
+    die "pve-overlay: no module patches match @PATCH_GLOBS\n"
+        if !grep { $_->{kind} eq 'module' } @entries;
+    return @entries;
 }
 
 sub block_matches_at {
@@ -138,16 +174,54 @@ sub apply_diff {
     return join("\n", @lines);
 }
 
-# Returns the patched text of every module, keyed by target path.
-sub build_patched_modules {
+# Returns the text of a file that a patch adds. The hunk of a new file has
+# no old lines, and its new lines are the whole file.
+sub new_file_text {
+    my ($diff, $label) = @_;
+    my @hunks = parse_hunks($diff);
+    die "$label: the patch of a new file needs exactly one hunk\n" if scalar(@hunks) != 1;
+    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]{old} };
+    return join("\n", @{ $hunks[0]{new} }) . "\n";
+}
+
+# Returns the text of every installed file, keyed by target path.
+sub build_patched_files {
     my %patched;
-    for my $module (read_module_diffs()) {
-        my $relative_path = $module->{relative_path};
-        my $packaged_text = read_file("$source_root$PACKAGED_MODULE_DIR/$relative_path");
-        $patched{"$target_dir/$relative_path"} =
-            apply_diff($packaged_text, $module->{diff}, $relative_path);
+    for my $entry (read_file_diffs()) {
+        my $relative_path = $entry->{relative_path};
+        if ($entry->{is_new}) {
+            # A package that starts to ship this module is drift. apply then
+            # removes the copies, and Proxmox loads the packaged module.
+            die "$relative_path: the patch adds a module that a package now ships\n"
+                if defined($entry->{source_path}) && -e $entry->{source_path};
+            $patched{ $entry->{target_path} } = new_file_text($entry->{diff}, $relative_path);
+        } else {
+            $patched{ $entry->{target_path} } =
+                apply_diff(read_file($entry->{source_path}), $entry->{diff}, $relative_path);
+        }
     }
     return \%patched;
+}
+
+sub apparmor_paths {
+    return map { $_->{target_path} }
+        grep { $_->{kind} eq 'host' && index($_->{relative_path}, $APPARMOR_DIR) == 0 }
+        read_file_diffs();
+}
+
+sub load_apparmor_profiles {
+    return if !$system_mode;
+    for my $path (apparmor_paths()) {
+        system('apparmor_parser', '--replace', $path) == 0
+            or die "pve-overlay: apparmor_parser --replace $path failed\n";
+    }
+}
+
+sub unload_apparmor_profile {
+    my ($path) = @_;
+    return if !$system_mode;
+    system('apparmor_parser', '--remove', $path) == 0
+        or warn "pve-overlay: apparmor_parser --remove $path failed\n";
 }
 
 sub restart_units {
@@ -160,9 +234,11 @@ sub restart_units {
 
 sub remove_copies {
     my $removed_count = 0;
-    for my $module (read_module_diffs()) {
-        my $path = "$target_dir/$module->{relative_path}";
+    for my $entry (read_file_diffs()) {
+        my $path = $entry->{target_path};
         next if !-e $path;
+        unload_apparmor_profile($path)
+            if $entry->{kind} eq 'host' && index($entry->{relative_path}, $APPARMOR_DIR) == 0;
         unlink($path) or die "cannot remove $path: $!\n";
         $removed_count++;
     }
@@ -170,12 +246,12 @@ sub remove_copies {
 }
 
 sub command_check {
-    build_patched_modules();
+    build_patched_files();
     print "every patch applies to the modules under $source_root$PACKAGED_MODULE_DIR\n";
 }
 
 sub command_apply {
-    my $patched = eval { build_patched_modules() };
+    my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         # A patched copy of an older module must not shadow a newer package.
         my $removed_count = remove_copies();
@@ -194,6 +270,9 @@ sub command_apply {
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
     }
+    # apparmor.service loads each profile file at boot. This call loads a new
+    # or changed profile before the restarted units use it.
+    load_apparmor_profiles() if $changed_count;
     restart_units() if $changed_count;
     print "the patched copies are current\n" if !$changed_count;
 }
@@ -206,7 +285,7 @@ sub command_remove {
 }
 
 sub command_status {
-    my $patched = eval { build_patched_modules() };
+    my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         print "drift: $error";
         return 1;
@@ -226,9 +305,9 @@ sub command_status {
 # Loads each module in a taint-mode Perl process and confirms that Perl
 # compiled the patched copy, not the packaged module.
 sub command_compile {
-    for my $module (read_module_diffs()) {
+    for my $module (grep { $_->{kind} eq 'module' } read_file_diffs()) {
         my $relative_path = $module->{relative_path};
-        my $target_path = "$target_dir/$relative_path";
+        my $target_path = $module->{target_path};
         # Taint mode rejects a module path from the command line. The program
         # text includes the path instead.
         my $program = "require q{$relative_path}; print \$INC{q{$relative_path}}";
@@ -259,7 +338,8 @@ usage: pve-overlay <command> [options]
 
   --source-root DIR  read packaged modules below DIR instead of /
   --target-dir DIR   write patched copies to DIR instead of $DEFAULT_TARGET_DIR
-  --no-system        skip the dpkg hook and the service restarts
+  --host-root DIR    write host files below DIR instead of /
+  --no-system        skip the dpkg hook, the profile loads, and the service restarts
   --hook             dpkg hook mode: report a failure and exit 0
 USAGE
 }
@@ -268,6 +348,7 @@ my $command = shift(@ARGV) // usage();
 GetOptions(
     'source-root=s' => \$source_root,
     'target-dir=s' => \$target_dir,
+    'host-root=s' => \$host_root,
     'system!' => \$system_mode,
     'hook' => \$hook_mode,
 ) or usage();
