@@ -24,11 +24,22 @@ my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
 
+# The record lists every installed path, one line per path: "module <path>" or "host <path>".
+# The path of the record is relative to --host-root. A later run deletes a recorded path that
+# the current patches do not produce, for example after an older commit replaces the patches.
+my $STATE_FILE = 'var/lib/pve-overlay/installed';
+
+# A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
+# at /<path>. Only a path below one of these directories is installed.
+my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
+my $APPARMOR_DIR = 'etc/apparmor.d/';
+
 # Units that load the patched modules at start.
 my @UNITS = qw(pvedaemon pveproxy pvestatd pvescheduler pve-ha-lrm);
 
 my $source_root = '';
 my $target_dir = $DEFAULT_TARGET_DIR;
+my $host_root = '';
 my $hook_mode = 0;
 my $system_mode = 1;
 
@@ -51,25 +62,53 @@ sub write_file {
     rename($temporary_path, $path) or die "cannot rename $temporary_path: $!\n";
 }
 
-# Returns one entry per patched module: the path below the module directory
-# and the diff of that file. Each patch file is the commit of one fork. Files
-# outside PVE/*.pm, such as tests, are not installed and are skipped.
-sub read_module_diffs {
+sub host_file_dir_allows {
+    my ($relative_path) = @_;
+    return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
+    return scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
+}
+
+# Patch files also include tests, which the installer does not install.
+sub read_file_diffs {
     my @patch_paths;
     for my $patch_glob (@PATCH_GLOBS) {
         @patch_paths = sort glob($patch_glob);
         last if @patch_paths;
     }
 
-    my @modules;
+    my @entries;
     for my $patch_path (@patch_paths) {
         for my $file_diff (split(/^(?=diff --git )/m, read_file($patch_path))) {
-            next if $file_diff !~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/};
-            push @modules, { relative_path => $1, diff => $file_diff };
+            my $is_new = $file_diff =~ /^new file mode /m ? 1 : 0;
+            if ($file_diff =~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/}) {
+                push @entries, {
+                    kind => 'module',
+                    relative_path => $1,
+                    source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
+                    target_path => "$target_dir/$1",
+                    diff => $file_diff,
+                    is_new => $is_new,
+                };
+            } elsif ($file_diff =~ m{^diff --git a/(?:src/)?overlay-root/(\S+) b/}) {
+                my $relative_path = $1;
+                die "pve-overlay: $patch_path adds $relative_path outside @HOST_FILE_DIRS\n"
+                    if !host_file_dir_allows($relative_path);
+                die "pve-overlay: $patch_path changes $relative_path, and a host file must be new\n"
+                    if !$is_new;
+                push @entries, {
+                    kind => 'host',
+                    relative_path => $relative_path,
+                    source_path => undef,
+                    target_path => "$host_root/$relative_path",
+                    diff => $file_diff,
+                    is_new => 1,
+                };
+            }
         }
     }
-    die "pve-overlay: no module patches match @PATCH_GLOBS\n" if !@modules;
-    return @modules;
+    die "pve-overlay: no module patches match @PATCH_GLOBS\n"
+        if !grep { $_->{kind} eq 'module' } @entries;
+    return @entries;
 }
 
 sub block_matches_at {
@@ -138,16 +177,50 @@ sub apply_diff {
     return join("\n", @lines);
 }
 
-# Returns the patched text of every module, keyed by target path.
-sub build_patched_modules {
+sub new_file_text {
+    my ($diff, $label) = @_;
+    my @hunks = parse_hunks($diff);
+    die "$label: the patch of a new file needs exactly one hunk\n" if scalar(@hunks) != 1;
+    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]{old} };
+    return join("\n", @{ $hunks[0]{new} }) . "\n";
+}
+
+sub build_patched_files {
     my %patched;
-    for my $module (read_module_diffs()) {
-        my $relative_path = $module->{relative_path};
-        my $packaged_text = read_file("$source_root$PACKAGED_MODULE_DIR/$relative_path");
-        $patched{"$target_dir/$relative_path"} =
-            apply_diff($packaged_text, $module->{diff}, $relative_path);
+    for my $entry (read_file_diffs()) {
+        my $relative_path = $entry->{relative_path};
+        if ($entry->{is_new}) {
+            # A newly packaged module requires a patch against the package version.
+            die "$relative_path: the patch adds a module that a package now ships\n"
+                if defined($entry->{source_path}) && -e $entry->{source_path};
+            $patched{ $entry->{target_path} } = new_file_text($entry->{diff}, $relative_path);
+        } else {
+            $patched{ $entry->{target_path} } =
+                apply_diff(read_file($entry->{source_path}), $entry->{diff}, $relative_path);
+        }
     }
     return \%patched;
+}
+
+sub apparmor_paths {
+    return map { $_->{target_path} }
+        grep { $_->{kind} eq 'host' && index($_->{relative_path}, $APPARMOR_DIR) == 0 }
+        read_file_diffs();
+}
+
+sub load_apparmor_profiles {
+    return if !$system_mode;
+    for my $path (apparmor_paths()) {
+        system('apparmor_parser', '--replace', $path) == 0
+            or die "pve-overlay: apparmor_parser --replace $path failed\n";
+    }
+}
+
+sub unload_apparmor_profile {
+    my ($path) = @_;
+    return if !$system_mode;
+    system('apparmor_parser', '--remove', $path) == 0
+        or warn "pve-overlay: apparmor_parser --remove $path failed\n";
 }
 
 sub restart_units {
@@ -158,30 +231,125 @@ sub restart_units {
     }
 }
 
-sub remove_copies {
-    my $removed_count = 0;
-    for my $module (read_module_diffs()) {
-        my $path = "$target_dir/$module->{relative_path}";
-        next if !-e $path;
-        unlink($path) or die "cannot remove $path: $!\n";
-        $removed_count++;
+sub state_path {
+    return "$host_root/$STATE_FILE";
+}
+
+# read_state returns a hash of recorded path to kind. A host without the record
+# file returns an empty hash.
+sub read_state {
+    my $state_path = state_path();
+    return {} if !-e $state_path;
+
+    my %recorded;
+    for my $line (split(/\n/, read_file($state_path))) {
+        next if $line eq '';
+        if ($line !~ m/\A(module|host) (\/\S+)\z/) {
+            warn "pve-overlay: ignored the line '$line' in $state_path\n";
+            next;
+        }
+        $recorded{$2} = $1;
     }
+    return \%recorded;
+}
+
+sub write_state {
+    my ($recorded) = @_;
+    my $content = '';
+    for my $path (sort keys %$recorded) {
+        $content .= "$recorded->{$path} $path\n";
+    }
+    write_file(state_path(), $content);
+}
+
+# Returns a hash of the paths that the current patches produce to their kind.
+sub produced_paths {
+    my %produced;
+    for my $entry (read_file_diffs()) {
+        $produced{ $entry->{target_path} } = $entry->{kind};
+    }
+    return \%produced;
+}
+
+# The record is a file that root writes, and a deletion must stay inside the directories that
+# pve-overlay installs into.
+sub is_installable_path {
+    my ($path, $kind) = @_;
+    return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
+    return index($path, "$target_dir/PVE/") == 0 if $kind eq 'module';
+    for my $host_dir (@HOST_FILE_DIRS) {
+        return 1 if index($path, "$host_root/$host_dir") == 0;
+    }
+    return 0;
+}
+
+sub is_apparmor_path {
+    my ($path) = @_;
+    return index($path, "$host_root/$APPARMOR_DIR") == 0;
+}
+
+# Deletes one installed file and unloads a deleted AppArmor profile. Returns 1 when it deleted
+# a file.
+sub remove_installed_path {
+    my ($path, $kind) = @_;
+    if (!is_installable_path($path, $kind)) {
+        warn "pve-overlay: skipped the recorded path $path outside the install directories\n";
+        return 0;
+    }
+    return 0 if !-e $path;
+    unload_apparmor_profile($path) if $kind eq 'host' && is_apparmor_path($path);
+    unlink($path) or die "cannot remove $path: $!\n";
+    return 1;
+}
+
+# Deletes every recorded path and every path that the current patches produce.
+sub remove_copies {
+    my $paths = read_state();
+    my $produced = eval { produced_paths() } // {};
+    for my $path (keys %$produced) {
+        $paths->{$path} = $produced->{$path};
+    }
+
+    my $removed_count = 0;
+    for my $path (sort keys %$paths) {
+        $removed_count += remove_installed_path($path, $paths->{$path});
+    }
+    unlink(state_path()) if -e state_path();
     return $removed_count;
 }
 
 sub command_check {
-    build_patched_modules();
+    build_patched_files();
     print "every patch applies to the modules under $source_root$PACKAGED_MODULE_DIR\n";
 }
 
 sub command_apply {
-    my $patched = eval { build_patched_modules() };
+    my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         # A patched copy of an older module must not shadow a newer package.
         my $removed_count = remove_copies();
         restart_units() if $removed_count;
         die "pve-overlay: removed the patched copies, Proxmox runs packaged modules: $error";
     }
+
+    my $produced = produced_paths();
+    my $recorded = read_state();
+
+    my $deleted_count = 0;
+    for my $path (sort keys %$recorded) {
+        next if exists($produced->{$path});
+        if (remove_installed_path($path, $recorded->{$path})) {
+            print "removed $path, which the current patches do not produce\n";
+            $deleted_count++;
+        }
+    }
+
+    # Record the new paths before the writes. A run that fails after a write still lists the file.
+    my %pending = (%$recorded, %$produced);
+    for my $path (keys %pending) {
+        delete $pending{$path} if !exists($produced->{$path}) && !-e $path;
+    }
+    write_state(\%pending);
 
     my $changed_count = 0;
     for my $path (sort keys %$patched) {
@@ -190,12 +358,16 @@ sub command_apply {
         print "wrote $path\n";
         $changed_count++;
     }
+    write_state($produced);
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
     }
-    restart_units() if $changed_count;
-    print "the patched copies are current\n" if !$changed_count;
+    # apparmor.service loads each profile file at boot. This call loads a new
+    # or changed profile before the restarted units use it.
+    load_apparmor_profiles() if $changed_count;
+    restart_units() if $changed_count || $deleted_count;
+    print "the patched copies are current\n" if !$changed_count && !$deleted_count;
 }
 
 sub command_remove {
@@ -206,7 +378,7 @@ sub command_remove {
 }
 
 sub command_status {
-    my $patched = eval { build_patched_modules() };
+    my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         print "drift: $error";
         return 1;
@@ -220,15 +392,21 @@ sub command_status {
         $stale_count++ if $state ne 'current';
         print "$state  $path\n";
     }
+    my $recorded = read_state();
+    for my $path (sort keys %$recorded) {
+        next if exists($patched->{$path});
+        $stale_count++;
+        print "orphan  $path\n";
+    }
     return $stale_count ? 1 : 0;
 }
 
 # Loads each module in a taint-mode Perl process and confirms that Perl
 # compiled the patched copy, not the packaged module.
 sub command_compile {
-    for my $module (read_module_diffs()) {
+    for my $module (grep { $_->{kind} eq 'module' } read_file_diffs()) {
         my $relative_path = $module->{relative_path};
-        my $target_path = "$target_dir/$relative_path";
+        my $target_path = $module->{target_path};
         # Taint mode rejects a module path from the command line. The program
         # text includes the path instead.
         my $program = "require q{$relative_path}; print \$INC{q{$relative_path}}";
@@ -251,7 +429,7 @@ sub usage {
 usage: pve-overlay <command> [options]
 
   apply    write patched copies of the packaged modules to $DEFAULT_TARGET_DIR
-  remove   delete the patched copies
+  remove   delete every recorded path and every path the current patches produce
   status   compare the patched copies with the packaged modules
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process
@@ -259,7 +437,8 @@ usage: pve-overlay <command> [options]
 
   --source-root DIR  read packaged modules below DIR instead of /
   --target-dir DIR   write patched copies to DIR instead of $DEFAULT_TARGET_DIR
-  --no-system        skip the dpkg hook and the service restarts
+  --host-root DIR    write host files below DIR instead of /
+  --no-system        skip the dpkg hook, the profile loads, and the service restarts
   --hook             dpkg hook mode: report a failure and exit 0
 USAGE
 }
@@ -268,6 +447,7 @@ my $command = shift(@ARGV) // usage();
 GetOptions(
     'source-root=s' => \$source_root,
     'target-dir=s' => \$target_dir,
+    'host-root=s' => \$host_root,
     'system!' => \$system_mode,
     'hook' => \$hook_mode,
 ) or usage();

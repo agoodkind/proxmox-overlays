@@ -9,6 +9,13 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `VM.Config.Nesting` | `/vms/<vmid>` | Change the `nesting` flag in the `features` option of a container |
 | `VM.Config.Keyctl` | `/vms/<vmid>` | Change the `keyctl` flag in the `features` option of a container |
 | `VM.Config.Vsock` | `/vms/<vmid>` | Set, delete, or revert the `vsock` option of a VM |
+| `VM.Config.BPFDelegate.Cmd.<Name>` | `/vms/<vmid>` | Add or remove one BPF command in the `bpfdelegate` option of an unprivileged container |
+| `VM.Config.BPFDelegate.Map.<Name>` | `/vms/<vmid>` | Add or remove one BPF map type in the `bpfdelegate` option of an unprivileged container |
+| `VM.Config.BPFDelegate.Prog.<Name>` | `/vms/<vmid>` | Add or remove one BPF program type in the `bpfdelegate` option of an unprivileged container |
+| `VM.Config.BPFDelegate.Attach.<Name>` | `/vms/<vmid>` | Add or remove one BPF attach type in the `bpfdelegate` option of an unprivileged container |
+| `VM.Guest.Exec` | `/vms/<vmid>` | Run a command as root in a running container |
+| `VM.Guest.FileRead` | `/vms/<vmid>` | Read a file as root in a running container |
+| `VM.Guest.FileWrite` | `/vms/<vmid>` | Write a file as root in a running container |
 | `Sys.ACME.Account.Audit` | `/acme/accounts/<name>` | Read one ACME account and see it in the account list |
 | `Sys.ACME.Account.Create` | `/acme/accounts/<name>` | Register an ACME account with that name |
 | `Sys.ACME.Account.Modify` | `/acme/accounts/<name>` | Update or refresh one ACME account |
@@ -62,6 +69,58 @@ The `features` check compares the stored flags with the requested flags. A missi
 A request that changes several flags needs the privilege for each changed flag. A flag that keeps its value needs no privilege.
 
 Container creation and restore use the same `features` check with no stored flags. A privileged container still requires `Sys.Modify` on `/` at creation and restore.
+
+## Container BPF delegation
+
+The `bpfdelegate` option applies to unprivileged containers. Each of `cmds`, `maps`, `progs`, and `attachs` accepts names separated by semicolons.
+
+At container startup, the generated `lxc.hook.start-host` hook mounts bpffs at `/sys/fs/bpf` inside the container. The hook converts the configured lists to `delegate_cmds`, `delegate_maps`, `delegate_progs`, and `delegate_attachs` mount options. Proxmox rejects a directly configured `lxc.hook.start-host` entry.
+
+```
+bpfdelegate: cmds=prog_load;map_create;btf_load,maps=hash,progs=sched_cls;socket_filter,attachs=tcx_ingress;tcx_egress;cgroup_inet_ingress
+```
+
+Use the lowercase Linux v7.0 enum constant without its prefix. Remove `BPF_` from command and attach constants, `BPF_MAP_TYPE_` from map constants, and `BPF_PROG_TYPE_` from program constants. The option rejects `any`, numeric values, `unspec`, duplicate entries, entries from another list, and enum aliases.
+
+| Key | Privilege | Example |
+| --- | --- | --- |
+| `cmds` | `VM.Config.BPFDelegate.Cmd.<Name>` | `prog_load` needs `VM.Config.BPFDelegate.Cmd.ProgLoad` |
+| `maps` | `VM.Config.BPFDelegate.Map.<Name>` | `hash` needs `VM.Config.BPFDelegate.Map.Hash` |
+| `progs` | `VM.Config.BPFDelegate.Prog.<Name>` | `sched_cls` needs `VM.Config.BPFDelegate.Prog.SchedCls` |
+| `attachs` | `VM.Config.BPFDelegate.Attach.<Name>` | `tcx_ingress` needs `VM.Config.BPFDelegate.Attach.TcxIngress` |
+
+Construct each privilege suffix by converting the option value from snake_case to CamelCase. The container API requires the corresponding privilege for each name added to or removed from `bpfdelegate`. It does not require privileges for unchanged names.
+
+Proxmox rejects `bpfdelegate` for privileged containers. Container startup also rejects a privileged container that already has this option configured.
+
+`PUT /nodes/{node}/lxc/{vmid}/config` accepts a caller with any of these privileges on `/vms/{vmid}`. The patched `PVE::AccessControl` defines the names, and the patched `PVE::LXC::Config` and the API privilege list read the names from it. The container patch depends on the access control patch.
+
+The hook selects the `lxc-pve-overlay-mount` AppArmor profile before calling `move_mount`. `pve-overlay` installs the profile at `/etc/apparmor.d/lxc-pve-overlay-mount`.
+
+## Container guest methods
+
+Each method runs in `pvedaemon` as root on the node that hosts the container. The container must be running. A stopped container returns an error with its VM ID.
+
+| Method | Path | Requirement |
+| --- | --- | --- |
+| `POST` | `/nodes/{node}/lxc/{vmid}/exec` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/lxc/{vmid}/exec-status` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `POST` | `/nodes/{node}/lxc/{vmid}/file-write` | `VM.Guest.FileWrite` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/lxc/{vmid}/file-read` | `VM.Guest.FileRead` on `/vms/{vmid}` |
+
+`VM.Guest.Exec` runs any program as root in the container and can read or write any file there. The existing `VM.GuestAgent.*` privileges apply to the QEMU guest agent of a VM and do not authorize these methods.
+
+`exec` returns `pid` at once and runs the command in a task worker that `pvedaemon` detaches with `fork_worker`. The worker survives the end of the `pvedaemon` process that started it and appears in the task list as `lxcexec`. `pid` is a random number, not a process ID, because a process ID can repeat before a caller reads the result.
+
+The worker starts the command with `lxc-attach --clear-env`, the program that `pct exec` starts. `timeout` defaults to 120 seconds and accepts 1 to 3600. `lxc-attach` starts as the leader of a new process group. After the timeout the worker sends `TERM` to that group, then `KILL` after 5 seconds. A command that calls `setsid` leaves the group and keeps running. The `lxcexec` task of a timed-out command ends with the error `command timed out after <n> seconds` after the worker stores the result.
+
+`exec-status` returns `exited: 0` while the command runs. After the command exits, it returns `exited: 1`, `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` when an output exceeds 1 MiB, then deletes the stored result. A command that a signal ends returns 128 plus the signal number. A command that exceeded its timeout returns `exitcode` 124 and `timed-out`. A `pid` that is unknown, already read, or started for another container returns an error.
+
+The worker stores the result in `/run/pve/lxc-exec/<vmid>/<pid>`, which only `root` can read (mode 0700). Each `exec` and `exec-status` call, for any container, deletes results that no caller read within one hour. It also deletes a directory without a status file after two hours.
+
+`file-write` writes the decoded `content` to the absolute path `file` with `tee` in the container and replaces an existing file. `file-read` reads the file with `head` and returns base64 `content`. It sets `truncated` when the file exceeds 4 MiB.
+
+`input-data` and `content` accept at most 128 KiB of base64, which is 96 KiB of data. `pve-http-server` rejects a request body above 512 KiB, and form encoding expands a base64 value to at most three times its length.
 
 ## VM vsock option
 
