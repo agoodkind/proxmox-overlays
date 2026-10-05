@@ -24,6 +24,11 @@ my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
 
+# The record lists every installed path, one line per path: "module <path>" or "host <path>".
+# The path of the record is relative to --host-root. A later run deletes a recorded path that
+# the current patches do not produce, for example after an older commit replaces the patches.
+my $STATE_FILE = 'var/lib/pve-overlay/installed';
+
 # A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
 # at /<path>. Only a path below one of these directories is installed.
 my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
@@ -226,16 +231,89 @@ sub restart_units {
     }
 }
 
-sub remove_copies {
-    my $removed_count = 0;
-    for my $entry (read_file_diffs()) {
-        my $path = $entry->{target_path};
-        next if !-e $path;
-        unload_apparmor_profile($path)
-            if $entry->{kind} eq 'host' && index($entry->{relative_path}, $APPARMOR_DIR) == 0;
-        unlink($path) or die "cannot remove $path: $!\n";
-        $removed_count++;
+sub state_path {
+    return "$host_root/$STATE_FILE";
+}
+
+# Returns a hash of recorded path to kind. A host without the record has an empty one.
+sub read_state {
+    my $state_path = state_path();
+    return {} if !-e $state_path;
+
+    my %recorded;
+    for my $line (split(/\n/, read_file($state_path))) {
+        next if $line eq '';
+        if ($line !~ m/\A(module|host) (\/\S+)\z/) {
+            warn "pve-overlay: ignored the line '$line' in $state_path\n";
+            next;
+        }
+        $recorded{$2} = $1;
     }
+    return \%recorded;
+}
+
+sub write_state {
+    my ($recorded) = @_;
+    my $content = '';
+    for my $path (sort keys %$recorded) {
+        $content .= "$recorded->{$path} $path\n";
+    }
+    write_file(state_path(), $content);
+}
+
+# Returns a hash of the paths that the current patches produce to their kind.
+sub produced_paths {
+    my %produced;
+    for my $entry (read_file_diffs()) {
+        $produced{ $entry->{target_path} } = $entry->{kind};
+    }
+    return \%produced;
+}
+
+# The record is a file that root writes, and a deletion must stay inside the directories that
+# pve-overlay installs into.
+sub is_installable_path {
+    my ($path, $kind) = @_;
+    return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
+    return index($path, "$target_dir/PVE/") == 0 if $kind eq 'module';
+    for my $host_dir (@HOST_FILE_DIRS) {
+        return 1 if index($path, "$host_root/$host_dir") == 0;
+    }
+    return 0;
+}
+
+sub is_apparmor_path {
+    my ($path) = @_;
+    return index($path, "$host_root/$APPARMOR_DIR") == 0;
+}
+
+# Deletes one installed file and unloads a deleted AppArmor profile. Returns 1 when it deleted
+# a file.
+sub remove_installed_path {
+    my ($path, $kind) = @_;
+    if (!is_installable_path($path, $kind)) {
+        warn "pve-overlay: skipped the recorded path $path outside the install directories\n";
+        return 0;
+    }
+    return 0 if !-e $path;
+    unload_apparmor_profile($path) if $kind eq 'host' && is_apparmor_path($path);
+    unlink($path) or die "cannot remove $path: $!\n";
+    return 1;
+}
+
+# Deletes every recorded path and every path that the current patches produce.
+sub remove_copies {
+    my $paths = read_state();
+    my $produced = eval { produced_paths() } // {};
+    for my $path (keys %$produced) {
+        $paths->{$path} = $produced->{$path};
+    }
+
+    my $removed_count = 0;
+    for my $path (sort keys %$paths) {
+        $removed_count += remove_installed_path($path, $paths->{$path});
+    }
+    unlink(state_path()) if -e state_path();
     return $removed_count;
 }
 
@@ -253,6 +331,25 @@ sub command_apply {
         die "pve-overlay: removed the patched copies, Proxmox runs packaged modules: $error";
     }
 
+    my $produced = produced_paths();
+    my $recorded = read_state();
+
+    my $deleted_count = 0;
+    for my $path (sort keys %$recorded) {
+        next if exists($produced->{$path});
+        if (remove_installed_path($path, $recorded->{$path})) {
+            print "removed $path, which the current patches do not produce\n";
+            $deleted_count++;
+        }
+    }
+
+    # Record the new paths before the writes. A run that fails after a write still lists the file.
+    my %pending = (%$recorded, %$produced);
+    for my $path (keys %pending) {
+        delete $pending{$path} if !exists($produced->{$path}) && !-e $path;
+    }
+    write_state(\%pending);
+
     my $changed_count = 0;
     for my $path (sort keys %$patched) {
         next if -e $path && read_file($path) eq $patched->{$path};
@@ -260,6 +357,7 @@ sub command_apply {
         print "wrote $path\n";
         $changed_count++;
     }
+    write_state($produced);
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
@@ -267,8 +365,8 @@ sub command_apply {
     # apparmor.service loads each profile file at boot. This call loads a new
     # or changed profile before the restarted units use it.
     load_apparmor_profiles() if $changed_count;
-    restart_units() if $changed_count;
-    print "the patched copies are current\n" if !$changed_count;
+    restart_units() if $changed_count || $deleted_count;
+    print "the patched copies are current\n" if !$changed_count && !$deleted_count;
 }
 
 sub command_remove {
@@ -292,6 +390,12 @@ sub command_status {
         }
         $stale_count++ if $state ne 'current';
         print "$state  $path\n";
+    }
+    my $recorded = read_state();
+    for my $path (sort keys %$recorded) {
+        next if exists($patched->{$path});
+        $stale_count++;
+        print "orphan  $path\n";
     }
     return $stale_count ? 1 : 0;
 }
@@ -324,7 +428,7 @@ sub usage {
 usage: pve-overlay <command> [options]
 
   apply    write patched copies of the packaged modules to $DEFAULT_TARGET_DIR
-  remove   delete the patched copies
+  remove   delete every installed path that the record lists
   status   compare the patched copies with the packaged modules
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process

@@ -22,6 +22,8 @@ The [permission reference](docs/permissions.md) lists the ACL path and the API m
 
 `pve-overlay` reads each packaged module from `/usr/share/perl5`, applies the patch, and writes the result to `/etc/perl`. Debian Perl searches `/etc/perl` before `/usr/share/perl5`, also in taint mode. Every Proxmox service and command loads the patched copy. `pve-overlay` does not write to packaged files.
 
+`pve-overlay` records every installed path in `/var/lib/pve-overlay/installed`. `apply` deletes a recorded path that the current patches do not produce, for example after a rollback to an older patch set, unloads a deleted AppArmor profile, and restarts the units. `remove` deletes every recorded path, and `status` prints `orphan` for a recorded path that the current patches do not produce.
+
 `pve-overlay` installs `overlay-root/<path>` at `/<path>`. It rejects host files outside `etc/apparmor.d/` and loads installed profiles with `apparmor_parser`.
 
 A dpkg hook runs `pve-overlay apply` after each package operation. The hook builds new copies from the upgraded modules. When a patch does not apply to an upgraded module, the hook deletes all patched copies and Proxmox runs the packaged modules.
