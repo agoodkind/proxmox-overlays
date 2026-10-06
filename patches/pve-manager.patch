@@ -307,6 +307,215 @@ index 2f210903..0b780254 100644
          cfs_lock_file(
              $plugin_config_file,
              undef,
+diff --git a/PVE/API2/KernelModules.pm b/PVE/API2/KernelModules.pm
+new file mode 100644
+index 00000000..1260ac19
+--- /dev/null
++++ b/PVE/API2/KernelModules.pm
+@@ -0,0 +1,191 @@
++package PVE::API2::KernelModules;
++
++use strict;
++use warnings;
++
++use PVE::File;
++use PVE::JSONSchema qw(get_standard_option);
++use PVE::Tools qw(run_command);
++
++use base qw(PVE::RESTHandler);
++
++use vars qw($LOAD_FILE $ALLOW_FILE $SYS_MODULE_DIR $MODINFO_COMMAND $MODPROBE_COMMAND);
++
++$LOAD_FILE = '/etc/modules-load.d/pve-overlay.conf';
++$ALLOW_FILE = '/etc/pve-overlay/kernel-modules.allow';
++$SYS_MODULE_DIR = '/sys/module';
++$MODINFO_COMMAND = '/sbin/modinfo';
++$MODPROBE_COMMAND = '/sbin/modprobe';
++
++my $LOAD_FILE_MODE = 0644;
++my $BUILTIN_MARKER = '(builtin)';
++
++my $read_names = sub {
++    my ($path) = @_;
++
++    return [] if !-e $path;
++
++    my $names = [];
++    for my $line (split(/\n/, PVE::File::file_get_contents($path))) {
++        $line =~ s/^\s+|\s+$//g;
++        next if $line eq '' || $line =~ /^[#;]/;
++        push @$names, $line;
++    }
++    return $names;
++};
++
++my $read_state = sub {
++    my $modules = $read_names->($LOAD_FILE);
++
++    my $loaded = {};
++    for my $name (@$modules) {
++        $loaded->{$name} = -d "$SYS_MODULE_DIR/$name" ? 1 : 0;
++    }
++
++    return { modules => $modules, loaded => $loaded };
++};
++
++my $modinfo_path = sub {
++    my ($name) = @_;
++
++    my $output = '';
++    my $errors = '';
++    eval {
++        run_command(
++            [$MODINFO_COMMAND, '-n', '--', $name],
++            outfunc => sub { $output .= shift() . "\n" },
++            errfunc => sub { $errors .= shift() . "\n" },
++        );
++    };
++    my $failed = $@ ? 1 : 0;
++
++    $errors =~ s/^\s+|\s+$//g;
++    return (undef, $errors) if $failed;
++
++    $output =~ s/^\s+|\s+$//g;
++    return ($output, $errors);
++};
++
++my $validate_name = sub {
++    my ($name, $allowed) = @_;
++
++    die "Kernel module '$name' does not match the required pattern ^[a-z0-9_]+\$.\n"
++        if $name !~ /^([a-z0-9_]+)\z/;
++    my $untainted = $1;
++
++    die "Kernel module '$untainted' is not in $ALLOW_FILE.\n"
++        if !$allowed->{$untainted};
++
++    my ($path, $errors) = $modinfo_path->($untainted);
++    if (!defined($path) || $path eq '') {
++        my $message = "The validator rejects kernel module '$untainted' because modinfo -n fails or returns no path for the running kernel.";
++        $message .= " The modinfo command wrote to stderr: $errors" if $errors ne '';
++        die "$message\n";
++    }
++    die "Kernel module '$untainted' is built into the running kernel.\n"
++        if $path eq $BUILTIN_MARKER;
++
++    return $untainted;
++};
++
++my $state_returns = {
++    type => 'object',
++    properties => {
++        modules => {
++            type => 'array',
++            description => 'The response lists persistent module names in file order.',
++            items => { type => 'string' },
++        },
++        loaded => {
++            type => 'object',
++            description => 'The response reports whether each listed module is loaded (1) or is not loaded (0).',
++            additionalProperties => { type => 'integer', minimum => 0, maximum => 1 },
++        },
++    },
++};
++
++__PACKAGE__->register_method({
++    name => 'get_kernel_modules',
++    path => '',
++    method => 'GET',
++    description => "GET returns the persistent kernel module list and a loaded flag for each module on the node.",
++    permissions => {
++        check => ['perm', '/nodes/{node}', ['Sys.KernelModules.Audit']],
++    },
++    proxyto => 'node',
++    parameters => {
++        additionalProperties => 0,
++        properties => {
++            node => get_standard_option('pve-node'),
++        },
++    },
++    returns => $state_returns,
++    code => sub {
++        return $read_state->();
++    },
++});
++
++__PACKAGE__->register_method({
++    name => 'set_kernel_modules',
++    path => '',
++    method => 'PUT',
++    description => "PUT replaces the persistent kernel module list and loads accepted modules on the node. PUT never unloads modules.",
++    permissions => {
++        check => ['perm', '/nodes/{node}', ['Sys.KernelModules.Modify']],
++    },
++    protected => 1,
++    proxyto => 'node',
++    parameters => {
++        additionalProperties => 0,
++        properties => {
++            node => get_standard_option('pve-node'),
++            modules => {
++                type => 'array',
++                description => 'The request supplies module names to replace the persistent list.',
++                items => { type => 'string' },
++            },
++        },
++    },
++    returns => $state_returns,
++    code => sub {
++        my ($param) = @_;
++
++        my $allowed = { map { $_ => 1 } @{ $read_names->($ALLOW_FILE) } };
++
++        my $names = [];
++        my $seen = {};
++        for my $requested (@{ $param->{modules} }) {
++            my $name = $validate_name->($requested, $allowed);
++            next if $seen->{$name}++;
++            push @$names, $name;
++        }
++
++        for my $name (@$names) {
++            my $errors = '';
++            eval {
++                run_command(
++                    [$MODPROBE_COMMAND, '--', $name],
++                    errfunc => sub { $errors .= shift() . "\n" },
++                );
++            };
++            if ($@) {
++                my $failure = $@;
++                $errors =~ s/^\s+|\s+$//g;
++                $failure =~ s/^\s+|\s+$//g;
++                my $detail = $errors;
++                $detail = $failure if $detail eq '';
++                die "The modprobe command failed for kernel module '$name': $detail\n";
++            }
++        }
++
++        my $content = '';
++        for my $name (@$names) {
++            $content .= "$name\n";
++        }
++        PVE::File::file_set_contents($LOAD_FILE, $content, $LOAD_FILE_MODE);
++
++        return $read_state->();
++    },
++});
++
++1;
+diff --git a/PVE/API2/Makefile b/PVE/API2/Makefile
+index 97f1cc20..5fe55456 100644
+--- a/PVE/API2/Makefile
++++ b/PVE/API2/Makefile
+@@ -14,6 +14,7 @@ PERLSOURCE = 			\
+ 	Cluster.pm		\
+ 	HAConfig.pm		\
+ 	Hardware.pm		\
++	KernelModules.pm	\
+ 	Network.pm		\
+ 	NodeConfig.pm		\
+ 	Nodes.pm		\
 diff --git a/PVE/API2/NodeConfig.pm b/PVE/API2/NodeConfig.pm
 index cc726dac..f0b774ad 100644
 --- a/PVE/API2/NodeConfig.pm
@@ -416,3 +625,243 @@ index cc726dac..f0b774ad 100644
          my $code = sub {
              my $conf = PVE::NodeConfig::load_config($node);
  
+diff --git a/PVE/API2/Nodes.pm b/PVE/API2/Nodes.pm
+index 2ca3244d..a657bd03 100644
+--- a/PVE/API2/Nodes.pm
++++ b/PVE/API2/Nodes.pm
+@@ -49,6 +49,7 @@ use PVE::API2::Certificates;
+ use PVE::API2::Disks;
+ use PVE::API2::Firewall::Host;
+ use PVE::API2::Hardware;
++use PVE::API2::KernelModules;
+ use PVE::API2::LXC::Status;
+ use PVE::API2::LXC;
+ use PVE::API2::Network;
+@@ -199,6 +200,11 @@ __PACKAGE__->register_method({
+     path => 'config',
+ });
+ 
++__PACKAGE__->register_method({
++    subclass => "PVE::API2::KernelModules",
++    path => 'kernel-modules',
++});
++
+ __PACKAGE__->register_method({
+     subclass => "PVE::API2::Network::SDN::Nodes::Status",
+     path => 'sdn',
+diff --git a/test/KernelModules_test.pl b/test/KernelModules_test.pl
+new file mode 100755
+index 00000000..5b053687
+--- /dev/null
++++ b/test/KernelModules_test.pl
+@@ -0,0 +1,193 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use lib ('.', '..');
++
++use File::Temp qw(tempdir);
++use Test::More;
++
++use PVE::API2::KernelModules;
++
++my $root = tempdir(CLEANUP => 1);
++mkdir "$root/sys" or die "cannot create $root/sys: $!\n";
++mkdir "$root/sys/loaded_mod" or die "cannot create $root/sys/loaded_mod: $!\n";
++
++my $modinfo_script = <<'SCRIPT';
++#!/bin/sh
++name="$3"
++case "$name" in
++    builtin_mod) echo "(builtin)" ;;
++    missing_mod) echo "modinfo: ERROR: Module $name not found." >&2; exit 1 ;;
++    *) echo "/lib/modules/test/$name.ko" ;;
++esac
++SCRIPT
++
++my $modprobe_script = <<"SCRIPT";
++#!/bin/sh
++echo "\$2" >> "$root/modprobe.log"
++if [ "\$2" = "fail_mod" ]; then
++    echo "modprobe: FATAL: Module fail_mod cannot be inserted." >&2
++    exit 1
++fi
++SCRIPT
++
++sub write_file {
++    my ($path, $content, $mode) = @_;
++    open(my $handle, '>', $path) or die "cannot write $path: $!\n";
++    print {$handle} $content;
++    close($handle) or die "cannot write $path: $!\n";
++    chmod($mode, $path) or die "cannot chmod $path: $!\n";
++}
++
++write_file("$root/modinfo", $modinfo_script, 0755);
++write_file("$root/modprobe", $modprobe_script, 0755);
++write_file(
++    "$root/allow",
++    "loaded_mod\nunloaded_mod\nbuiltin_mod\nmissing_mod\nsecond_mod\nfail_mod\n",
++    0644,
++);
++
++$PVE::API2::KernelModules::LOAD_FILE = "$root/pve-overlay.conf";
++$PVE::API2::KernelModules::ALLOW_FILE = "$root/allow";
++$PVE::API2::KernelModules::SYS_MODULE_DIR = "$root/sys";
++$PVE::API2::KernelModules::MODINFO_COMMAND = "$root/modinfo";
++$PVE::API2::KernelModules::MODPROBE_COMMAND = "$root/modprobe";
++
++sub read_file {
++    my ($path) = @_;
++    return '' if !-e $path;
++    open(my $handle, '<', $path) or die "cannot read $path: $!\n";
++    local $/ = undef;
++    my $content = <$handle>;
++    close($handle);
++    return $content;
++}
++
++sub put_modules {
++    my ($modules) = @_;
++    return PVE::API2::KernelModules->set_kernel_modules({
++        node => 'localhost',
++        modules => $modules,
++    });
++}
++
++sub assert_rejected {
++    my ($modules, $pattern, $label) = @_;
++    my $before = read_file($PVE::API2::KernelModules::LOAD_FILE);
++    unlink("$root/modprobe.log");
++
++    my $result = eval { put_modules($modules) };
++    like($@, $pattern, "$label: error message");
++    is(read_file($PVE::API2::KernelModules::LOAD_FILE), $before, "$label: file unchanged");
++    ok(!-e "$root/modprobe.log", "$label: modprobe not run");
++}
++
++my $initial = PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' });
++is_deeply($initial, { modules => [], loaded => {} }, 'a missing load file lists no modules');
++
++assert_rejected(['Bad-Name'], qr/'Bad-Name'.*does not match/, 'malformed name');
++assert_rejected(['loaded_mod', 'bad name'], qr/'bad name'.*does not match/, 'name with space');
++assert_rejected(['not_allowed'], qr/'not_allowed'.*not in /, 'name outside the allowlist');
++assert_rejected(
++    ['loaded_mod', 'builtin_mod'],
++    qr/'builtin_mod'.*built into the running kernel/,
++    'builtin module',
++);
++assert_rejected(['missing_mod'], qr/'missing_mod'.*modinfo -n fails/, 'module without modinfo');
++assert_rejected(
++    ['missing_mod'],
++    qr/modinfo: ERROR: Module missing_mod not found\./,
++    'modinfo failure includes its stderr',
++);
++
++my $state = put_modules(['loaded_mod', 'unloaded_mod', 'loaded_mod']);
++is(
++    read_file($PVE::API2::KernelModules::LOAD_FILE),
++    "loaded_mod\nunloaded_mod\n",
++    'the load file lists each name once, one per line',
++);
++is(read_file("$root/modprobe.log"), "loaded_mod\nunloaded_mod\n", 'modprobe runs for each name');
++is_deeply(
++    $state,
++    {
++        modules => ['loaded_mod', 'unloaded_mod'],
++        loaded => { loaded_mod => 1, unloaded_mod => 0 },
++    },
++    'PUT returns the module list and the loaded flags',
++);
++is_deeply(
++    PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' }),
++    $state,
++    'GET returns the state that PUT wrote',
++);
++
++$state = put_modules(['second_mod']);
++is(read_file($PVE::API2::KernelModules::LOAD_FILE), "second_mod\n", 'PUT replaces the list');
++
++my $before_failure = read_file($PVE::API2::KernelModules::LOAD_FILE);
++unlink("$root/modprobe.log");
++eval { put_modules(['loaded_mod', 'fail_mod']) };
++like($@, qr/fail_mod/, 'a modprobe failure error includes the module name');
++like(
++    $@,
++    qr/modprobe: FATAL: Module fail_mod cannot be inserted\./,
++    'a modprobe failure error includes the modprobe stderr',
++);
++is(
++    read_file($PVE::API2::KernelModules::LOAD_FILE),
++    $before_failure,
++    'a modprobe failure keeps the load file unchanged',
++);
++is(
++    read_file("$root/modprobe.log"),
++    "loaded_mod\nfail_mod\n",
++    'modprobe runs in request order until the failure',
++);
++
++$state = put_modules([]);
++is(read_file($PVE::API2::KernelModules::LOAD_FILE), '', 'an empty list empties the load file');
++is_deeply($state, { modules => [], loaded => {} }, 'PUT of an empty list returns no modules');
++
++put_modules(['loaded_mod']);
++for my $invalid ({ name => 'loaded_mod' }, undef) {
++    eval { put_modules($invalid) };
++    like($@, qr/modules/, 'the schema rejects a modules value that is not an array');
++}
++eval { PVE::API2::KernelModules->set_kernel_modules({ node => 'localhost' }) };
++like($@, qr/modules/, 'the schema rejects a request without modules');
++is(read_file($PVE::API2::KernelModules::LOAD_FILE), "loaded_mod\n", 'rejected shapes keep the file');
++
++write_file(
++    $PVE::API2::KernelModules::LOAD_FILE,
++    "# managed by hand\nloaded_mod\n; disabled\n  # indented comment\nunloaded_mod\n\n",
++    0644,
++);
++is_deeply(
++    PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' }),
++    {
++        modules => ['loaded_mod', 'unloaded_mod'],
++        loaded => { loaded_mod => 1, unloaded_mod => 0 },
++    },
++    'GET skips comment lines that start with # or ;',
++);
++
++write_file(
++    $PVE::API2::KernelModules::ALLOW_FILE,
++    "# allowed modules\nloaded_mod\n; more modules\nunloaded_mod\n",
++    0644,
++);
++$state = put_modules(['loaded_mod', 'unloaded_mod']);
++is_deeply(
++    $state->{modules},
++    ['loaded_mod', 'unloaded_mod'],
++    'an allowlist with comment lines still accepts its module entries',
++);
++assert_rejected(['# allowed modules'], qr/'# allowed modules'/, 'allowlist comment text');
++assert_rejected(['; more modules'], qr/'; more modules'/, 'allowlist semicolon comment text');
++
++unlink($PVE::API2::KernelModules::ALLOW_FILE);
++assert_rejected(['loaded_mod'], qr/'loaded_mod'.*not in /, 'a missing allowlist is empty');
++
++done_testing();
+diff --git a/test/Makefile b/test/Makefile
+index 2dfd20a4..2c8c4f3c 100644
+--- a/test/Makefile
++++ b/test/Makefile
+@@ -5,7 +5,11 @@ all:
+ export PERLLIB=..
+ 
+ .PHONY: check
+-check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh
++check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh test-kernel-modules
++
++.PHONY: test-kernel-modules
++test-kernel-modules:
++	./KernelModules_test.pl
+ 
+ .PHONY: test-balloon
+ test-balloon:

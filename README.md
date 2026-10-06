@@ -15,6 +15,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - Six `Sys.ACME.Plugin` privileges read, add, change, and delete one DNS plugin. The stored credentials have one privilege for reads and one for writes.
 - `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.
 - Four `Sys.ACME.Config` privileges read and change only the ACME options of one node.
+- `Sys.KernelModules.Audit` reads one node's persistent kernel module list. `Sys.KernelModules.Modify` sets the list and loads allowlisted modules.
 
 The [permission reference](docs/permissions.md) lists the ACL path and the API method for each privilege.
 
