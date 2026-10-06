@@ -1,8 +1,8 @@
 diff --git a/README b/README
-index 1e64786..4417cad 100644
+index 1e64786..97fac16 100644
 --- a/README
 +++ b/README
-@@ -90,6 +90,23 @@ privileges:
+@@ -90,9 +90,28 @@ privileges:
  	Realm.Allocate: create/modify/remove authentication realms
  	SDN.Allocate: manage SDN configuration
  	SDN.Audit: view SDN configuration
@@ -26,7 +26,12 @@ index 1e64786..4417cad 100644
  	Sys.Audit: view node status/config, Corosync cluster config, and HA config
  	Sys.Console: console access to node
  	Sys.Incoming: allow incoming data streams from other clusters (experimental)
-@@ -105,15 +122,25 @@ privileges:
++	Sys.KernelModules.Audit: view the persistent kernel module list of a node
++	Sys.KernelModules.Modify: set the persistent kernel module list of a node
+ 	Sys.Modify: create/modify/remove node network parameters
+ 	Sys.PowerMgmt: node power management (start, stop, reset, shutdown, ...)
+ 	Sys.Syslog: view syslog
+@@ -105,15 +124,25 @@ privileges:
  	VM.Audit: view VM config
  	VM.Backup: backup/restore VMs
  	VM.Clone: clone/copy a VM
@@ -53,7 +58,7 @@ index 1e64786..4417cad 100644
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
  	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index 8879ab8..d74eac2 100644
+index 8879ab8..c80d983 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
 @@ -1049,6 +1049,113 @@ sub delete_pool_acl {
@@ -187,7 +192,7 @@ index 8879ab8..d74eac2 100644
          admin => [
              'VM.Config.Disk',
              'VM.Config.CPU',
-@@ -1092,6 +1207,23 @@ my $privgroups = {
+@@ -1092,6 +1207,25 @@ my $privgroups = {
              'Sys.Modify', # edit/change node settings
              'Sys.Incoming', # incoming storage/guest migrations
              'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
@@ -208,10 +213,12 @@ index 8879ab8..d74eac2 100644
 +            'Sys.ACME.Config.Account.Modify',
 +            'Sys.ACME.Config.Domain.Modify',
 +            'Sys.ACME.Config.Domain.Remove',
++            'Sys.KernelModules.Audit',
++            'Sys.KernelModules.Modify',
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1282,6 +1414,11 @@ sub check_path {
+@@ -1282,6 +1416,11 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -236,10 +243,10 @@ index 53f2da7..1ebb36f 100644
  	perl -I.. api-tests.pl
 diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
 new file mode 100755
-index 0000000..0d253a9
+index 0000000..439310e
 --- /dev/null
 +++ b/src/test/bpf-delegate-test.pl
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,63 @@
 +#!/usr/bin/perl -w
 +
 +use strict;
@@ -291,7 +298,10 @@ index 0000000..0d253a9
 +    die "name '$rejected' was accepted\n" if !$@;
 +}
 +
-+for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite)) {
++for my $privilege (
++    qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite
++    Sys.KernelModules.Audit Sys.KernelModules.Modify)
++) {
 +    die "privilege '$privilege' is not registered\n"
 +        if !PVE::AccessControl::verify_privname($privilege, 1);
 +    print "OK:registered:$privilege\n";
@@ -301,7 +311,7 @@ index 0000000..0d253a9
 +
 +exit(0);
 diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
-index d323447..86d7147 100755
+index d323447..82afec3 100755
 --- a/src/test/perm-test1.pl
 +++ b/src/test/perm-test1.pl
 @@ -70,10 +70,8 @@ check_permission(
@@ -321,6 +331,7 @@ index d323447..86d7147 100755
          . 'Pool.Allocate,Pool.Audit,'
          . 'Realm.Allocate,Realm.AllocateUser,'
          . 'SDN.Allocate,SDN.Audit,SDN.Use,'
+-        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
 +        . 'Sys.ACME.Account.Audit,Sys.ACME.Account.Create,Sys.ACME.Account.Modify,'
 +        . 'Sys.ACME.Account.Remove,'
 +        . 'Sys.ACME.Certificate.Order,Sys.ACME.Certificate.Renew,Sys.ACME.Certificate.Revoke,'
@@ -328,7 +339,7 @@ index d323447..86d7147 100755
 +        . 'Sys.ACME.Config.Domain.Remove,'
 +        . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
 +        . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
-         . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
++        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
          . 'User.Modify,'
          . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
 -        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'

@@ -33,6 +33,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.ACME.Config.Account.Modify` | `/nodes/<node>` | Set or delete the `acme` option of the node config |
 | `Sys.ACME.Config.Domain.Modify` | `/nodes/<node>` | Set an `acmedomain<n>` option of the node config |
 | `Sys.ACME.Config.Domain.Remove` | `/nodes/<node>` | Delete an `acmedomain<n>` option of the node config |
+| `Sys.KernelModules.Audit` | `/nodes/<node>` | Read the node's persistent kernel module list and loaded status |
+| `Sys.KernelModules.Modify` | `/nodes/<node>` | Set the node's persistent kernel module list and load its allowlisted modules |
 
 ## ACL paths
 
@@ -146,6 +148,30 @@ The worker stores the result in `/run/pve/lxc-exec/<vmid>/<pid>`, which only `ro
 | `DELETE` | `/cluster/acme/account/{name}` | `Sys.ACME.Account.Remove` on `/acme/accounts/{name}` |
 
 `root@pam` passes every check. An account privilege grants no plugin, certificate, or node option operation.
+
+## Kernel module methods
+
+| Method | Path | Requirement |
+| --- | --- | --- |
+| `GET` | `/nodes/{node}/kernel-modules` | `Sys.KernelModules.Audit` on `/nodes/{node}` |
+| `PUT` | `/nodes/{node}/kernel-modules` | `Sys.KernelModules.Modify` on `/nodes/{node}` |
+
+`GET` runs in `pveproxy`. The `modules` field returns names from `/etc/modules-load.d/pve-overlay.conf` in file order. The `loaded` field contains one flag per name. Each flag is `1` when `/sys/module/<name>` exists and `0` otherwise.
+
+The OpenTofu overlay module in `agoodkind/configs` writes each host's `/etc/pve-overlay/kernel-modules.allow` with one name per line. A missing allowlist file permits no names. The API cannot change the allowlist.
+
+`PUT` runs as root in `pvedaemon`. The method accepts a `modules` array, including an empty array. Each name must satisfy all these conditions:
+
+- The name matches `^[a-z0-9_]+$`.
+- The allowlist includes the name.
+- `modinfo -n` succeeds for the running kernel.
+- `modinfo -n` does not print `(builtin)`.
+
+`PUT` rejects the whole request before writing if any condition fails. The error identifies the name and failed condition.
+
+`PUT` removes duplicate names, then runs `/sbin/modprobe -- <name>` for each accepted name in request order. `PUT` writes the accepted names to the persistent module file, one per line, only after every command exits 0. A `modprobe` failure stops the request with an error containing the module name and standard error. The persistent file retains its pre-request content. Modules loaded before the failure remain loaded. A successful request returns the `GET` result. `PUT` never unloads a module. A failed `modinfo -n` check rejects the request with the existing condition message plus any nonempty standard error.
+
+At boot, `systemd-modules-load.service` reads `/etc/modules-load.d` before `pve-guests.service` starts guests.
 
 ## Tokens
 
