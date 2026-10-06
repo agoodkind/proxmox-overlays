@@ -1,5 +1,5 @@
 diff --git a/README b/README
-index 1e64786..4417cad 100644
+index 1e64786..b8cbb77 100644
 --- a/README
 +++ b/README
 @@ -90,6 +90,23 @@ privileges:
@@ -26,16 +26,7 @@ index 1e64786..4417cad 100644
  	Sys.Audit: view node status/config, Corosync cluster config, and HA config
  	Sys.Console: console access to node
  	Sys.Incoming: allow incoming data streams from other clusters (experimental)
-@@ -105,15 +122,25 @@ privileges:
- 	VM.Audit: view VM config
- 	VM.Backup: backup/restore VMs
- 	VM.Clone: clone/copy a VM
-+	VM.Config.BPFDelegate.Attach.<Name>: delegate one BPF attach type to a container
-+	VM.Config.BPFDelegate.Cmd.<Name>: delegate one BPF command to a container
-+	VM.Config.BPFDelegate.Map.<Name>: delegate one BPF map type to a container
-+	VM.Config.BPFDelegate.Prog.<Name>: delegate one BPF program type to a container
- 	VM.Config.CDROM: eject/change CD-ROM
- 	VM.Config.CPU: modify CPU settings
+@@ -110,9 +127,12 @@ privileges:
  	VM.Config.Cloudinit: modify Cloud-init parameters
  	VM.Config.Disk: add/modify/remove disks
  	VM.Config.HWType: modify emulated hardware types
@@ -46,131 +37,13 @@ index 1e64786..4417cad 100644
  	VM.Config.Options: modify any other VM configuration
 +	VM.Config.Vsock: add/modify/remove the virtio-vsock device
  	VM.Console: console access to VM
-+	VM.Guest.Exec: run a command as root in a container
-+	VM.Guest.FileRead: read a file in a container
-+	VM.Guest.FileWrite: write a file in a container
  	VM.GuestAgent.Audit: issue informational QEMU guest agent commands
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
- 	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index 8879ab8..d74eac2 100644
+index 8879ab8..494e9fa 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
-@@ -1049,6 +1049,113 @@ sub delete_pool_acl {
-     delete($usercfg->{acl_root}->{children}->{pool}->{children}->{$pool});
- }
- 
-+# Each list is the set of values that the bpffs mount options delegate_cmds, delegate_maps,
-+# delegate_progs, and delegate_attachs accept. A value is a lowercase enum constant of
-+# include/uapi/linux/bpf.h in Linux v7.0 without the BPF_, BPF_MAP_TYPE_, or BPF_PROG_TYPE_
-+# prefix. The lists exclude UNSPEC, the __MAX_* entries, and constants that alias another
-+# constant.
-+# PVE::LXC::Config validates the container option bpfdelegate against these lists. Each value
-+# has one VM.Config.BPFDelegate privilege.
-+my $bpf_delegate_tokens = {
-+    cmds => [
-+        qw(
-+            map_create map_lookup_elem map_update_elem map_delete_elem map_get_next_key
-+            prog_load obj_pin obj_get prog_attach prog_detach prog_test_run prog_get_next_id
-+            map_get_next_id prog_get_fd_by_id map_get_fd_by_id obj_get_info_by_fd prog_query
-+            raw_tracepoint_open btf_load btf_get_fd_by_id task_fd_query
-+            map_lookup_and_delete_elem map_freeze btf_get_next_id map_lookup_batch
-+            map_lookup_and_delete_batch map_update_batch map_delete_batch link_create
-+            link_update link_get_fd_by_id link_get_next_id enable_stats iter_create link_detach
-+            prog_bind_map token_create prog_stream_read_by_fd prog_assoc_struct_ops
-+        ),
-+    ],
-+    maps => [
-+        qw(
-+            hash array prog_array perf_event_array percpu_hash percpu_array stack_trace
-+            cgroup_array lru_hash lru_percpu_hash lpm_trie array_of_maps hash_of_maps devmap
-+            sockmap cpumap xskmap sockhash cgroup_storage_deprecated reuseport_sockarray
-+            percpu_cgroup_storage_deprecated queue stack sk_storage devmap_hash struct_ops
-+            ringbuf inode_storage task_storage bloom_filter user_ringbuf cgrp_storage arena
-+            insn_array
-+        ),
-+    ],
-+    progs => [
-+        qw(
-+            socket_filter kprobe sched_cls sched_act tracepoint xdp perf_event cgroup_skb
-+            cgroup_sock lwt_in lwt_out lwt_xmit sock_ops sk_skb cgroup_device sk_msg
-+            raw_tracepoint cgroup_sock_addr lwt_seg6local lirc_mode2 sk_reuseport flow_dissector
-+            cgroup_sysctl raw_tracepoint_writable cgroup_sockopt tracing struct_ops ext lsm
-+            sk_lookup syscall netfilter
-+        ),
-+    ],
-+    attachs => [
-+        qw(
-+            cgroup_inet_ingress cgroup_inet_egress cgroup_inet_sock_create cgroup_sock_ops
-+            sk_skb_stream_parser sk_skb_stream_verdict cgroup_device sk_msg_verdict
-+            cgroup_inet4_bind cgroup_inet6_bind cgroup_inet4_connect cgroup_inet6_connect
-+            cgroup_inet4_post_bind cgroup_inet6_post_bind cgroup_udp4_sendmsg
-+            cgroup_udp6_sendmsg lirc_mode2 flow_dissector cgroup_sysctl cgroup_udp4_recvmsg
-+            cgroup_udp6_recvmsg cgroup_getsockopt cgroup_setsockopt trace_raw_tp trace_fentry
-+            trace_fexit modify_return lsm_mac trace_iter cgroup_inet4_getpeername
-+            cgroup_inet6_getpeername cgroup_inet4_getsockname cgroup_inet6_getsockname
-+            xdp_devmap cgroup_inet_sock_release xdp_cpumap sk_lookup xdp sk_skb_verdict
-+            sk_reuseport_select sk_reuseport_select_or_migrate perf_event trace_kprobe_multi
-+            lsm_cgroup struct_ops netfilter tcx_ingress tcx_egress trace_uprobe_multi
-+            cgroup_unix_connect cgroup_unix_sendmsg cgroup_unix_recvmsg cgroup_unix_getpeername
-+            cgroup_unix_getsockname netkit_primary netkit_peer trace_kprobe_session
-+            trace_uprobe_session trace_fsession
-+        ),
-+    ],
-+};
-+
-+my $bpf_delegate_kinds = [qw(cmds maps progs attachs)];
-+
-+my $bpf_delegate_privilege_prefix = {
-+    cmds => 'VM.Config.BPFDelegate.Cmd',
-+    maps => 'VM.Config.BPFDelegate.Map',
-+    progs => 'VM.Config.BPFDelegate.Prog',
-+    attachs => 'VM.Config.BPFDelegate.Attach',
-+};
-+
-+my $bpf_delegate_privileges = {};
-+for my $kind (@$bpf_delegate_kinds) {
-+    for my $token (@{ $bpf_delegate_tokens->{$kind} }) {
-+        my $camel_case = join('', map { ucfirst($_) } split(/_/, $token));
-+        $bpf_delegate_privileges->{$kind}->{$token} =
-+            "$bpf_delegate_privilege_prefix->{$kind}.$camel_case";
-+    }
-+}
-+
-+sub bpf_delegate_kinds {
-+    return [@$bpf_delegate_kinds];
-+}
-+
-+sub bpf_delegate_tokens {
-+    my ($kind) = @_;
-+
-+    my $tokens = $bpf_delegate_tokens->{$kind};
-+    die "unknown bpf delegate list '$kind'\n" if !$tokens;
-+    return [@$tokens];
-+}
-+
-+sub bpf_delegate_privilege {
-+    my ($kind, $token) = @_;
-+
-+    my $privilege = $bpf_delegate_privileges->{$kind}->{$token};
-+    die "unknown bpf delegate name '$token' in '$kind'\n" if !$privilege;
-+    return $privilege;
-+}
-+
-+sub bpf_delegate_privileges {
-+    my $privileges = [];
-+    for my $kind (@$bpf_delegate_kinds) {
-+        for my $token (@{ $bpf_delegate_tokens->{$kind} }) {
-+            push @$privileges, $bpf_delegate_privileges->{$kind}->{$token};
-+        }
-+    }
-+    return $privileges;
-+}
-+
- # we automatically create some predefined roles by splitting privs
- # into 3 groups (per category)
- # root: only root is allowed to do that
-@@ -1056,7 +1163,15 @@ sub delete_pool_acl {
+@@ -1056,7 +1056,11 @@ sub delete_pool_acl {
  # user: a normal user/customer can to that
  my $privgroups = {
      VM => {
@@ -179,15 +52,11 @@ index 8879ab8..d74eac2 100644
 +            'VM.Config.Nesting',
 +            'VM.Config.Keyctl',
 +            'VM.Config.Vsock',
-+            'VM.Guest.Exec',
-+            'VM.Guest.FileRead',
-+            'VM.Guest.FileWrite',
-+            @{ bpf_delegate_privileges() },
 +        ],
          admin => [
              'VM.Config.Disk',
              'VM.Config.CPU',
-@@ -1092,6 +1207,23 @@ my $privgroups = {
+@@ -1092,6 +1096,23 @@ my $privgroups = {
              'Sys.Modify', # edit/change node settings
              'Sys.Incoming', # incoming storage/guest migrations
              'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
@@ -211,7 +80,7 @@ index 8879ab8..d74eac2 100644
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1282,6 +1414,11 @@ sub check_path {
+@@ -1282,6 +1303,11 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -223,101 +92,11 @@ index 8879ab8..d74eac2 100644
  	|/access
  	|/access/groups
  	|/access/groups/[[:alnum:]\.\-\_]+
-diff --git a/src/test/Makefile b/src/test/Makefile
-index 53f2da7..1ebb36f 100644
---- a/src/test/Makefile
-+++ b/src/test/Makefile
-@@ -12,5 +12,6 @@ check:
- 	perl -I.. perm-test6.pl
- 	perl -I.. perm-test7.pl
- 	perl -I.. perm-test8.pl
-+	perl -I.. bpf-delegate-test.pl
- 	perl -I.. realm_sync_test.pl
- 	perl -I.. api-tests.pl
-diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
-new file mode 100755
-index 0000000..0d253a9
---- /dev/null
-+++ b/src/test/bpf-delegate-test.pl
-@@ -0,0 +1,60 @@
-+#!/usr/bin/perl -w
-+
-+use strict;
-+use warnings;
-+
-+use PVE::AccessControl;
-+
-+sub check_equal {
-+    my ($label, $got, $expected) = @_;
-+
-+    die "unexpected result for $label\nneed '${expected}'\ngot '${got}'\n" if $got ne $expected;
-+    print "OK:$label:$got\n";
-+}
-+
-+my $privileges = PVE::AccessControl::bpf_delegate_privileges();
-+my $unique = {};
-+for my $privilege (@$privileges) {
-+    $unique->{$privilege} = 1;
-+    die "invalid privilege name '$privilege'\n"
-+        if $privilege !~ /^VM\.Config\.BPFDelegate\.(Cmd|Map|Prog|Attach)\.[A-Z][A-Za-z0-9]*\z/;
-+    die "privilege '$privilege' is not registered\n"
-+        if !PVE::AccessControl::verify_privname($privilege, 1);
-+}
-+check_equal('unique privileges', scalar(keys %$unique), scalar(@$privileges));
-+
-+check_equal(
-+    'cmd prog_load',
-+    PVE::AccessControl::bpf_delegate_privilege('cmds', 'prog_load'),
-+    'VM.Config.BPFDelegate.Cmd.ProgLoad',
-+);
-+check_equal(
-+    'map hash',
-+    PVE::AccessControl::bpf_delegate_privilege('maps', 'hash'),
-+    'VM.Config.BPFDelegate.Map.Hash',
-+);
-+check_equal(
-+    'prog sched_cls',
-+    PVE::AccessControl::bpf_delegate_privilege('progs', 'sched_cls'),
-+    'VM.Config.BPFDelegate.Prog.SchedCls',
-+);
-+check_equal(
-+    'attach tcx_ingress',
-+    PVE::AccessControl::bpf_delegate_privilege('attachs', 'tcx_ingress'),
-+    'VM.Config.BPFDelegate.Attach.TcxIngress',
-+);
-+
-+for my $rejected ('any', '0x4', 'unspec', 'prog_run', 'PROG_LOAD', 'bpf_prog_load') {
-+    eval { PVE::AccessControl::bpf_delegate_privilege('cmds', $rejected) };
-+    die "name '$rejected' was accepted\n" if !$@;
-+}
-+
-+for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite)) {
-+    die "privilege '$privilege' is not registered\n"
-+        if !PVE::AccessControl::verify_privname($privilege, 1);
-+    print "OK:registered:$privilege\n";
-+}
-+
-+print "all tests passed\n";
-+
-+exit(0);
 diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
-index d323447..86d7147 100755
+index d323447..f9fbdc4 100755
 --- a/src/test/perm-test1.pl
 +++ b/src/test/perm-test1.pl
-@@ -70,10 +70,8 @@ check_permission(
-         . 'VM.Snapshot,VM.Snapshot.Rollback',
- );
- # Administrator -> Permissions.Modify!
--check_permission(
--    'alex@pve',
--    '/vms/400',
--    '' # sorted, comma-separated expected privilege string, loosely grouped by prefix
-+my $administrator_privileges =
-+    '' # comma-separated expected privileges without the BPFDelegate ones, loosely grouped by prefix
-         . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
-         . 'Group.Allocate,'
-         . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
-@@ -81,13 +79,29 @@ check_permission(
+@@ -81,10 +81,18 @@ check_permission(
          . 'Pool.Allocate,Pool.Audit,'
          . 'Realm.Allocate,Realm.AllocateUser,'
          . 'SDN.Allocate,SDN.Audit,SDN.Use,'
@@ -332,21 +111,8 @@ index d323447..86d7147 100755
          . 'User.Modify,'
          . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
 -        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'
--        . 'VM.Console,VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
 +        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'
 +        . 'VM.Config.Network,VM.Config.Options,VM.Config.Vsock,'
-+        . 'VM.Console,VM.Guest.Exec,VM.Guest.FileRead,VM.Guest.FileWrite,'
-+        . 'VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
+         . 'VM.Console,VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
          . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
--        . 'VM.Snapshot,VM.Snapshot.Rollback',
-+        . 'VM.Snapshot,VM.Snapshot.Rollback';
-+
-+my @expected_administrator_privileges = split(/,/, $administrator_privileges);
-+push @expected_administrator_privileges, @{ PVE::AccessControl::bpf_delegate_privileges() };
-+check_permission(
-+    'alex@pve',
-+    '/vms/400',
-+    join(',', sort @expected_administrator_privileges),
- );
- 
- check_roles('max@pve', '/vms/200', 'storage_manager');
+         . 'VM.Snapshot,VM.Snapshot.Rollback',
