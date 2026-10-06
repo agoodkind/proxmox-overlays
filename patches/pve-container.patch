@@ -745,7 +745,7 @@ index 805eac0..2973b92 100644
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..fbf3f92 100644
+index dee073d..089601e 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -694,6 +694,30 @@ sub make_apparmor_config {
@@ -969,7 +969,7 @@ index dee073d..fbf3f92 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2532,167 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2438,6 +2532,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1081,12 +1081,17 @@ index dee073d..fbf3f92 100644
 +        # Verify the mount namespace after the helper calls setns.
 +        # The helper does not report setns failures.
 +        my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
++        opendir(my $host_proc_dir, '/proc/self')
++            or die "failed to open the host process directory: $!\n";
 +        # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
 +        # The lxc-pve-overlay-mount profile permits the BPF mount operation.
 +        $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
-+        my ($current_dev, $current_ino) = (stat('/proc/self/ns/mnt'))[0, 1];
++        chdir($host_proc_dir) or die "failed to change to the host process directory: $!\n";
++        my ($current_dev, $current_ino) = (stat('ns/mnt'))[0, 1];
++        chdir('/')
++            or die "failed to change directory within the container mount namespace: $!\n";
 +        die "failed to enter the container mount namespace\n"
-+            if $ns_dev != $current_dev || $ns_ino != $current_ino;
++            if !defined($current_ino) || $ns_dev != $current_dev || $ns_ino != $current_ino;
 +
 +        my $target = $BPF_DELEGATE_MOUNT_TARGET;
 +        PVE::Tools::move_mount(
