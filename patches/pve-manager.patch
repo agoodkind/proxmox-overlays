@@ -309,10 +309,10 @@ index 2f210903..0b780254 100644
              undef,
 diff --git a/PVE/API2/KernelModules.pm b/PVE/API2/KernelModules.pm
 new file mode 100644
-index 00000000..1260ac19
+index 00000000..de202c28
 --- /dev/null
 +++ b/PVE/API2/KernelModules.pm
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,189 @@
 +package PVE::API2::KernelModules;
 +
 +use strict;
@@ -324,13 +324,11 @@ index 00000000..1260ac19
 +
 +use base qw(PVE::RESTHandler);
 +
-+use vars qw($LOAD_FILE $ALLOW_FILE $SYS_MODULE_DIR $MODINFO_COMMAND $MODPROBE_COMMAND);
-+
-+$LOAD_FILE = '/etc/modules-load.d/pve-overlay.conf';
-+$ALLOW_FILE = '/etc/pve-overlay/kernel-modules.allow';
-+$SYS_MODULE_DIR = '/sys/module';
-+$MODINFO_COMMAND = '/sbin/modinfo';
-+$MODPROBE_COMMAND = '/sbin/modprobe';
++my $LOAD_FILE = '/etc/modules-load.d/pve-overlay.conf';
++my $ALLOW_FILE = '/etc/pve-overlay/kernel-modules.allow';
++my $SYS_MODULE_DIR = '/sys/module';
++my $MODINFO_COMMAND = '/sbin/modinfo';
++my $MODPROBE_COMMAND = '/sbin/modprobe';
 +
 +my $LOAD_FILE_MODE = 0644;
 +my $BUILTIN_MARKER = '(builtin)';
@@ -505,10 +503,10 @@ index 00000000..1260ac19
 +
 +1;
 diff --git a/PVE/API2/Makefile b/PVE/API2/Makefile
-index 97f1cc20..5fe55456 100644
+index 97f1cc20..515f3ef0 100644
 --- a/PVE/API2/Makefile
 +++ b/PVE/API2/Makefile
-@@ -14,6 +14,7 @@ PERLSOURCE = 			\
+@@ -14,12 +14,14 @@ PERLSOURCE = 			\
  	Cluster.pm		\
  	HAConfig.pm		\
  	Hardware.pm		\
@@ -516,6 +514,13 @@ index 97f1cc20..5fe55456 100644
  	Network.pm		\
  	NodeConfig.pm		\
  	Nodes.pm		\
+ 	Pool.pm			\
+ 	Replication.pm		\
+ 	ReplicationConfig.pm	\
++	SRIOV.pm		\
+ 	Services.pm		\
+ 	Subscription.pm		\
+ 	Tasks.pm		\
 diff --git a/PVE/API2/NodeConfig.pm b/PVE/API2/NodeConfig.pm
 index cc726dac..f0b774ad 100644
 --- a/PVE/API2/NodeConfig.pm
@@ -626,10 +631,10 @@ index cc726dac..f0b774ad 100644
              my $conf = PVE::NodeConfig::load_config($node);
  
 diff --git a/PVE/API2/Nodes.pm b/PVE/API2/Nodes.pm
-index 2ca3244d..a657bd03 100644
+index 2ca3244d..f6f96ce2 100644
 --- a/PVE/API2/Nodes.pm
 +++ b/PVE/API2/Nodes.pm
-@@ -49,6 +49,7 @@ use PVE::API2::Certificates;
+@@ -49,11 +49,13 @@ use PVE::API2::Certificates;
  use PVE::API2::Disks;
  use PVE::API2::Firewall::Host;
  use PVE::API2::Hardware;
@@ -637,7 +642,13 @@ index 2ca3244d..a657bd03 100644
  use PVE::API2::LXC::Status;
  use PVE::API2::LXC;
  use PVE::API2::Network;
-@@ -199,6 +200,11 @@ __PACKAGE__->register_method({
+ use PVE::API2::Network::SDN::Nodes::Status;
+ use PVE::API2::NodeConfig;
++use PVE::API2::SRIOV;
+ use PVE::API2::Qemu::CPU;
+ use PVE::API2::Qemu;
+ use PVE::API2::Replication;
+@@ -199,6 +201,16 @@ __PACKAGE__->register_method({
      path => 'config',
  });
  
@@ -646,15 +657,604 @@ index 2ca3244d..a657bd03 100644
 +    path => 'kernel-modules',
 +});
 +
++__PACKAGE__->register_method({
++    subclass => "PVE::API2::SRIOV",
++    path => 'sriov',
++});
++
  __PACKAGE__->register_method({
      subclass => "PVE::API2::Network::SDN::Nodes::Status",
      path => 'sdn',
-diff --git a/test/KernelModules_test.pl b/test/KernelModules_test.pl
-new file mode 100755
-index 00000000..5b053687
+diff --git a/PVE/API2/SRIOV.pm b/PVE/API2/SRIOV.pm
+new file mode 100644
+index 00000000..cdc65e0b
 --- /dev/null
-+++ b/test/KernelModules_test.pl
-@@ -0,0 +1,193 @@
++++ b/PVE/API2/SRIOV.pm
+@@ -0,0 +1,523 @@
++package PVE::API2::SRIOV;
++
++use strict;
++use warnings;
++
++use File::Path qw(make_path);
++use JSON qw(decode_json);
++
++use PVE::File;
++use PVE::JSONSchema qw(get_standard_option);
++use PVE::Tools qw(run_command lock_file);
++
++use base qw(PVE::RESTHandler);
++
++use vars qw(
++    $STATE_DIR $ALLOW_FILE $SYS_NET_DIR $SYS_PCI_DRIVER_DIR $LOCK_DIR
++    $IP_COMMAND $ETHTOOL_COMMAND $SYSTEMCTL_COMMAND
++    $SETTLE_ATTEMPTS $SETTLE_INTERVAL
++);
++
++$STATE_DIR = '/etc/pve-overlay/sriov';
++$ALLOW_FILE = '/etc/pve-overlay/sriov.allow';
++$SYS_NET_DIR = '/sys/class/net';
++$SYS_PCI_DRIVER_DIR = '/sys/bus/pci/drivers';
++$LOCK_DIR = '/run/lock';
++$IP_COMMAND = '/sbin/ip';
++$ETHTOOL_COMMAND = '/sbin/ethtool';
++$SYSTEMCTL_COMMAND = '/bin/systemctl';
++$SETTLE_ATTEMPTS = 50;
++$SETTLE_INTERVAL = 0.2;
++
++my $STATE_FILE_MODE = 0644;
++my $IFNAME_PATTERN = '^[a-zA-Z0-9_.-]{1,15}$';
++my $LINK_STATES = ['auto', 'enable', 'disable'];
++my $DEFAULT_LINK_STATE = 'auto';
++my $MAC_PATTERN = qr/^([0-9a-f]{2}(?::[0-9a-f]{2}){5})\z/;
++my $UNICAST_BIT = 0x01;
++
++my $read_names = sub {
++    my ($path) = @_;
++
++    return [] if !-e $path;
++
++    my $names = [];
++    for my $line (split(/\n/, PVE::File::file_get_contents($path))) {
++        $line =~ s/^\s+|\s+$//g;
++        next if $line eq '' || $line =~ /^[#;]/;
++        push @$names, $line;
++    }
++    return $names;
++};
++
++my $read_sysfs_number = sub {
++    my ($path) = @_;
++
++    my $content = PVE::File::file_get_contents($path);
++    $content =~ s/^\s+|\s+$//g;
++    die "The file $path does not contain a number.\n" if $content !~ /^(\d+)\z/;
++    return int($1);
++};
++
++my $write_sysfs = sub {
++    my ($path, $value) = @_;
++
++    open(my $handle, '>', $path) or die "cannot open $path: $!\n";
++    my $written = syswrite($handle, $value);
++    my $write_error = $!;
++    close($handle) or die "cannot write '$value' to $path: $!\n";
++    die "cannot write '$value' to $path: $write_error\n" if !defined($written);
++};
++
++my $step_error = sub {
++    my ($step, $ifname, $index, $detail) = @_;
++
++    my $where = "port '$ifname'";
++    $where = "VF $index of port '$ifname'" if defined($index);
++    $detail =~ s/^\s+|\s+$//g;
++    die "The SR-IOV step '$step' failed for $where: $detail\n";
++};
++
++my $run_step = sub {
++    my ($step, $ifname, $index, $command) = @_;
++
++    my $errors = '';
++    eval {
++        run_command(
++            $command,
++            outfunc => sub { },
++            errfunc => sub { $errors .= shift() . "\n" },
++        );
++    };
++    if ($@) {
++        my $detail = $errors;
++        $detail = $@ if $detail =~ /^\s*$/;
++        $step_error->($step, $ifname, $index, $detail);
++    }
++};
++
++my $validate_ifname = sub {
++    my ($ifname) = @_;
++
++    die "Port name '$ifname' does not match the required pattern $IFNAME_PATTERN.\n"
++        if $ifname !~ /^([a-zA-Z0-9_.-]{1,15})\z/;
++    my $untainted = $1;
++
++    die "Port '$untainted' has no SR-IOV support: $SYS_NET_DIR/$untainted/device/sriov_totalvfs is missing.\n"
++        if !-e "$SYS_NET_DIR/$untainted/device/sriov_totalvfs";
++
++    return $untainted;
++};
++
++my $port_dir = sub {
++    my ($ifname) = @_;
++    return "$SYS_NET_DIR/$ifname/device";
++};
++
++my $read_vf_table = sub {
++    my ($ifname) = @_;
++
++    my $output = '';
++    my $errors = '';
++    eval {
++        run_command(
++            [$IP_COMMAND, 'link', 'show', 'dev', $ifname],
++            outfunc => sub { $output .= shift() . "\n" },
++            errfunc => sub { $errors .= shift() . "\n" },
++        );
++    };
++    if ($@) {
++        my $detail = $errors;
++        $detail = $@ if $detail =~ /^\s*$/;
++        $step_error->('read', $ifname, undef, $detail);
++    }
++
++    my $table = {};
++    for my $line (split(/\n/, $output)) {
++        next if $line !~ /^\s*vf (\d+)\s+.*?link\/ether ([0-9a-fA-F:]{17})\b(.*)$/;
++        my ($index, $mac, $rest) = (int($1), lc($2), $3);
++        my $link_state = $DEFAULT_LINK_STATE;
++        $link_state = $1 if $rest =~ /link-state (auto|enable|disable)/;
++        $table->{$index} = { mac => $mac, link_state => $link_state };
++    }
++    return $table;
++};
++
++my $read_vf_device = sub {
++    my ($ifname, $index) = @_;
++
++    my $device_path = $port_dir->($ifname) . "/virtfn$index";
++    return undef if !-e $device_path;
++
++    my $address = '';
++    my $address_target = readlink($device_path);
++    if (defined($address_target) && $address_target =~ m{([0-9a-fA-F:.]+)\z}) {
++        $address = $1;
++    }
++
++    my $driver = '';
++    my $driver_target = readlink("$device_path/driver");
++    if (defined($driver_target) && $driver_target =~ m{([A-Za-z0-9_.-]+)\z}) {
++        $driver = $1;
++    }
++
++    my $netdev = '';
++    if (opendir(my $directory, "$device_path/net")) {
++        my @names = sort grep { !/^\./ } readdir($directory);
++        closedir($directory);
++        $netdev = $1 if @names && $names[0] =~ /^([a-zA-Z0-9_.-]{1,15})\z/;
++    }
++
++    return { address => $address, driver => $driver, ifname => $netdev };
++};
++
++my $read_state = sub {
++    my ($ifname) = @_;
++
++    my $numvfs = $read_sysfs_number->($port_dir->($ifname) . '/sriov_numvfs');
++    my $totalvfs = $read_sysfs_number->($port_dir->($ifname) . '/sriov_totalvfs');
++
++    my $vfs = [];
++    if ($numvfs > 0) {
++        my $table = $read_vf_table->($ifname);
++        for my $index (0 .. $numvfs - 1) {
++            my $entry = $table->{$index} // {};
++            my $device = $read_vf_device->($ifname, $index) // {};
++            push @$vfs, {
++                index => $index,
++                mac => $entry->{mac} // '',
++                link_state => $entry->{link_state} // $DEFAULT_LINK_STATE,
++                ifname => $device->{ifname} // '',
++                driver => $device->{driver} // '',
++            };
++        }
++    }
++
++    return { numvfs => $numvfs, totalvfs => $totalvfs, vfs => $vfs };
++};
++
++my $validate_declaration = sub {
++    my ($ifname, $numvfs, $vfs) = @_;
++
++    my $totalvfs = $read_sysfs_number->($port_dir->($ifname) . '/sriov_totalvfs');
++    die "Port '$ifname' supports at most $totalvfs virtual functions, and the request sets numvfs to $numvfs.\n"
++        if $numvfs < 0 || $numvfs > $totalvfs;
++
++    my $normalized = [];
++    my $seen_indexes = {};
++    my $seen_macs = {};
++    for my $vf (@$vfs) {
++        my $index = $vf->{index};
++        die "VF index $index is outside 0..", $numvfs - 1, " for numvfs $numvfs on port '$ifname'.\n"
++            if $index < 0 || $index >= $numvfs;
++        die "VF index $index appears more than once.\n" if $seen_indexes->{$index}++;
++
++        my $requested_mac = lc($vf->{mac});
++        die "VF $index has the MAC '$vf->{mac}', which is not six colon-separated hex pairs.\n"
++            if $requested_mac !~ $MAC_PATTERN;
++        my $mac = $1;
++        my $first_byte = hex(substr($mac, 0, 2));
++        die "VF $index has the MAC '$mac', which is a multicast address.\n"
++            if $first_byte & $UNICAST_BIT;
++        die "VF $index has the MAC '$mac', which is all zeros.\n" if $mac eq '00:00:00:00:00:00';
++        die "VF $index has the MAC '$mac', which VF $seen_macs->{$mac} also declares.\n"
++            if defined($seen_macs->{$mac});
++        $seen_macs->{$mac} = $index;
++
++        my $link_state = $vf->{link_state} // $DEFAULT_LINK_STATE;
++        die "VF $index has the link_state '$link_state', which is not auto, enable, or disable.\n"
++            if !grep { $_ eq $link_state } @$LINK_STATES;
++
++        push @$normalized, { index => int($index), mac => $mac, link_state => $link_state };
++    }
++
++    return [sort { $a->{index} <=> $b->{index} } @$normalized];
++};
++
++my $settle = sub {
++    my ($condition) = @_;
++
++    for my $attempt (1 .. $SETTLE_ATTEMPTS) {
++        return 1 if $condition->();
++        select(undef, undef, undef, $SETTLE_INTERVAL);
++    }
++    return $condition->() ? 1 : 0;
++};
++
++my $set_numvfs = sub {
++    my ($ifname, $numvfs) = @_;
++
++    my $path = $port_dir->($ifname) . '/sriov_numvfs';
++    my $current = $read_sysfs_number->($path);
++    return if $current == $numvfs;
++
++    eval {
++        $write_sysfs->($path, '0');
++        $write_sysfs->($path, "$numvfs") if $numvfs > 0;
++    };
++    $step_error->('set numvfs', $ifname, undef, $@) if $@;
++
++    my $read_back = $read_sysfs_number->($path);
++    $step_error->(
++        'verify numvfs', $ifname, undef,
++        "sriov_numvfs reads $read_back after the write of $numvfs",
++    ) if $read_back != $numvfs;
++
++    for my $index (0 .. $numvfs - 1) {
++        my $present = $settle->(sub { -e $port_dir->($ifname) . "/virtfn$index" });
++        $step_error->(
++            'wait for VF', $ifname, $index,
++            "virtfn$index did not appear after the write of $numvfs",
++        ) if !$present;
++    }
++};
++
++my $rebind_vf = sub {
++    my ($ifname, $index) = @_;
++
++    my $device = $read_vf_device->($ifname, $index);
++    $step_error->('rebind', $ifname, $index, "virtfn$index does not exist")
++        if !defined($device);
++    $step_error->('rebind', $ifname, $index, "virtfn$index has no PCI address or no driver")
++        if $device->{address} eq '' || $device->{driver} eq '';
++
++    my $driver_dir = "$SYS_PCI_DRIVER_DIR/$device->{driver}";
++    eval {
++        $write_sysfs->("$driver_dir/unbind", $device->{address});
++        $write_sysfs->("$driver_dir/bind", $device->{address});
++    };
++    $step_error->('rebind', $ifname, $index, $@) if $@;
++};
++
++my $permanent_mac = sub {
++    my ($netdev) = @_;
++
++    my $output = '';
++    my $errors = '';
++    eval {
++        run_command(
++            [$ETHTOOL_COMMAND, '-P', $netdev],
++            outfunc => sub { $output .= shift() . "\n" },
++            errfunc => sub { $errors .= shift() . "\n" },
++        );
++    };
++    return (undef, $errors) if $@;
++    return (lc($1), $errors) if $output =~ /Permanent address:\s*([0-9a-fA-F:]{17})/;
++    return (undef, "ethtool -P printed no permanent address: $output");
++};
++
++my $verify_vf_mac = sub {
++    my ($ifname, $vf) = @_;
++
++    my $index = $vf->{index};
++    my $netdev = '';
++    my $found = $settle->(sub {
++        my $device = $read_vf_device->($ifname, $index);
++        $netdev = $device->{ifname} // '' if defined($device);
++        return $netdev ne '';
++    });
++    $step_error->('verify mac', $ifname, $index, "virtfn$index has no network device after the rebind")
++        if !$found;
++
++    my $reported = '';
++    my $detail = '';
++    my $matched = $settle->(sub {
++        my ($mac, $errors) = $permanent_mac->($netdev);
++        $detail = $errors;
++        $reported = $mac // '';
++        return $reported eq $vf->{mac};
++    });
++    if (!$matched) {
++        my $message = "$netdev reports permanent address '$reported', and the declaration is '$vf->{mac}'";
++        $message .= ": $detail" if $detail !~ /^\s*$/;
++        $step_error->('verify mac', $ifname, $index, $message);
++    }
++};
++
++my $apply_declaration = sub {
++    my ($ifname, $numvfs, $vfs) = @_;
++
++    $run_step->('port up', $ifname, undef, [$IP_COMMAND, 'link', 'set', $ifname, 'up']);
++
++    $set_numvfs->($ifname, $numvfs);
++
++    for my $vf (@$vfs) {
++        my $index = $vf->{index};
++        $run_step->(
++            'set mac', $ifname, $index,
++            [$IP_COMMAND, 'link', 'set', $ifname, 'vf', "$index", 'mac', $vf->{mac}],
++        );
++        $run_step->(
++            'set link state', $ifname, $index,
++            [$IP_COMMAND, 'link', 'set', $ifname, 'vf', "$index", 'state', $vf->{link_state}],
++        );
++    }
++
++    for my $vf (@$vfs) {
++        $rebind_vf->($ifname, $vf->{index});
++    }
++
++    for my $vf (@$vfs) {
++        $verify_vf_mac->($ifname, $vf);
++    }
++};
++
++my $state_path = sub {
++    my ($ifname) = @_;
++    return "$STATE_DIR/$ifname.json";
++};
++
++my $with_lock = sub {
++    my ($ifname, $code) = @_;
++
++    my $result = lock_file("$LOCK_DIR/pve-overlay-sriov-$ifname.lck", 60, $code);
++    die $@ if $@;
++    return $result;
++};
++
++sub apply_saved {
++    my ($class, $ifname_input) = @_;
++
++    my $ifname = $validate_ifname->($ifname_input);
++    my $path = $state_path->($ifname);
++    die "The saved SR-IOV state $path does not exist.\n" if !-e $path;
++
++    my $saved = eval { decode_json(PVE::File::file_get_contents($path)) };
++    die "The saved SR-IOV state $path is not valid JSON: $@" if $@;
++    die "The saved SR-IOV state $path has no numvfs.\n"
++        if ref($saved) ne 'HASH' || !defined($saved->{numvfs}) || $saved->{numvfs} !~ /^\d+\z/;
++
++    my $vfs = $validate_declaration->($ifname, int($saved->{numvfs}), $saved->{vfs} // []);
++    $with_lock->($ifname, sub { $apply_declaration->($ifname, int($saved->{numvfs}), $vfs) });
++
++    return $read_state->($ifname);
++}
++
++my $state_returns = {
++    type => 'object',
++    properties => {
++        numvfs => { type => 'integer', minimum => 0, description => 'PROSE' },
++        totalvfs => { type => 'integer', minimum => 0, description => 'PROSE' },
++        vfs => {
++            type => 'array',
++            description => 'PROSE',
++            items => {
++                type => 'object',
++                properties => {
++                    index => { type => 'integer', minimum => 0, description => 'PROSE' },
++                    mac => { type => 'string', description => 'PROSE' },
++                    link_state => {
++                        type => 'string',
++                        enum => $LINK_STATES,
++                        description => 'PROSE',
++                    },
++                    ifname => { type => 'string', description => 'PROSE' },
++                    driver => { type => 'string', description => 'PROSE' },
++                },
++            },
++        },
++    },
++};
++
++my $ifname_schema = {
++    type => 'string',
++    pattern => $IFNAME_PATTERN,
++    maxLength => 15,
++    description => 'PROSE',
++};
++
++__PACKAGE__->register_method({
++    name => 'get_sriov',
++    path => '{ifname}',
++    method => 'GET',
++    description => 'PROSE',
++    permissions => {
++        check => ['perm', '/nodes/{node}', ['Sys.SRIOV.Audit']],
++    },
++    proxyto => 'node',
++    parameters => {
++        additionalProperties => 0,
++        properties => {
++            node => get_standard_option('pve-node'),
++            ifname => $ifname_schema,
++        },
++    },
++    returns => $state_returns,
++    code => sub {
++        my ($param) = @_;
++
++        my $ifname = $validate_ifname->($param->{ifname});
++        return $read_state->($ifname);
++    },
++});
++
++__PACKAGE__->register_method({
++    name => 'set_sriov',
++    path => '{ifname}',
++    method => 'PUT',
++    description => 'PROSE',
++    permissions => {
++        check => ['perm', '/nodes/{node}', ['Sys.SRIOV.Modify']],
++    },
++    protected => 1,
++    proxyto => 'node',
++    parameters => {
++        additionalProperties => 0,
++        properties => {
++            node => get_standard_option('pve-node'),
++            ifname => $ifname_schema,
++            numvfs => {
++                type => 'integer',
++                minimum => 0,
++                description => 'PROSE',
++            },
++            vfs => {
++                type => 'array',
++                optional => 1,
++                description => 'PROSE',
++                items => {
++                    type => 'object',
++                    additionalProperties => 0,
++                    properties => {
++                        index => { type => 'integer', minimum => 0, description => 'PROSE' },
++                        mac => { type => 'string', description => 'PROSE' },
++                        link_state => {
++                            type => 'string',
++                            enum => $LINK_STATES,
++                            optional => 1,
++                            default => $DEFAULT_LINK_STATE,
++                            description => 'PROSE',
++                        },
++                    },
++                },
++            },
++        },
++    },
++    returns => $state_returns,
++    code => sub {
++        my ($param) = @_;
++
++        my $ifname = $validate_ifname->($param->{ifname});
++
++        my $allowed = { map { $_ => 1 } @{ $read_names->($ALLOW_FILE) } };
++        die "Port '$ifname' is not in $ALLOW_FILE.\n" if !$allowed->{$ifname};
++
++        my $numvfs = int($param->{numvfs});
++        my $vfs = $validate_declaration->($ifname, $numvfs, $param->{vfs} // []);
++
++        $with_lock->($ifname, sub { $apply_declaration->($ifname, $numvfs, $vfs) });
++
++        make_path($STATE_DIR);
++        my $content = JSON->new->canonical->pretty->encode({ numvfs => $numvfs, vfs => $vfs });
++        PVE::File::file_set_contents($state_path->($ifname), $content, $STATE_FILE_MODE);
++
++        $run_step->(
++            'enable unit', $ifname, undef,
++            [$SYSTEMCTL_COMMAND, 'enable', "pve-overlay-sriov\@$ifname.service"],
++        );
++
++        return $read_state->($ifname);
++    },
++});
++
++1;
+diff --git a/overlay-root/etc/systemd/system/pve-overlay-sriov@.service b/overlay-root/etc/systemd/system/pve-overlay-sriov@.service
+new file mode 100644
+index 00000000..3f026b52
+--- /dev/null
++++ b/overlay-root/etc/systemd/system/pve-overlay-sriov@.service
+@@ -0,0 +1,13 @@
++[Unit]
++Description=Declare the SR-IOV virtual functions of %I
++After=network-pre.target
++Wants=network-pre.target
++Before=pve-guests.service
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++ExecStart=/usr/bin/perl -T /usr/share/pve-overlay/sriov-apply %i
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/overlay-root/usr/share/pve-overlay/sriov-apply b/overlay-root/usr/share/pve-overlay/sriov-apply
+new file mode 100755
+index 00000000..65861b9c
+--- /dev/null
++++ b/overlay-root/usr/share/pve-overlay/sriov-apply
+@@ -0,0 +1,13 @@
++#!/usr/bin/perl -T
++
++use strict;
++use warnings;
++
++use PVE::API2::SRIOV;
++
++$ENV{PATH} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
++delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
++
++die "usage: sriov-apply <ifname>\n" if scalar(@ARGV) != 1;
++
++PVE::API2::SRIOV->apply_saved($ARGV[0]);
+diff --git a/test/Makefile b/test/Makefile
+index 2dfd20a4..e6371ecc 100644
+--- a/test/Makefile
++++ b/test/Makefile
+@@ -5,7 +5,11 @@ all:
+ export PERLLIB=..
+ 
+ .PHONY: check
+-check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh
++check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh test-sriov
++
++.PHONY: test-sriov
++test-sriov:
++	./SRIOV_test.pl
+ 
+ .PHONY: test-balloon
+ test-balloon:
+diff --git a/test/SRIOV_test.pl b/test/SRIOV_test.pl
+new file mode 100755
+index 00000000..9aa9fda3
+--- /dev/null
++++ b/test/SRIOV_test.pl
+@@ -0,0 +1,148 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -662,55 +1262,20 @@ index 00000000..5b053687
 +
 +use lib ('.', '..');
 +
++use File::Path qw(make_path);
 +use File::Temp qw(tempdir);
 +use Test::More;
 +
-+use PVE::API2::KernelModules;
++use PVE::API2::SRIOV;
 +
 +my $root = tempdir(CLEANUP => 1);
-+mkdir "$root/sys" or die "cannot create $root/sys: $!\n";
-+mkdir "$root/sys/loaded_mod" or die "cannot create $root/sys/loaded_mod: $!\n";
-+
-+my $modinfo_script = <<'SCRIPT';
-+#!/bin/sh
-+name="$3"
-+case "$name" in
-+    builtin_mod) echo "(builtin)" ;;
-+    missing_mod) echo "modinfo: ERROR: Module $name not found." >&2; exit 1 ;;
-+    *) echo "/lib/modules/test/$name.ko" ;;
-+esac
-+SCRIPT
-+
-+my $modprobe_script = <<"SCRIPT";
-+#!/bin/sh
-+echo "\$2" >> "$root/modprobe.log"
-+if [ "\$2" = "fail_mod" ]; then
-+    echo "modprobe: FATAL: Module fail_mod cannot be inserted." >&2
-+    exit 1
-+fi
-+SCRIPT
 +
 +sub write_file {
-+    my ($path, $content, $mode) = @_;
++    my ($path, $content) = @_;
 +    open(my $handle, '>', $path) or die "cannot write $path: $!\n";
 +    print {$handle} $content;
 +    close($handle) or die "cannot write $path: $!\n";
-+    chmod($mode, $path) or die "cannot chmod $path: $!\n";
 +}
-+
-+write_file("$root/modinfo", $modinfo_script, 0755);
-+write_file("$root/modprobe", $modprobe_script, 0755);
-+write_file(
-+    "$root/allow",
-+    "loaded_mod\nunloaded_mod\nbuiltin_mod\nmissing_mod\nsecond_mod\nfail_mod\n",
-+    0644,
-+);
-+
-+$PVE::API2::KernelModules::LOAD_FILE = "$root/pve-overlay.conf";
-+$PVE::API2::KernelModules::ALLOW_FILE = "$root/allow";
-+$PVE::API2::KernelModules::SYS_MODULE_DIR = "$root/sys";
-+$PVE::API2::KernelModules::MODINFO_COMMAND = "$root/modinfo";
-+$PVE::API2::KernelModules::MODPROBE_COMMAND = "$root/modprobe";
 +
 +sub read_file {
 +    my ($path) = @_;
@@ -722,146 +1287,119 @@ index 00000000..5b053687
 +    return $content;
 +}
 +
-+sub put_modules {
-+    my ($modules) = @_;
-+    return PVE::API2::KernelModules->set_kernel_modules({
-+        node => 'localhost',
-+        modules => $modules,
-+    });
++sub make_port {
++    my ($name, $totalvfs, $numvfs) = @_;
++    make_path("$root/net/$name/device");
++    write_file("$root/net/$name/device/sriov_totalvfs", "$totalvfs\n");
++    write_file("$root/net/$name/device/sriov_numvfs", "$numvfs\n");
++}
++
++make_port('eth0', 4, 0);
++make_port('eth1', 4, 0);
++make_path("$root/net/plain0/device");
++
++write_file("$root/allow", "# ports\neth0\n; disabled\n  # indented\n\n");
++
++$PVE::API2::SRIOV::STATE_DIR = "$root/state";
++$PVE::API2::SRIOV::ALLOW_FILE = "$root/allow";
++$PVE::API2::SRIOV::SYS_NET_DIR = "$root/net";
++$PVE::API2::SRIOV::LOCK_DIR = $root;
++
++sub get_port {
++    my ($ifname) = @_;
++    return PVE::API2::SRIOV->get_sriov({ node => 'localhost', ifname => $ifname });
++}
++
++sub put_port {
++    my ($ifname, $numvfs, $vfs) = @_;
++    my $param = { node => 'localhost', ifname => $ifname };
++    $param->{numvfs} = $numvfs if defined($numvfs);
++    $param->{vfs} = $vfs if defined($vfs);
++    return PVE::API2::SRIOV->set_sriov($param);
 +}
 +
 +sub assert_rejected {
-+    my ($modules, $pattern, $label) = @_;
-+    my $before = read_file($PVE::API2::KernelModules::LOAD_FILE);
-+    unlink("$root/modprobe.log");
++    my ($label, $pattern, $ifname, $numvfs, $vfs) = @_;
 +
-+    my $result = eval { put_modules($modules) };
++    eval { put_port($ifname, $numvfs, $vfs) };
 +    like($@, $pattern, "$label: error message");
-+    is(read_file($PVE::API2::KernelModules::LOAD_FILE), $before, "$label: file unchanged");
-+    ok(!-e "$root/modprobe.log", "$label: modprobe not run");
++    is(read_file("$root/net/eth0/device/sriov_numvfs"), "0\n", "$label: numvfs unchanged");
++    ok(!-e "$root/state", "$label: no state written");
 +}
 +
-+my $initial = PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' });
-+is_deeply($initial, { modules => [], loaded => {} }, 'a missing load file lists no modules');
-+
-+assert_rejected(['Bad-Name'], qr/'Bad-Name'.*does not match/, 'malformed name');
-+assert_rejected(['loaded_mod', 'bad name'], qr/'bad name'.*does not match/, 'name with space');
-+assert_rejected(['not_allowed'], qr/'not_allowed'.*not in /, 'name outside the allowlist');
-+assert_rejected(
-+    ['loaded_mod', 'builtin_mod'],
-+    qr/'builtin_mod'.*built into the running kernel/,
-+    'builtin module',
-+);
-+assert_rejected(['missing_mod'], qr/'missing_mod'.*modinfo -n fails/, 'module without modinfo');
-+assert_rejected(
-+    ['missing_mod'],
-+    qr/modinfo: ERROR: Module missing_mod not found\./,
-+    'modinfo failure includes its stderr',
-+);
-+
-+my $state = put_modules(['loaded_mod', 'unloaded_mod', 'loaded_mod']);
-+is(
-+    read_file($PVE::API2::KernelModules::LOAD_FILE),
-+    "loaded_mod\nunloaded_mod\n",
-+    'the load file lists each name once, one per line',
-+);
-+is(read_file("$root/modprobe.log"), "loaded_mod\nunloaded_mod\n", 'modprobe runs for each name');
 +is_deeply(
-+    $state,
-+    {
-+        modules => ['loaded_mod', 'unloaded_mod'],
-+        loaded => { loaded_mod => 1, unloaded_mod => 0 },
-+    },
-+    'PUT returns the module list and the loaded flags',
-+);
-+is_deeply(
-+    PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' }),
-+    $state,
-+    'GET returns the state that PUT wrote',
++    get_port('eth0'),
++    { numvfs => 0, totalvfs => 4, vfs => [] },
++    'GET returns numvfs, totalvfs, and no VFs for a port without VFs',
 +);
 +
-+$state = put_modules(['second_mod']);
-+is(read_file($PVE::API2::KernelModules::LOAD_FILE), "second_mod\n", 'PUT replaces the list');
++write_file("$root/net/eth0/device/sriov_numvfs", "0\n");
++make_port('eth0', 8, 0);
++is(get_port('eth0')->{totalvfs}, 8, 'GET reads totalvfs from sysfs');
++make_port('eth0', 4, 0);
 +
-+my $before_failure = read_file($PVE::API2::KernelModules::LOAD_FILE);
-+unlink("$root/modprobe.log");
-+eval { put_modules(['loaded_mod', 'fail_mod']) };
-+like($@, qr/fail_mod/, 'a modprobe failure error includes the module name');
-+like(
-+    $@,
-+    qr/modprobe: FATAL: Module fail_mod cannot be inserted\./,
-+    'a modprobe failure error includes the modprobe stderr',
-+);
-+is(
-+    read_file($PVE::API2::KernelModules::LOAD_FILE),
-+    $before_failure,
-+    'a modprobe failure keeps the load file unchanged',
-+);
-+is(
-+    read_file("$root/modprobe.log"),
-+    "loaded_mod\nfail_mod\n",
-+    'modprobe runs in request order until the failure',
-+);
-+
-+$state = put_modules([]);
-+is(read_file($PVE::API2::KernelModules::LOAD_FILE), '', 'an empty list empties the load file');
-+is_deeply($state, { modules => [], loaded => {} }, 'PUT of an empty list returns no modules');
-+
-+put_modules(['loaded_mod']);
-+for my $invalid ({ name => 'loaded_mod' }, undef) {
-+    eval { put_modules($invalid) };
-+    like($@, qr/modules/, 'the schema rejects a modules value that is not an array');
++for my $invalid ('bad name', 'a' x 16, 'eth0/../eth1') {
++    eval { get_port($invalid) };
++    like($@, qr/ifname/, "GET rejects the port name '$invalid'");
 +}
-+eval { PVE::API2::KernelModules->set_kernel_modules({ node => 'localhost' }) };
-+like($@, qr/modules/, 'the schema rejects a request without modules');
-+is(read_file($PVE::API2::KernelModules::LOAD_FILE), "loaded_mod\n", 'rejected shapes keep the file');
++eval { get_port('missing0') };
++like($@, qr/Port 'missing0' has no SR-IOV support/, 'GET rejects a port that does not exist');
++eval { get_port('plain0') };
++like($@, qr/Port 'plain0' has no SR-IOV support/, 'GET rejects a port without sriov_totalvfs');
 +
-+write_file(
-+    $PVE::API2::KernelModules::LOAD_FILE,
-+    "# managed by hand\nloaded_mod\n; disabled\n  # indented comment\nunloaded_mod\n\n",
-+    0644,
++assert_rejected(
++    'port outside the allowlist', qr/Port 'eth1' is not in \Q$root\E\/allow/,
++    'eth1', 0, [],
 +);
++assert_rejected(
++    'allowlist comment text', qr/ifname/,
++    '# ports', 0, [],
++);
++assert_rejected(
++    'numvfs above totalvfs', qr/supports at most 4 virtual functions.*numvfs to 5/,
++    'eth0', 5, [],
++);
++assert_rejected(
++    'VF index outside numvfs', qr/VF index 2 is outside 0\.\.1 for numvfs 2/,
++    'eth0', 2, [{ index => 2, mac => '02:00:00:00:00:01' }],
++);
++assert_rejected(
++    'repeated VF index', qr/VF index 0 appears more than once/,
++    'eth0', 2,
++    [{ index => 0, mac => '02:00:00:00:00:01' }, { index => 0, mac => '02:00:00:00:00:02' }],
++);
++assert_rejected(
++    'malformed MAC', qr/VF 0 has the MAC '02:00:00:00:00'.*not six colon-separated hex pairs/,
++    'eth0', 1, [{ index => 0, mac => '02:00:00:00:00' }],
++);
++assert_rejected(
++    'multicast MAC', qr/VF 0 has the MAC '03:00:00:00:00:01'.*multicast/,
++    'eth0', 1, [{ index => 0, mac => '03:00:00:00:00:01' }],
++);
++assert_rejected(
++    'zero MAC', qr/VF 0 has the MAC '00:00:00:00:00:00'.*all zeros/,
++    'eth0', 1, [{ index => 0, mac => '00:00:00:00:00:00' }],
++);
++assert_rejected(
++    'repeated MAC', qr/VF 1 has the MAC '02:aa:bb:cc:dd:ee'.*VF 0 also declares/,
++    'eth0', 2,
++    [{ index => 0, mac => '02:AA:BB:CC:DD:EE' }, { index => 1, mac => '02:aa:bb:cc:dd:ee' }],
++);
++assert_rejected(
++    'link state outside the enum', qr/link_state/,
++    'eth0', 1, [{ index => 0, mac => '02:00:00:00:00:01', link_state => 'up' }],
++);
++assert_rejected('missing numvfs', qr/numvfs/, 'eth0', undef, []);
++assert_rejected(
++    'extra VF property', qr/vlan/,
++    'eth0', 1, [{ index => 0, mac => '02:00:00:00:00:01', vlan => 5 }],
++);
++
++write_file("$root/net/eth0/device/sriov_numvfs", "0\n");
 +is_deeply(
-+    PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' }),
-+    {
-+        modules => ['loaded_mod', 'unloaded_mod'],
-+        loaded => { loaded_mod => 1, unloaded_mod => 0 },
-+    },
-+    'GET skips comment lines that start with # or ;',
++    get_port('eth0'),
++    { numvfs => 0, totalvfs => 4, vfs => [] },
++    'rejected requests leave the GET result unchanged',
 +);
-+
-+write_file(
-+    $PVE::API2::KernelModules::ALLOW_FILE,
-+    "# allowed modules\nloaded_mod\n; more modules\nunloaded_mod\n",
-+    0644,
-+);
-+$state = put_modules(['loaded_mod', 'unloaded_mod']);
-+is_deeply(
-+    $state->{modules},
-+    ['loaded_mod', 'unloaded_mod'],
-+    'an allowlist with comment lines still accepts its module entries',
-+);
-+assert_rejected(['# allowed modules'], qr/'# allowed modules'/, 'allowlist comment text');
-+assert_rejected(['; more modules'], qr/'; more modules'/, 'allowlist semicolon comment text');
-+
-+unlink($PVE::API2::KernelModules::ALLOW_FILE);
-+assert_rejected(['loaded_mod'], qr/'loaded_mod'.*not in /, 'a missing allowlist is empty');
 +
 +done_testing();
-diff --git a/test/Makefile b/test/Makefile
-index 2dfd20a4..2c8c4f3c 100644
---- a/test/Makefile
-+++ b/test/Makefile
-@@ -5,7 +5,11 @@ all:
- export PERLLIB=..
- 
- .PHONY: check
--check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh
-+check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh test-kernel-modules
-+
-+.PHONY: test-kernel-modules
-+test-kernel-modules:
-+	./KernelModules_test.pl
- 
- .PHONY: test-balloon
- test-balloon:

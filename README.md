@@ -16,6 +16,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.
 - Four `Sys.ACME.Config` privileges read and change only the ACME options of one node.
 - `Sys.KernelModules.Audit` reads one node's persistent kernel module list. `Sys.KernelModules.Modify` sets the list and loads allowlisted modules.
+- PROSE
 
 The [permission reference](docs/permissions.md) lists the ACL path and the API method for each privilege.
 

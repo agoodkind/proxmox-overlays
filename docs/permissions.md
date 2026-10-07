@@ -35,6 +35,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.ACME.Config.Domain.Remove` | `/nodes/<node>` | Delete an `acmedomain<n>` option of the node config |
 | `Sys.KernelModules.Audit` | `/nodes/<node>` | Read the node's persistent kernel module list and loaded status |
 | `Sys.KernelModules.Modify` | `/nodes/<node>` | Set the node's persistent kernel module list and load its allowlisted modules |
+| `Sys.SRIOV.Audit` | `/nodes/<node>` | PROSE |
+| `Sys.SRIOV.Modify` | `/nodes/<node>` | PROSE |
 
 ## ACL paths
 

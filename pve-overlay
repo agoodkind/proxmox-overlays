@@ -31,7 +31,7 @@ my $STATE_FILE = 'var/lib/pve-overlay/installed';
 
 # A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
 # at /<path>. Only a path below one of these directories is installed.
-my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
+my @HOST_FILE_DIRS = qw(etc/apparmor.d/ etc/systemd/system/ usr/share/pve-overlay/);
 my $APPARMOR_DIR = 'etc/apparmor.d/';
 
 # Units that load the patched modules at start.
@@ -225,6 +225,8 @@ sub unload_apparmor_profile {
 
 sub restart_units {
     return if !$system_mode;
+    system('systemctl', 'daemon-reload') == 0
+        or warn "pve-overlay: systemctl daemon-reload failed\n";
     for my $unit (@UNITS) {
         system('systemctl', 'try-restart', "$unit.service") == 0
             or warn "pve-overlay: systemctl try-restart $unit.service failed\n";
