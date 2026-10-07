@@ -1213,7 +1213,7 @@ index dee073d..631ce4b 100644
  
      eval {
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
-index 3eb1905..1ce2fec 100644
+index 3eb1905..f2108e0 100644
 --- a/src/PVE/LXC/Config.pm
 +++ b/src/PVE/LXC/Config.pm
 @@ -6,6 +6,7 @@ use warnings;
@@ -1359,7 +1359,7 @@ index 3eb1905..1ce2fec 100644
      env => {
          type => 'string',
          description => 'The container runtime environment as NUL-separated list.'
-@@ -969,6 +1091,24 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
+@@ -969,6 +1091,26 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
      };
  }
  
@@ -1376,15 +1376,17 @@ index 3eb1905..1ce2fec 100644
 +sub hostnic_lxc_net_index {
 +    my ($class, $key) = @_;
 +
-+    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(\d)$/;
++    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(0|[1-9]\d*)$/;
++    my $index = $1;
++    die "'$key' is not a valid hostnic key.\n" if $index >= $MAX_LXC_HOSTNICS;
 +
-+    return $MAX_LXC_NETWORKS + $1;
++    return $MAX_LXC_NETWORKS + $index;
 +}
 +
  PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
  
  sub verify_ct_timezone {
-@@ -1392,6 +1532,9 @@ sub update_pct_config {
+@@ -1392,6 +1534,9 @@ sub update_pct_config {
          $class->remove_from_pending_delete($conf, $opt);
      }
  
@@ -1394,7 +1396,7 @@ index 3eb1905..1ce2fec 100644
      my $changes = $class->cleanup_pending($conf);
  
      my $errors = {};
-@@ -1591,6 +1734,87 @@ sub parse_features {
+@@ -1591,6 +1736,89 @@ sub parse_features {
      return PVE::JSONSchema::parse_property_string($features_desc, $data);
  }
  
@@ -1419,7 +1421,9 @@ index 3eb1905..1ce2fec 100644
 +
 +    my $hostnics = {};
 +    for my $key (sort keys %$conf) {
-+        next if $key !~ m/^hostnic\d$/;
++        next if $key !~ m/^hostnic(0|[1-9]\d*)$/;
++        my $index = $1;
++        next if $index >= $MAX_LXC_HOSTNICS;
 +        $hostnics->{$key} = $class->parse_hostnic($conf->{$key});
 +    }
 +
@@ -1988,10 +1992,10 @@ index 0000000..131a96c
 +acl:1:/vms/100:dave@pve:audit_only:
 diff --git a/src/test/hostnic-test.pl b/src/test/hostnic-test.pl
 new file mode 100755
-index 0000000..e16b82c
+index 0000000..2373fd2
 --- /dev/null
 +++ b/src/test/hostnic-test.pl
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,267 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -2103,6 +2107,9 @@ index 0000000..e16b82c
 +    die "hostnic$index collides with a netN index\n" if $lxc_index <= $max_net_index;
 +}
 +print "OK:index range\n";
++
++eval { PVE::LXC::Config->hostnic_lxc_net_index('hostnic10') };
++check_equal('index limit', $@, "'hostnic10' is not a valid hostnic key.\n");
 +
 +check_conflict_rejected(
 +    'same link',
