@@ -731,24 +731,25 @@ index 5f94d5a..db2e158 100644
      name => 'mtunnel',
      path => '{vmid}/mtunnel',
 diff --git a/src/PVE/API2/LXC/Config.pm b/src/PVE/API2/LXC/Config.pm
-index 805eac0..2973b92 100644
+index 805eac0..3f4fafa 100644
 --- a/src/PVE/API2/LXC/Config.pm
 +++ b/src/PVE/API2/LXC/Config.pm
-@@ -106,6 +106,9 @@ my $vm_config_perm_list = [
+@@ -106,6 +106,10 @@ my $vm_config_perm_list = [
      'VM.Config.Memory',
      'VM.Config.Network',
      'VM.Config.Options',
 +    'VM.Config.Nesting',
 +    'VM.Config.Keyctl',
++    'VM.Config.HostNIC',
 +    @{ PVE::AccessControl::bpf_delegate_privileges() },
  ];
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..089601e 100644
+index dee073d..631ce4b 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -694,6 +694,30 @@ sub make_apparmor_config {
+@@ -694,6 +694,66 @@ sub make_apparmor_config {
      return $raw;
  }
  
@@ -776,10 +777,46 @@ index dee073d..089601e 100644
 +    return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
 +}
 +
++sub make_hostnic_config {
++    my ($conf) = @_;
++
++    PVE::LXC::Config->check_hostnic_conflicts($conf);
++
++    my $raw = '';
++    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
++    for my $key (sort keys %$hostnics) {
++        my $hostnic = $hostnics->{$key};
++        my $ind = PVE::LXC::Config->hostnic_lxc_net_index($key);
++        $raw .= "lxc.net.$ind.type = phys\n";
++        $raw .= "lxc.net.$ind.link = $hostnic->{link}\n";
++        $raw .= "lxc.net.$ind.name = $hostnic->{name}\n";
++        $raw .= "lxc.net.$ind.hwaddr = $hostnic->{hwaddr}\n" if defined($hostnic->{hwaddr});
++        $raw .= "lxc.net.$ind.mtu = $hostnic->{mtu}\n" if defined($hostnic->{mtu});
++        $raw .= "lxc.net.$ind.flags = up\n" if $hostnic->{up};
++    }
++
++    return $raw;
++}
++
++sub check_hostnic_links {
++    my ($conf, $net_dir) = @_;
++
++    $net_dir //= '/sys/class/net';
++
++    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
++    for my $key (sort keys %$hostnics) {
++        my $link = $hostnics->{$key}->{link};
++        die "$key: Host interface '$link' does not exist.\n" if !-d "$net_dir/$link";
++        die "$key: Host interface '$link' is a Linux bridge.\n" if -d "$net_dir/$link/bridge";
++    }
++
++    return;
++}
++
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -755,6 +779,8 @@ sub update_lxc_config {
+@@ -755,6 +815,8 @@ sub update_lxc_config {
          $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
      }
  
@@ -788,7 +825,16 @@ index dee073d..089601e 100644
      if ($unprivileged && !$features->{force_rw_sys}) {
          # unpriv. CT default to sys:rw, but that doesn't always plays well with
          # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
-@@ -1675,11 +1701,75 @@ sub delete_read_restricted_options {
+@@ -891,6 +953,8 @@ sub update_lxc_config {
+         }
+     }
+ 
++    $raw .= make_hostnic_config($conf);
++
+     if (my $env = $conf->{env}) {
+         for my $variable (split(/\0+/, $env)) {
+             $raw .= "lxc.environment.runtime = $variable\n";
+@@ -1675,11 +1739,75 @@ sub delete_read_restricted_options {
      return $conf;
  }
  
@@ -865,7 +911,7 @@ index dee073d..089601e 100644
  
      my $check = sub {
          my ($opt, $delete) = @_;
-@@ -1696,6 +1786,8 @@ sub check_ct_modify_config_perm {
+@@ -1696,6 +1824,8 @@ sub check_ct_modify_config_perm {
                  my $sid = $1;
                  $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
              } else {
@@ -874,7 +920,7 @@ index dee073d..089601e 100644
                  PVE::Storage::check_volume_access(
                      $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                  );
-@@ -1711,51 +1803,53 @@ sub check_ct_modify_config_perm {
+@@ -1711,51 +1841,68 @@ sub check_ct_modify_config_perm {
          } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
          } elsif ($opt eq 'features') {
@@ -966,10 +1012,25 @@ index dee073d..089601e 100644
 +
 +            my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
 +            $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
++        } elsif ($opt =~ m/^hostnic\d+$/) {
++            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HostNIC']);
++
++            my $links = {};
++            if (defined($oldconf) && $oldconf->{$opt}) {
++                my $old_hostnic = PVE::LXC::Config->parse_hostnic($oldconf->{$opt});
++                $links->{ $old_hostnic->{link} } = 1;
++            }
++            if (!$delete && defined($newconf->{$opt})) {
++                my $new_hostnic = PVE::LXC::Config->parse_hostnic($newconf->{$opt});
++                $links->{ $new_hostnic->{link} } = 1;
++            }
++            for my $link (sort keys %$links) {
++                $rpcenv->check($authuser, "/hostnic/$link", ['Sys.HostNIC.Use']);
++            }
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2532,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2438,6 +2585,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1142,8 +1203,17 @@ index dee073d..089601e 100644
  sub mountpoint_hotplug : prototype($$$$$) {
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
+@@ -3156,6 +3469,8 @@ sub vm_start {
+         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
+     }
+ 
++    check_hostnic_links($conf);
++
+     update_lxc_config($vmid, $conf);
+ 
+     eval {
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
-index 3eb1905..1d63c28 100644
+index 3eb1905..1ce2fec 100644
 --- a/src/PVE/LXC/Config.pm
 +++ b/src/PVE/LXC/Config.pm
 @@ -6,6 +6,7 @@ use warnings;
@@ -1154,7 +1224,7 @@ index 3eb1905..1d63c28 100644
  use PVE::Cluster qw(cfs_register_file);
  use PVE::DataCenterConfig;
  use PVE::GuestHelpers;
-@@ -510,6 +511,81 @@ my $features_desc = {
+@@ -510,6 +511,119 @@ my $features_desc = {
      },
  };
  
@@ -1233,10 +1303,48 @@ index 3eb1905..1d63c28 100644
 +    },
 +};
 +
++my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_.\-]{1,15}';
++
++my $hostnic_desc = {
++    link => {
++        type => 'string',
++        format_description => 'ifname',
++        description => 'Specify the host interface to assign to the container.',
++        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
++    },
++    name => {
++        type => 'string',
++        format_description => 'ifname',
++        description => 'Set the interface name inside the container. The default is the host interface name.',
++        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
++        optional => 1,
++    },
++    hwaddr => get_standard_option(
++        'mac-addr',
++        {
++            description => 'Set the interface MAC address.',
++            optional => 1,
++        },
++    ),
++    mtu => {
++        type => 'integer',
++        description => 'Set the interface maximum transmission unit.',
++        minimum => 64,
++        maximum => 65535,
++        optional => 1,
++    },
++    up => {
++        type => 'boolean',
++        description => 'Bring the interface up when the container starts. The interface starts administratively down by default.',
++        default => 0,
++        optional => 1,
++    },
++};
++
  my $confdesc = {
      lock => {
          optional => 1,
-@@ -694,6 +770,14 @@ my $confdesc = {
+@@ -694,6 +808,14 @@ my $confdesc = {
          format => $features_desc,
          description => "Allow containers access to advanced features.",
      },
@@ -1251,7 +1359,42 @@ index 3eb1905..1d63c28 100644
      env => {
          type => 'string',
          description => 'The container runtime environment as NUL-separated list.'
-@@ -1591,6 +1675,12 @@ sub parse_features {
+@@ -969,6 +1091,24 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
+     };
+ }
+ 
++my $MAX_LXC_HOSTNICS = 10;
++for (my $i = 0; $i < $MAX_LXC_HOSTNICS; $i++) {
++    $confdesc->{"hostnic$i"} = {
++        optional => 1,
++        type => 'string',
++        format => $hostnic_desc,
++        description => 'Assign a host interface to the container as an LXC physical device.',
++    };
++}
++
++sub hostnic_lxc_net_index {
++    my ($class, $key) = @_;
++
++    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(\d)$/;
++
++    return $MAX_LXC_NETWORKS + $1;
++}
++
+ PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
+ 
+ sub verify_ct_timezone {
+@@ -1392,6 +1532,9 @@ sub update_pct_config {
+         $class->remove_from_pending_delete($conf, $opt);
+     }
+ 
++    $class->check_pending_hostnic_conflicts($conf)
++        if grep { m/^(?:hostnic|net)\d+$/ } keys %$modified;
++
+     my $changes = $class->cleanup_pending($conf);
+ 
+     my $errors = {};
+@@ -1591,6 +1734,87 @@ sub parse_features {
      return PVE::JSONSchema::parse_property_string($features_desc, $data);
  }
  
@@ -1261,8 +1404,100 @@ index 3eb1905..1d63c28 100644
 +    return PVE::JSONSchema::parse_property_string($bpf_delegate_desc, $data);
 +}
 +
++sub parse_hostnic {
++    my ($class, $data) = @_;
++
++    my $res = PVE::JSONSchema::parse_property_string($hostnic_desc, $data);
++    $res->{name} //= $res->{link};
++    $res->{up} //= 0;
++
++    return $res;
++}
++
++sub get_hostnics {
++    my ($class, $conf) = @_;
++
++    my $hostnics = {};
++    for my $key (sort keys %$conf) {
++        next if $key !~ m/^hostnic\d$/;
++        $hostnics->{$key} = $class->parse_hostnic($conf->{$key});
++    }
++
++    return $hostnics;
++}
++
++sub check_hostnic_conflicts {
++    my ($class, $conf) = @_;
++
++    my $net_names = {};
++    for my $key (sort keys %$conf) {
++        next if $key !~ m/^net\d+$/;
++        my $net = PVE::JSONSchema::parse_property_string($netconf_desc, $conf->{$key});
++        $net_names->{ $net->{name} } = $key;
++    }
++
++    my $hostnics = $class->get_hostnics($conf);
++    my $link_owners = {};
++    my $name_owners = {};
++    for my $key (sort keys %$hostnics) {
++        my $link = $hostnics->{$key}->{link};
++        my $name = $hostnics->{$key}->{name};
++
++        die "$key: $link_owners->{$link} already uses host interface '$link'.\n"
++            if defined($link_owners->{$link});
++        $link_owners->{$link} = $key;
++
++        die "$key: $name_owners->{$name} already uses container interface name '$name'.\n"
++            if defined($name_owners->{$name});
++        die "$key: $net_names->{$name} already uses container interface name '$name'.\n"
++            if defined($net_names->{$name});
++        $name_owners->{$name} = $key;
++    }
++
++    return;
++}
++
++sub check_pending_hostnic_conflicts {
++    my ($class, $conf) = @_;
++
++    my $effective_conf = {};
++    for my $key (keys %$conf) {
++        next if $key eq 'pending';
++        $effective_conf->{$key} = $conf->{$key};
++    }
++    for my $key (keys %{ $conf->{pending} }) {
++        next if $key eq 'delete';
++        $effective_conf->{$key} = $conf->{pending}->{$key};
++    }
++    my $pending_delete = $class->parse_pending_delete($conf->{pending}->{delete});
++    for my $key (keys %$pending_delete) {
++        delete $effective_conf->{$key};
++    }
++
++    $class->check_hostnic_conflicts($effective_conf);
++
++    return;
++}
++
  sub option_exists {
      my ($class, $name) = @_;
+ 
+diff --git a/src/PVE/LXC/Create.pm b/src/PVE/LXC/Create.pm
+index 08b65ca..e0e5146 100644
+--- a/src/PVE/LXC/Create.pm
++++ b/src/PVE/LXC/Create.pm
+@@ -550,6 +550,12 @@ sub sanitize_and_merge_config {
+             next;
+         }
+ 
++        if ($key =~ /^hostnic\d+$/ && $restricted) {
++            $rpcenv->warn("Restore skipped $key. Restore $oldconf->{$key} manually as root\@pam.");
++
++            next;
++        }
++
+         if ($key eq 'lxc' && $restricted) {
+             my $lxc_list = $oldconf->{'lxc'};
  
 diff --git a/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount b/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount
 new file mode 100644
@@ -1278,7 +1513,7 @@ index 0000000..2e13592
 +  mount options=(move),
 +}
 diff --git a/src/test/Makefile b/src/test/Makefile
-index 91ae6ff..faa7034 100644
+index 91ae6ff..3fa094a 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -2,7 +2,7 @@ RUN_USERNS := lxc-usernsexec -m "u:0:`id -u`:1" -m "g:0:`id -g`:1" --
@@ -1286,11 +1521,11 @@ index 91ae6ff..faa7034 100644
  all: test
  
 -test: test_setup test_snapshot test_bindmount test_idmap
-+test: test_setup test_snapshot test_bindmount test_idmap test_bpfdelegate test_exec_concurrency
++test: test_setup test_snapshot test_bindmount test_idmap test_bpfdelegate test_exec_concurrency test_hostnic
  
  test_setup: run_setup_tests.pl
  	if test -e /run/lock/sbuild; then \
-@@ -24,5 +24,11 @@ test_bindmount: bindmount_test.pl
+@@ -24,5 +24,14 @@ test_bindmount: bindmount_test.pl
  test_idmap: run_idmap_tests.pl
  	./run_idmap_tests.pl
  
@@ -1299,6 +1534,9 @@ index 91ae6ff..faa7034 100644
 +
 +test_exec_concurrency: exec-concurrency-test.pl
 +	./exec-concurrency-test.pl
++
++test_hostnic: hostnic-test.pl
++	./hostnic-test.pl
 +
  clean:
  	rm -rf tmprootfs
@@ -1728,3 +1966,293 @@ index 0000000..ff63547
 +done
 +shift
 +exec "$@"
+diff --git a/src/test/hostnic-test.cfg b/src/test/hostnic-test.cfg
+new file mode 100644
+index 0000000..131a96c
+--- /dev/null
++++ b/src/test/hostnic-test.cfg
+@@ -0,0 +1,14 @@
++user:alice@pve:1:
++user:bob@pve:1:
++user:carol@pve:1:
++user:dave@pve:1:
++
++role:hostnic_config:VM.Audit,VM.Config.HostNIC:
++role:hostnic_use:Sys.HostNIC.Use:
++role:audit_only:VM.Audit:
++
++acl:1:/vms/100:alice@pve:hostnic_config:
++acl:1:/hostnic/nic1v1:alice@pve:hostnic_use:
++acl:1:/vms/100:bob@pve:hostnic_config:
++acl:1:/hostnic/nic1v1:carol@pve:hostnic_use:
++acl:1:/vms/100:dave@pve:audit_only:
+diff --git a/src/test/hostnic-test.pl b/src/test/hostnic-test.pl
+new file mode 100755
+index 0000000..e16b82c
+--- /dev/null
++++ b/src/test/hostnic-test.pl
+@@ -0,0 +1,264 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use lib qw(..);
++
++use File::Temp qw(tempdir);
++
++use PVE::API2::LXC::Config;
++use PVE::LXC;
++use PVE::LXC::Config;
++use PVE::LXC::Create;
++use PVE::RPCEnvironment;
++
++my $rpcenv = PVE::RPCEnvironment->init('cli');
++$rpcenv->init_request(userconfig => 'hostnic-test.cfg');
++
++my $vmid = 100;
++
++sub check_equal {
++    my ($label, $got, $expected) = @_;
++
++    die "unexpected result for $label\nneed '$expected'\ngot '$got'\n" if $got ne $expected;
++    print "OK:$label\n";
++}
++
++sub check_parse_ok {
++    my ($value) = @_;
++
++    my $parsed = eval { PVE::LXC::Config->parse_hostnic($value) };
++    die "value '$value' was rejected: $@" if $@;
++    print "PARSE OK:$value\n";
++    return $parsed;
++}
++
++sub check_parse_rejected {
++    my ($value) = @_;
++
++    eval { PVE::LXC::Config->parse_hostnic($value) };
++    die "value '$value' was accepted\n" if !$@;
++    print "PARSE REJECTED:$value\n";
++}
++
++sub check_conflict_rejected {
++    my ($label, $conf, $expected_pattern) = @_;
++
++    eval { PVE::LXC::Config->check_hostnic_conflicts($conf) };
++    die "conflict '$label' was accepted\n" if !$@;
++    die "conflict '$label' failed with an unexpected error: $@" if $@ !~ $expected_pattern;
++    print "CONFLICT REJECTED:$label:$@";
++}
++
++my $minimal = check_parse_ok('link=nic1v1');
++check_equal('minimal link', $minimal->{link}, 'nic1v1');
++check_equal('default name', $minimal->{name}, 'nic1v1');
++check_equal('default up', $minimal->{up}, 0);
++die "minimal value has an hwaddr\n" if defined($minimal->{hwaddr});
++die "minimal value has an mtu\n" if defined($minimal->{mtu});
++
++my $full = check_parse_ok('link=nic1v1,name=mwanbr,hwaddr=AA:BB:CC:DD:EE:01,mtu=1500,up=1');
++check_equal('full name', $full->{name}, 'mwanbr');
++check_equal('full hwaddr', $full->{hwaddr}, 'AA:BB:CC:DD:EE:01');
++check_equal('full mtu', $full->{mtu}, 1500);
++check_equal('full up', $full->{up}, 1);
++
++check_parse_ok('link=a.b-c_d');
++check_parse_ok('link=123456789012345');
++check_parse_rejected('name=mwanbr');
++check_parse_rejected('link=1234567890123456');
++check_parse_rejected('link=nic/1');
++check_parse_rejected('link=nic 1');
++check_parse_rejected('link=');
++check_parse_rejected('link=nic1v1,name=1234567890123456');
++check_parse_rejected('link=nic1v1,name=a/b');
++check_parse_rejected('link=nic1v1,hwaddr=zz');
++check_parse_rejected('link=nic1v1,mtu=63');
++check_parse_rejected('link=nic1v1,mtu=65536');
++check_parse_rejected('link=nic1v1,up=maybe');
++check_parse_rejected('link=nic1v1,unknown=1');
++
++my $generated_conf = {
++    net0 => 'name=eth0,bridge=vmbr0,type=veth',
++    hostnic0 => 'link=nic1v1,name=mwanbr,up=1',
++    hostnic1 => 'link=nic2v1,hwaddr=AA:BB:CC:DD:EE:02,mtu=1400',
++    hostnic9 => 'link=nic3v1',
++};
++my $expected_lines = join(
++    '',
++    "lxc.net.32.type = phys\n",
++    "lxc.net.32.link = nic1v1\n",
++    "lxc.net.32.name = mwanbr\n",
++    "lxc.net.32.flags = up\n",
++    "lxc.net.33.type = phys\n",
++    "lxc.net.33.link = nic2v1\n",
++    "lxc.net.33.name = nic2v1\n",
++    "lxc.net.33.hwaddr = AA:BB:CC:DD:EE:02\n",
++    "lxc.net.33.mtu = 1400\n",
++    "lxc.net.41.type = phys\n",
++    "lxc.net.41.link = nic3v1\n",
++    "lxc.net.41.name = nic3v1\n",
++);
++check_equal('generated lines', PVE::LXC::make_hostnic_config($generated_conf), $expected_lines);
++check_equal('no hostnic lines', PVE::LXC::make_hostnic_config({ net0 => 'name=eth0' }), '');
++
++my $max_net_index = 31;
++for my $index (0 .. 9) {
++    my $lxc_index = PVE::LXC::Config->hostnic_lxc_net_index("hostnic$index");
++    die "hostnic$index collides with a netN index\n" if $lxc_index <= $max_net_index;
++}
++print "OK:index range\n";
++
++check_conflict_rejected(
++    'same link',
++    { hostnic0 => 'link=nic1v1,name=a', hostnic1 => 'link=nic1v1,name=b' },
++    qr/hostnic1: hostnic0 already uses host interface 'nic1v1'\./,
++);
++check_conflict_rejected(
++    'same name',
++    { hostnic0 => 'link=nic1v1,name=mwanbr', hostnic1 => 'link=nic2v1,name=mwanbr' },
++    qr/hostnic1: hostnic0 already uses container interface name 'mwanbr'\./,
++);
++check_conflict_rejected(
++    'default name equals an explicit name',
++    { hostnic0 => 'link=nic1v1', hostnic1 => 'link=nic2v1,name=nic1v1' },
++    qr/hostnic1: hostnic0 already uses container interface name 'nic1v1'\./,
++);
++check_conflict_rejected(
++    'name equals a netN name',
++    { net1 => 'name=eth1,bridge=vmbr0', hostnic0 => 'link=nic1v1,name=eth1' },
++    qr/hostnic0: net1 already uses container interface name 'eth1'\./,
++);
++check_conflict_rejected(
++    'default name equals a netN name',
++    { net0 => 'name=nic1v1,bridge=vmbr0', hostnic0 => 'link=nic1v1' },
++    qr/hostnic0: net0 already uses container interface name 'nic1v1'\./,
++);
++
++PVE::LXC::Config->check_hostnic_conflicts($generated_conf);
++PVE::LXC::Config->check_hostnic_conflicts({
++    hostnic0 => 'link=nic1v1,name=a',
++    hostnic1 => 'link=nic1v2,name=nic1v1',
++});
++print "OK:distinct links and names\n";
++
++my $pending_conf = {
++    net0 => 'name=eth0,bridge=vmbr0',
++    hostnic0 => 'link=nic1v1,name=mwanbr',
++    pending => {
++        hostnic1 => 'link=nic1v1,name=other',
++    },
++};
++eval { PVE::LXC::Config->check_pending_hostnic_conflicts($pending_conf) };
++die "a pending duplicate link was accepted\n" if !$@;
++print "PENDING REJECTED:$@";
++
++$pending_conf->{pending}->{delete} = 'hostnic0';
++PVE::LXC::Config->check_pending_hostnic_conflicts($pending_conf);
++print "OK:pending delete resolves the conflict\n";
++
++my $net_dir = tempdir(CLEANUP => 1);
++mkdir "$net_dir/plain0" or die "mkdir plain0: $!\n";
++mkdir "$net_dir/br0" or die "mkdir br0: $!\n";
++mkdir "$net_dir/br0/bridge" or die "mkdir br0/bridge: $!\n";
++
++PVE::LXC::check_hostnic_links({ hostnic0 => 'link=plain0' }, $net_dir);
++PVE::LXC::check_hostnic_links({ net0 => 'name=eth0' }, $net_dir);
++PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' });
++print "OK:existing links\n";
++
++eval { PVE::LXC::check_hostnic_links({ hostnic0 => 'link=missing0' }, $net_dir) };
++die "a missing host interface was accepted\n"
++    if $@ !~ /hostnic0: Host interface 'missing0' does not exist\./;
++print "START REJECTED:$@";
++
++eval { PVE::LXC::check_hostnic_links({ hostnic2 => 'link=br0' }, $net_dir) };
++die "a bridge was accepted\n" if $@ !~ /hostnic2: Host interface 'br0' is a Linux bridge\./;
++print "START REJECTED:$@";
++
++sub run_perm_check {
++    my ($user, $old_value, $new_value) = @_;
++
++    my $oldconf = {};
++    $oldconf->{hostnic0} = $old_value if defined($old_value);
++    my $newconf = {};
++    my $delete = [];
++    if (defined($new_value)) {
++        $newconf->{hostnic0} = $new_value;
++    } else {
++        $delete = ['hostnic0'];
++    }
++
++    eval {
++        PVE::LXC::check_ct_modify_config_perm(
++            $rpcenv, $user, $vmid, undef, $oldconf, $newconf, $delete, 1,
++        );
++    };
++    return $@;
++}
++
++sub check_perm_ok {
++    my ($label, $user, $old_value, $new_value) = @_;
++
++    my $error = run_perm_check($user, $old_value, $new_value);
++    die "unexpected permission error for $label: $error" if $error;
++    print "PERM OK:$label\n";
++}
++
++sub check_perm_denied {
++    my ($label, $user, $old_value, $new_value) = @_;
++
++    my $error = run_perm_check($user, $old_value, $new_value);
++    die "permission check for $label passed\n" if !$error;
++    print "PERM DENIED:$label:$error";
++}
++
++my $link_one = 'link=nic1v1';
++my $link_two = 'link=nic2v1';
++
++check_perm_ok('root set', 'root@pam', undef, $link_two);
++check_perm_ok('alice set permitted link', 'alice@pve', undef, $link_one);
++check_perm_denied('alice set other link', 'alice@pve', undef, $link_two);
++check_perm_denied('alice change to other link', 'alice@pve', $link_one, $link_two);
++check_perm_denied('alice change from other link', 'alice@pve', $link_two, $link_one);
++check_perm_ok('alice delete permitted link', 'alice@pve', $link_one, undef);
++check_perm_denied('alice delete other link', 'alice@pve', $link_two, undef);
++check_perm_denied('bob set without link privilege', 'bob@pve', undef, $link_one);
++check_perm_denied('bob delete without link privilege', 'bob@pve', $link_one, undef);
++check_perm_denied('carol set without vm privilege', 'carol@pve', undef, $link_one);
++check_perm_denied('carol delete without vm privilege', 'carol@pve', $link_one, undef);
++check_perm_denied('dave set', 'dave@pve', undef, $link_one);
++
++my $method_info = PVE::API2::LXC::Config->map_method_by_name('update_vm');
++my $api_privileges = $method_info->{permissions}->{check}->[2];
++for my $user ('alice@pve', 'bob@pve') {
++    my $allowed = $rpcenv->check_vm_perm($user, $vmid, undef, $api_privileges, 1, 1);
++    die "the API level check rejected user $user\n" if !$allowed;
++}
++for my $user ('carol@pve', 'dave@pve') {
++    my $allowed = $rpcenv->check_vm_perm($user, $vmid, undef, $api_privileges, 1, 1);
++    die "the API level check admitted user $user\n" if $allowed;
++}
++print "API level check: " . scalar(@$api_privileges) . " privileges\n";
++
++$rpcenv->set_user('alice@pve');
++my $restored_conf = {};
++PVE::LXC::Create::sanitize_and_merge_config(
++    $restored_conf,
++    { hostnic0 => 'link=nic1v1', memory => 256 },
++    1,
++    0,
++);
++die "a restricted restore copied hostnic0\n" if defined($restored_conf->{hostnic0});
++die "a restricted restore dropped memory\n" if !defined($restored_conf->{memory});
++my $root_restored_conf = {};
++PVE::LXC::Create::sanitize_and_merge_config(
++    $root_restored_conf, { hostnic0 => 'link=nic1v1' }, 0, 0,
++);
++die "an unrestricted restore dropped hostnic0\n" if !defined($root_restored_conf->{hostnic0});
++print "OK:restore\n";
++
++print "all tests passed\n";
++
++exit(0);
