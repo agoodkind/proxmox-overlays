@@ -746,7 +746,7 @@ index 805eac0..3f4fafa 100644
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..631ce4b 100644
+index dee073d..186e2a8 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -694,6 +694,66 @@ sub make_apparmor_config {
@@ -801,7 +801,7 @@ index dee073d..631ce4b 100644
 +sub check_hostnic_links {
 +    my ($conf, $net_dir) = @_;
 +
-+    $net_dir //= '/sys/class/net';
++    die "check_hostnic_links: net_dir is required\n" if !defined($net_dir);
 +
 +    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
 +    for my $key (sort keys %$hostnics) {
@@ -1207,7 +1207,7 @@ index dee073d..631ce4b 100644
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
-+    check_hostnic_links($conf);
++    check_hostnic_links($conf, '/sys/class/net');
 +
      update_lxc_config($vmid, $conf);
  
@@ -1993,10 +1993,10 @@ index 0000000..131a96c
 +acl:1:/vms/100:dave@pve:audit_only:
 diff --git a/src/test/hostnic-test.pl b/src/test/hostnic-test.pl
 new file mode 100755
-index 0000000..48161e4
+index 0000000..fba3175
 --- /dev/null
 +++ b/src/test/hostnic-test.pl
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,282 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -2179,8 +2179,11 @@ index 0000000..48161e4
 +
 +PVE::LXC::check_hostnic_links({ hostnic0 => 'link=plain0' }, $net_dir);
 +PVE::LXC::check_hostnic_links({ net0 => 'name=eth0' }, $net_dir);
-+PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' });
++PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' }, '/sys/class/net');
 +print "OK:existing links\n";
++
++eval { PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' }) };
++check_equal('missing net_dir', $@, "check_hostnic_links: net_dir is required\n");
 +
 +eval { PVE::LXC::check_hostnic_links({ hostnic0 => 'link=missing0' }, $net_dir) };
 +die "a missing host interface was accepted\n"

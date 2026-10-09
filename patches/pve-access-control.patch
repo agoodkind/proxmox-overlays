@@ -60,7 +60,7 @@ index 1e64786..8e8e4e6 100644
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
  	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index 8879ab8..c442c8f 100644
+index 8879ab8..a91d05d 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
 @@ -1049,6 +1049,113 @@ sub delete_pool_acl {
@@ -237,7 +237,7 @@ index 8879ab8..c442c8f 100644
  	|/access/realm
  	|/access/realm/[[:alnum:]\.\-\_]+
 +	|/hostnic
-+	|/hostnic/[a-zA-Z0-9_.\-]{1,15}
++	|/hostnic/[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}
  	|/nodes
  	|/nodes/[[:alnum:]\.\-\_]+
  	|/pool
@@ -341,10 +341,10 @@ index 0000000..499e5b0
 +acl:1:/:carol@pve:PVEAdmin:
 diff --git a/src/test/hostnic-test.pl b/src/test/hostnic-test.pl
 new file mode 100755
-index 0000000..b86c5e7
+index 0000000..440a9d9
 --- /dev/null
 +++ b/src/test/hostnic-test.pl
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +#!/usr/bin/perl -w
 +
 +use strict;
@@ -390,6 +390,8 @@ index 0000000..b86c5e7
 +    '/hostnic/1234567890123456',
 +    '/hostnic/a b',
 +    '/hostnic/a:b',
++    '/hostnic/.',
++    '/hostnic/..',
 +) {
 +    die "path '$path' was accepted\n" if PVE::AccessControl::check_path($path);
 +    print "OK:rejected path:$path\n";
