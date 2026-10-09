@@ -215,11 +215,12 @@ sub apparmor_is_enabled {
 }
 
 sub load_apparmor_profiles {
+    my ($apparmor_enabled) = @_;
     return if !$system_mode;
     my @paths = apparmor_paths();
     return if !@paths;
-    if (!apparmor_is_enabled()) {
-        print "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
+    if (!$apparmor_enabled) {
+        warn "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
         return;
     }
     for my $path (@paths) {
@@ -229,11 +230,46 @@ sub load_apparmor_profiles {
 }
 
 sub unload_apparmor_profile {
-    my ($path) = @_;
+    my ($path, $apparmor_enabled) = @_;
     return if !$system_mode;
-    return if !apparmor_is_enabled();
+    return if !$apparmor_enabled;
     system('apparmor_parser', '--remove', $path) == 0
         or warn "pve-overlay: apparmor_parser --remove $path failed\n";
+}
+
+sub newest_mtime {
+    my (@paths) = @_;
+    my $newest = 0;
+    for my $path (@paths) {
+        my $mtime = (stat($path))[9];
+        $newest = $mtime if defined($mtime) && $mtime > $newest;
+    }
+    return $newest;
+}
+
+sub unit_active_since {
+    my ($unit) = @_;
+    open(
+        my $handle, '-|', 'systemctl', 'show', "$unit.service",
+        '--property=ActiveState', '--property=ActiveEnterTimestamp', '--timestamp=unix',
+    ) or return undef;
+    my %property;
+    while (my $line = <$handle>) {
+        $property{$1} = $2 if $line =~ /\A(\w+)=(.*)$/;
+    }
+    close($handle);
+    return undef if ($property{ActiveState} // '') !~ /\A(?:active|reloading)\z/;
+    return ($property{ActiveEnterTimestamp} // '') =~ /\A@(\d+)\z/ ? $1 : undef;
+}
+
+sub units_started_before {
+    my ($mtime) = @_;
+    return 0 if !$system_mode;
+    for my $unit (@UNITS) {
+        my $active_since = unit_active_since($unit);
+        return 1 if defined($active_since) && $active_since < $mtime;
+    }
+    return 0;
 }
 
 sub restart_units {
@@ -304,19 +340,21 @@ sub is_apparmor_path {
 # Deletes one installed file and unloads a deleted AppArmor profile. Returns 1 when it deleted
 # a file.
 sub remove_installed_path {
-    my ($path, $kind) = @_;
+    my ($path, $kind, $apparmor_enabled) = @_;
     if (!is_installable_path($path, $kind)) {
         warn "pve-overlay: skipped the recorded path $path outside the install directories\n";
         return 0;
     }
     return 0 if !-e $path;
-    unload_apparmor_profile($path) if $kind eq 'host' && is_apparmor_path($path);
+    unload_apparmor_profile($path, $apparmor_enabled)
+        if $kind eq 'host' && is_apparmor_path($path);
     unlink($path) or die "cannot remove $path: $!\n";
     return 1;
 }
 
 # Deletes every recorded path and every path that the current patches produce.
 sub remove_copies {
+    my ($apparmor_enabled) = @_;
     my $paths = read_state();
     my $produced = eval { produced_paths() } // {};
     for my $path (keys %$produced) {
@@ -325,7 +363,7 @@ sub remove_copies {
 
     my $removed_count = 0;
     for my $path (sort keys %$paths) {
-        $removed_count += remove_installed_path($path, $paths->{$path});
+        $removed_count += remove_installed_path($path, $paths->{$path}, $apparmor_enabled);
     }
     unlink(state_path()) if -e state_path();
     return $removed_count;
@@ -337,10 +375,11 @@ sub command_check {
 }
 
 sub command_apply {
+    my $apparmor_enabled = apparmor_is_enabled();
     my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         # A patched copy of an older module must not shadow a newer package.
-        my $removed_count = remove_copies();
+        my $removed_count = remove_copies($apparmor_enabled);
         restart_units() if $removed_count;
         die "pve-overlay: removed the patched copies, Proxmox runs packaged modules: $error";
     }
@@ -351,7 +390,7 @@ sub command_apply {
     my $deleted_count = 0;
     for my $path (sort keys %$recorded) {
         next if exists($produced->{$path});
-        if (remove_installed_path($path, $recorded->{$path})) {
+        if (remove_installed_path($path, $recorded->{$path}, $apparmor_enabled)) {
             print "removed $path, which the current patches do not produce\n";
             $deleted_count++;
         }
@@ -378,13 +417,15 @@ sub command_apply {
     }
     # apparmor.service loads each profile file at boot. This call loads a new
     # or changed profile before the restarted units use it.
-    load_apparmor_profiles() if $changed_count;
-    restart_units() if $changed_count || $deleted_count;
-    print "the patched copies are current\n" if !$changed_count && !$deleted_count;
+    my $units_stale = units_started_before(newest_mtime(keys %$produced));
+    load_apparmor_profiles($apparmor_enabled) if $changed_count || $units_stale;
+    my $restart_needed = $changed_count || $deleted_count || $units_stale;
+    restart_units() if $restart_needed;
+    print "the patched copies are current\n" if !$restart_needed;
 }
 
 sub command_remove {
-    my $removed_count = remove_copies();
+    my $removed_count = remove_copies(apparmor_is_enabled());
     unlink($DPKG_HOOK_FILE) if $system_mode && -e $DPKG_HOOK_FILE;
     restart_units() if $removed_count;
     print "removed $removed_count patched copies\n";
