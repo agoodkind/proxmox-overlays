@@ -33,6 +33,7 @@ my $STATE_FILE = 'var/lib/pve-overlay/installed';
 # at /<path>. Only a path below one of these directories is installed.
 my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
 my $APPARMOR_DIR = 'etc/apparmor.d/';
+my $APPARMOR_ENABLED_FILE = '/sys/module/apparmor/parameters/enabled';
 
 # Units that load the patched modules at start.
 my @UNITS = qw(pvedaemon pveproxy pvestatd pvescheduler pve-ha-lrm);
@@ -208,9 +209,20 @@ sub apparmor_paths {
         read_file_diffs();
 }
 
+sub apparmor_is_enabled {
+    return 0 if !-e $APPARMOR_ENABLED_FILE;
+    return read_file($APPARMOR_ENABLED_FILE) =~ /\AY/ ? 1 : 0;
+}
+
 sub load_apparmor_profiles {
     return if !$system_mode;
-    for my $path (apparmor_paths()) {
+    my @paths = apparmor_paths();
+    return if !@paths;
+    if (!apparmor_is_enabled()) {
+        print "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
+        return;
+    }
+    for my $path (@paths) {
         system('apparmor_parser', '--replace', $path) == 0
             or die "pve-overlay: apparmor_parser --replace $path failed\n";
     }
@@ -219,6 +231,7 @@ sub load_apparmor_profiles {
 sub unload_apparmor_profile {
     my ($path) = @_;
     return if !$system_mode;
+    return if !apparmor_is_enabled();
     system('apparmor_parser', '--remove', $path) == 0
         or warn "pve-overlay: apparmor_parser --remove $path failed\n";
 }
