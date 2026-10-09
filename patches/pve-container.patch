@@ -1213,7 +1213,7 @@ index dee073d..631ce4b 100644
  
      eval {
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
-index 3eb1905..f2108e0 100644
+index 3eb1905..47835c7 100644
 --- a/src/PVE/LXC/Config.pm
 +++ b/src/PVE/LXC/Config.pm
 @@ -6,6 +6,7 @@ use warnings;
@@ -1303,7 +1303,7 @@ index 3eb1905..f2108e0 100644
 +    },
 +};
 +
-+my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_.\-]{1,15}';
++my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}';
 +
 +my $hostnic_desc = {
 +    link => {
@@ -1396,7 +1396,7 @@ index 3eb1905..f2108e0 100644
      my $changes = $class->cleanup_pending($conf);
  
      my $errors = {};
-@@ -1591,6 +1736,89 @@ sub parse_features {
+@@ -1591,6 +1736,90 @@ sub parse_features {
      return PVE::JSONSchema::parse_property_string($features_desc, $data);
  }
  
@@ -1469,11 +1469,12 @@ index 3eb1905..f2108e0 100644
 +        next if $key eq 'pending';
 +        $effective_conf->{$key} = $conf->{$key};
 +    }
-+    for my $key (keys %{ $conf->{pending} }) {
++    my $pending = $conf->{pending} // {};
++    for my $key (keys %$pending) {
 +        next if $key eq 'delete';
-+        $effective_conf->{$key} = $conf->{pending}->{$key};
++        $effective_conf->{$key} = $pending->{$key};
 +    }
-+    my $pending_delete = $class->parse_pending_delete($conf->{pending}->{delete});
++    my $pending_delete = $class->parse_pending_delete($pending->{delete});
 +    for my $key (keys %$pending_delete) {
 +        delete $effective_conf->{$key};
 +    }
@@ -1992,10 +1993,10 @@ index 0000000..131a96c
 +acl:1:/vms/100:dave@pve:audit_only:
 diff --git a/src/test/hostnic-test.pl b/src/test/hostnic-test.pl
 new file mode 100755
-index 0000000..2373fd2
+index 0000000..48161e4
 --- /dev/null
 +++ b/src/test/hostnic-test.pl
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,279 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -2069,6 +2070,9 @@ index 0000000..2373fd2
 +check_parse_rejected('link=nic/1');
 +check_parse_rejected('link=nic 1');
 +check_parse_rejected('link=');
++check_parse_rejected('link=.');
++check_parse_rejected('link=..');
++check_parse_rejected('link=nic1v1,name=..');
 +check_parse_rejected('link=nic1v1,name=1234567890123456');
 +check_parse_rejected('link=nic1v1,name=a/b');
 +check_parse_rejected('link=nic1v1,hwaddr=zz');
@@ -2158,6 +2162,15 @@ index 0000000..2373fd2
 +$pending_conf->{pending}->{delete} = 'hostnic0';
 +PVE::LXC::Config->check_pending_hostnic_conflicts($pending_conf);
 +print "OK:pending delete resolves the conflict\n";
++
++my $direct_conf = { net0 => 'name=eth0,bridge=vmbr0', hostnic0 => 'link=nic1v1' };
++PVE::LXC::Config->check_pending_hostnic_conflicts($direct_conf);
++check_equal('keys without a pending section', join(',', sort keys %$direct_conf), 'hostnic0,net0');
++$direct_conf->{hostnic1} = 'link=nic1v1,name=other';
++eval { PVE::LXC::Config->check_pending_hostnic_conflicts($direct_conf) };
++die "a duplicate link without a pending section was accepted\n"
++    if $@ !~ /hostnic1: hostnic0 already uses host interface 'nic1v1'\./;
++print "DIRECT REJECTED:$@";
 +
 +my $net_dir = tempdir(CLEANUP => 1);
 +mkdir "$net_dir/plain0" or die "mkdir plain0: $!\n";
