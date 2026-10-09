@@ -247,19 +247,25 @@ sub newest_mtime {
     return $newest;
 }
 
+sub parse_unit_active_since {
+    my (@lines) = @_;
+    my %property;
+    for my $line (@lines) {
+        $property{$1} = $2 if $line =~ /\A(\w+)=(.*)$/;
+    }
+    return undef if ($property{ActiveState} // '') !~ /\A(?:active|reloading)\z/;
+    return ($property{ActiveEnterTimestamp} // '') =~ /\A@(\d+)\z/ ? $1 : undef;
+}
+
 sub unit_active_since {
     my ($unit) = @_;
     open(
         my $handle, '-|', 'systemctl', 'show', "$unit.service",
         '--property=ActiveState', '--property=ActiveEnterTimestamp', '--timestamp=unix',
     ) or return undef;
-    my %property;
-    while (my $line = <$handle>) {
-        $property{$1} = $2 if $line =~ /\A(\w+)=(.*)$/;
-    }
+    my @lines = <$handle>;
     close($handle);
-    return undef if ($property{ActiveState} // '') !~ /\A(?:active|reloading)\z/;
-    return ($property{ActiveEnterTimestamp} // '') =~ /\A@(\d+)\z/ ? $1 : undef;
+    return parse_unit_active_since(@lines);
 }
 
 sub units_started_before {
@@ -267,7 +273,7 @@ sub units_started_before {
     return 0 if !$system_mode;
     for my $unit (@UNITS) {
         my $active_since = unit_active_since($unit);
-        return 1 if defined($active_since) && $active_since < $mtime;
+        return 1 if defined($active_since) && $active_since <= $mtime;
     }
     return 0;
 }
