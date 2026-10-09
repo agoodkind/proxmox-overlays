@@ -13,6 +13,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `VM.Config.BPFDelegate.Map.<Name>` | `/vms/<vmid>` | Add or remove one BPF map type in the `bpfdelegate` option of an unprivileged container |
 | `VM.Config.BPFDelegate.Prog.<Name>` | `/vms/<vmid>` | Add or remove one BPF program type in the `bpfdelegate` option of an unprivileged container |
 | `VM.Config.BPFDelegate.Attach.<Name>` | `/vms/<vmid>` | Add or remove one BPF attach type in the `bpfdelegate` option of an unprivileged container |
+| `VM.Config.HostNIC` | `/vms/<vmid>` | Change a container's host interface options |
+| `Sys.HostNIC.Use` | `/hostnic/<ifname>` | Use a host interface in a container |
 | `VM.Guest.Exec` | `/vms/<vmid>` | Run a command as root in a running container |
 | `VM.Guest.FileRead` | `/vms/<vmid>` | Read a file as root in a running container |
 | `VM.Guest.FileWrite` | `/vms/<vmid>` | Write a file as root in a running container |
@@ -45,6 +47,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `/acme/accounts/<name>` | One ACME account |
 | `/acme/plugins` | Every ACME plugin, with propagation |
 | `/acme/plugins/<id>` | One ACME plugin |
+| `/hostnic` | Every host interface |
+| `/hostnic/<ifname>` | One host interface |
 
 An account name or plugin id starts with a letter and continues with one or more letters, digits, `_`, or `-`. The access control module rejects every other path under `/acme`.
 
