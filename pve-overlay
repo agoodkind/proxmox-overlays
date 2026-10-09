@@ -262,9 +262,15 @@ sub unit_active_since {
     open(
         my $handle, '-|', 'systemctl', 'show', "$unit.service",
         '--property=ActiveState', '--property=ActiveEnterTimestamp', '--timestamp=unix',
-    ) or return undef;
+    ) or do {
+        warn "pve-overlay: systemctl show $unit.service failed\n";
+        return 0;
+    };
     my @lines = <$handle>;
-    close($handle);
+    if (!close($handle)) {
+        warn "pve-overlay: systemctl show $unit.service failed\n";
+        return 0;
+    }
     return parse_unit_active_since(@lines);
 }
 
