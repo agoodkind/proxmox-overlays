@@ -143,6 +143,8 @@ Command execution and file operations use the QEMU guest agent in a running VM. 
 
 `timeout` defaults to 120 seconds and accepts 1 to 3600. On timeout, the worker runs `kill` through the agent to send `TERM` to the guest process, then `KILL` after 5 seconds if needed. Child processes continue with qemu-ga 10.0. The task reports `command timed out after <n> seconds` after storing the result.
 
+The `qmexec` worker retries the same `guest-exec` or `guest-exec-status` call at intervals of 0.05 to 1 second while the guest filesystems are frozen during a snapshot or backup; the command timeout counts from worker startup and includes this wait; an already started command continues without restarting while `exec-status` returns `exited: 0`. `exec-status` returns `exitcode` 124 with `timed-out` and empty output for a started command when the agent rejects calls until the timeout; the worker cannot run `kill` through the disabled agent to stop a guest process that is still running; `exec-status` returns an error with the agent message if the command never started.
+
 `exec-status` returns `exited: 0` until the result is ready. A successful completed read returns `exited: 1`, `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` for output exceeding 1 MiB. The read deletes the result. Signals produce 128 plus the signal number; timeouts produce `exitcode` 124 and `timed-out`. A `pid` without a stored result for the requested VM returns an error.
 
 The worker stores results in `/run/pve/qemu-exec/<vmid>/<pid>` with directory mode 0700. Each `exec` and `exec-status` call deletes unread results after one hour and directories without a status file after two hours.
