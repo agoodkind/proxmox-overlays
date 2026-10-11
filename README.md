@@ -11,7 +11,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - The container API requires `VM.Config.BPFDelegate` privileges to change `bpfdelegate` on an unprivileged container. Each privilege authorizes one BPF command, map type, program type, or attach type.
 - `VM.Config.Vsock` enables a virtio vsock device on a VM. The guest CID equals the VM ID.
 - `VM.Config.HostNIC` permits changes to a container's `hostnic0` through `hostnic9` options. Changes also require `Sys.HostNIC.Use` for each host interface in the old and new values.
-- `VM.Guest.Exec`, `VM.Guest.FileRead`, and `VM.Guest.FileWrite` run a command in a container as root, read a container file, and write a container file.
+- `VM.Guest.Exec`, `VM.Guest.FileRead`, and `VM.Guest.FileWrite` authorize command execution, file reads, and file writes in containers as root and in VMs through the QEMU guest agent.
 - `Sys.ACME.Account.Audit`, `Create`, `Modify`, and `Remove` read, register, update, and remove one named ACME account.
 - Six `Sys.ACME.Plugin` privileges read, add, change, and delete one DNS plugin. The stored credentials have one privilege for reads and one for writes.
 - `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.

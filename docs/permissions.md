@@ -15,9 +15,9 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `VM.Config.BPFDelegate.Attach.<Name>` | `/vms/<vmid>` | Add or remove one BPF attach type in the `bpfdelegate` option of an unprivileged container |
 | `VM.Config.HostNIC` | `/vms/<vmid>` | Change a container's host interface options |
 | `Sys.HostNIC.Use` | `/hostnic/<ifname>` | Use a host interface in a container |
-| `VM.Guest.Exec` | `/vms/<vmid>` | Run a command as root in a running container |
-| `VM.Guest.FileRead` | `/vms/<vmid>` | Read a file as root in a running container |
-| `VM.Guest.FileWrite` | `/vms/<vmid>` | Write a file as root in a running container |
+| `VM.Guest.Exec` | `/vms/<vmid>` | Run a command as root in a running container or through the QEMU guest agent in a running VM |
+| `VM.Guest.FileRead` | `/vms/<vmid>` | Read a file as root in a running container or through the QEMU guest agent in a running VM |
+| `VM.Guest.FileWrite` | `/vms/<vmid>` | Write a file as root in a running container or through the QEMU guest agent in a running VM |
 | `Sys.ACME.Account.Audit` | `/acme/accounts/<name>` | Read one ACME account and see it in the account list |
 | `Sys.ACME.Account.Create` | `/acme/accounts/<name>` | Register an ACME account with that name |
 | `Sys.ACME.Account.Modify` | `/acme/accounts/<name>` | Update or refresh one ACME account |
@@ -114,7 +114,7 @@ Each method runs in `pvedaemon` as root on the node that hosts the container. Th
 | `POST` | `/nodes/{node}/lxc/{vmid}/file-write` | `VM.Guest.FileWrite` on `/vms/{vmid}` |
 | `GET` | `/nodes/{node}/lxc/{vmid}/file-read` | `VM.Guest.FileRead` on `/vms/{vmid}` |
 
-`VM.Guest.Exec` runs any program as root in the container and can read or write any file there. The existing `VM.GuestAgent.*` privileges apply to the QEMU guest agent of a VM and do not authorize these methods.
+`VM.Guest.Exec` runs any program as root in the container and can read or write any file there. `VM.GuestAgent.*` privileges do not authorize these methods.
 
 `exec` returns `pid` at once and runs the command in a task worker that `pvedaemon` detaches with `fork_worker`. The worker survives the end of the `pvedaemon` process that started it and appears in the task list as `lxcexec`. `pid` is a random number, not a process ID, because a process ID can repeat before a caller reads the result.
 
@@ -127,6 +127,27 @@ The worker stores the result in `/run/pve/lxc-exec/<vmid>/<pid>`, which only `ro
 `file-write` writes the decoded `content` to the absolute path `file` with `tee` in the container and replaces an existing file. `file-read` reads the file with `head` and returns base64 `content`. It sets `truncated` when the file exceeds 4 MiB.
 
 `input-data` and `content` accept at most 128 KiB of base64, which is 96 KiB of data. `pve-http-server` rejects a request body above 512 KiB, and form encoding expands a base64 value to at most three times its length.
+
+## VM guest methods
+
+Command execution and file operations use the QEMU guest agent in a running VM. `exec` checks agent availability before starting its worker.
+
+| Method | Path | Requirement |
+| --- | --- | --- |
+| `POST` | `/nodes/{node}/qemu/{vmid}/exec` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/qemu/{vmid}/exec-status` | `VM.Guest.Exec` on `/vms/{vmid}` |
+| `POST` | `/nodes/{node}/qemu/{vmid}/file-write` | `VM.Guest.FileWrite` on `/vms/{vmid}` |
+| `GET` | `/nodes/{node}/qemu/{vmid}/file-read` | `VM.Guest.FileRead` on `/vms/{vmid}` |
+
+`exec` returns a random `pid`, not a process ID, immediately and starts a `qmexec` task worker through `fork_worker`. `command` lists the program and arguments; base64 `input-data` supplies standard input.
+
+`timeout` defaults to 120 seconds and accepts 1 to 3600. On timeout, the worker runs `kill` through the agent to send `TERM` to the guest process, then `KILL` after 5 seconds if needed. Child processes continue with qemu-ga 10.0. The task reports `command timed out after <n> seconds` after storing the result.
+
+`exec-status` returns `exited: 0` until the result is ready. A successful completed read returns `exited: 1`, `exitcode`, base64 `out-data` and `err-data`, and `out-truncated` or `err-truncated` for output exceeding 1 MiB. The read deletes the result. Signals produce 128 plus the signal number; timeouts produce `exitcode` 124 and `timed-out`. A `pid` without a stored result for the requested VM returns an error.
+
+The worker stores results in `/run/pve/qemu-exec/<vmid>/<pid>` with directory mode 0700. Each `exec` and `exec-status` call deletes unread results after one hour and directories without a status file after two hours.
+
+`file` must be an absolute path without NUL bytes and at most 4096 characters. `file-write` replaces the file through the agent. `file-read` returns base64 `content` and sets `truncated` above 4 MiB. Both methods call `file-close` after file operations. `input-data` and `content` accept at most 128 KiB of base64, or 96 KiB of data.
 
 ## VM vsock option
 
