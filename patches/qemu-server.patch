@@ -61,10 +61,10 @@ index 922c6599..c2c74bf3 100644
  ];
 diff --git a/src/PVE/API2/Qemu/Guest.pm b/src/PVE/API2/Qemu/Guest.pm
 new file mode 100644
-index 00000000..ceca4f99
+index 00000000..089fb21b
 --- /dev/null
 +++ b/src/PVE/API2/Qemu/Guest.pm
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,696 @@
 +package PVE::API2::Qemu::Guest;
 +
 +use strict;
@@ -397,6 +397,14 @@ index 00000000..ceca4f99
 +    die $close_error if $close_error;
 +    return $result;
 +};
++
++sub exec_output_limit {
++    return $GUEST_EXEC_OUTPUT_LIMIT;
++}
++
++sub file_read_limit {
++    return $GUEST_FILE_READ_LIMIT;
++}
 +
 +sub register_methods {
 +    my ($class) = @_;
@@ -807,6 +815,34 @@ index d7dc6121..084ac259 100644
          'virtio6' => { bus => 2, addr => 1 },
          'virtio7' => { bus => 2, addr => 2 },
          'virtio8' => { bus => 2, addr => 3 },
+diff --git a/src/test/GuestTestRequest.pm b/src/test/GuestTestRequest.pm
+new file mode 100644
+index 00000000..56f56260
+--- /dev/null
++++ b/src/test/GuestTestRequest.pm
+@@ -0,0 +1,22 @@
++package GuestTestRequest;
++
++use strict;
++use warnings;
++
++use PVE::API2;
++use PVE::HTTPServer;
++
++# The helper uses bless because new requires socket, lockfh, and lockfile.
++sub guest_request {
++    my ($rpcenv, $user, $method, $vmid, $operation, $params) = @_;
++
++    my $server = bless({ rpcenv => $rpcenv }, 'PVE::HTTPServer');
++    my $auth = { userid => $user };
++    $auth->{api_token} = 1 if $user =~ m/!/;
++
++    return $server->rest_handler(
++        '127.0.0.1', $method, "/nodes/localhost/qemu/$vmid/$operation", $auth, $params,
++    );
++}
++
++1;
 diff --git a/src/test/Makefile b/src/test/Makefile
 index cf589f41..badd2997 100644
 --- a/src/test/Makefile
@@ -834,10 +870,10 @@ index cf589f41..badd2997 100644
  	rm -rf MigrationTest/run parse-config-output
 diff --git a/src/test/guest-agent-test.pl b/src/test/guest-agent-test.pl
 new file mode 100755
-index 00000000..eef7c119
+index 00000000..5896ffe0
 --- /dev/null
 +++ b/src/test/guest-agent-test.pl
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,369 @@
 +#!/usr/bin/perl -T
 +
 +# qemu-ga runs commands on the test host as the test user.
@@ -852,23 +888,32 @@ index 00000000..eef7c119
 +use POSIX;
 +use Time::HiRes qw();
 +
-+use lib qw(..);
++use lib qw(.. .);
 +
-+use PVE::API2::Qemu;
++use HTTP::Status qw(:constants);
++
++use PVE::API2::Qemu::Guest;
 +use PVE::ProcFSTools;
 +use PVE::QemuConfig;
 +use PVE::QemuServer::Helpers;
 +use PVE::RPCEnvironment;
 +use PVE::UPID;
 +
-+my $VMID = 9005;
-+my $USER = 'svc@pve!deploy';
++use GuestTestRequest;
++
++my $VMID = 100;
++my $OTHER_VMID = 101;
++my $OWNER_USER = 'erin@pve';
++my $EXEC_USER = 'erin@pve!exec';
++my $READ_USER = 'erin@pve!read';
++my $WRITE_USER = 'erin@pve!write';
 +my $QEMU_GA = '/usr/sbin/qemu-ga';
 +my $SOCKET_DIRECTORY = '/var/run/qemu-server';
 +my $AGENT_START_SECONDS = 30;
 +my $POLL_SECONDS = 60;
-+my $EXEC_OUTPUT_LIMIT = 1024 * 1024;
-+my $FILE_READ_LIMIT = 4 * 1024 * 1024;
++my $EXEC_TIMEOUT_ABOVE_MAXIMUM = 3601;
++my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
++my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 +
 +my $vm_config = { agent => '1' };
 +
@@ -937,25 +982,46 @@ index 00000000..eef7c119
 +}
 +
 +my $rpcenv = PVE::RPCEnvironment->init('priv');
-+
-+my $exec_info = PVE::API2::Qemu->map_method_by_name('exec');
-+my $status_info = PVE::API2::Qemu->map_method_by_name('exec_status');
-+my $write_info = PVE::API2::Qemu->map_method_by_name('file_write');
-+my $read_info = PVE::API2::Qemu->map_method_by_name('file_read');
++$rpcenv->init_request(userconfig => 'guest-permission-test.cfg');
 +
 +my $test_start = time();
 +my $started_count = 0;
 +
++sub call_guest {
++    my ($user, $method, $vmid, $operation, $params) = @_;
++
++    my $response =
++        GuestTestRequest::guest_request($rpcenv, $user, $method, $vmid, $operation, $params);
++    die $response->{message} if $response->{status} != HTTP_OK;
++    return $response->{data};
++}
++
 +sub call_exec {
 +    my ($param) = @_;
 +
-+    $rpcenv->set_credentials({ userid => $USER });
-+    my $result = eval { $exec_info->{code}->({ vmid => $VMID, %$param }) };
-+    my $error = $@;
-+    $rpcenv->set_credentials(undef);
-+    die $error if $error;
++    my $result = call_guest($EXEC_USER, 'POST', $VMID, 'exec', $param);
 +    $started_count++;
 +    return $result->{pid};
++}
++
++sub call_exec_status {
++    my ($user, $vmid, $pid) = @_;
++
++    return call_guest($user, 'GET', $vmid, 'exec-status', { pid => $pid });
++}
++
++sub call_file_write {
++    my ($file, $content) = @_;
++
++    return call_guest(
++        $WRITE_USER, 'POST', $VMID, 'file-write', { file => $file, content => $content },
++    );
++}
++
++sub call_file_read {
++    my ($file) = @_;
++
++    return call_guest($READ_USER, 'GET', $VMID, 'file-read', { file => $file });
 +}
 +
 +sub wait_for_exit {
@@ -963,7 +1029,7 @@ index 00000000..eef7c119
 +
 +    my $deadline = Time::HiRes::time() + $POLL_SECONDS;
 +    while (Time::HiRes::time() < $deadline) {
-+        my $status = $status_info->{code}->({ vmid => $VMID, pid => $pid });
++        my $status = call_exec_status($EXEC_USER, $VMID, $pid);
 +        if ($status->{exited}) {
 +            $status->{stdout} = decode_base64($status->{'out-data'});
 +            $status->{stderr} = decode_base64($status->{'err-data'});
@@ -1055,12 +1121,14 @@ index 00000000..eef7c119
 +check_dies(
 +    'exec-status rejects a second result read',
 +    qr/no stored result for command $read_pid in VM $VMID/,
-+    sub { $status_info->{code}->({ vmid => $VMID, pid => $read_pid }) },
++    sub { call_exec_status($EXEC_USER, $VMID, $read_pid) },
 +);
 +check_dies(
 +    'exec-status rejects a pid from another VM',
-+    qr/no stored result for command \d+ in VM 9006/,
-+    sub { $status_info->{code}->({ vmid => 9006, pid => call_exec({ command => ['true'] }) }) },
++    qr/no stored result for command \d+ in VM $OTHER_VMID/,
++    sub {
++        call_exec_status($OWNER_USER, $OTHER_VMID, call_exec({ command => ['true'] }));
++    },
 +);
 +check_dies(
 +    'exec rejects invalid base64 input-data',
@@ -1068,9 +1136,9 @@ index 00000000..eef7c119
 +    sub { call_exec({ command => ['true'], 'input-data' => 'not base64!' }) },
 +);
 +check_dies(
-+    'exec rejects missing request credentials',
-+    qr/authenticated user of the request is not available/,
-+    sub { $exec_info->{code}->({ vmid => $VMID, command => ['true'] }) },
++    'exec rejects a timeout above the schema maximum',
++    qr/Parameter verification failed/,
++    sub { call_exec({ command => ['true'], timeout => $EXEC_TIMEOUT_ABOVE_MAXIMUM }) },
 +);
 +check_dies(
 +    'exec-status reports a missing program',
@@ -1080,10 +1148,8 @@ index 00000000..eef7c119
 +
 +my $file_path = "$work_directory/written file";
 +my $file_content = join('', map { chr($_) } 0 .. 255) x 16;
-+$write_info->{code}->({
-+    vmid => $VMID, file => $file_path, content => encode_base64($file_content, ''),
-+});
-+my $read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
++call_file_write($file_path, encode_base64($file_content, ''));
++my $read_result = call_file_read($file_path);
 +check_equal(
 +    'file-read returns the bytes written by file-write',
 +    $read_result->{content},
@@ -1091,14 +1157,14 @@ index 00000000..eef7c119
 +);
 +die "file-read marked a file below the read limit as truncated\n" if $read_result->{truncated};
 +
-+$write_info->{code}->({ vmid => $VMID, file => $file_path, content => encode_base64('new', '') });
-+$read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
++call_file_write($file_path, encode_base64('new', ''));
++$read_result = call_file_read($file_path);
 +check_equal(
 +    'file-write replaces existing content', decode_base64($read_result->{content}), 'new',
 +);
 +
-+$write_info->{code}->({ vmid => $VMID, file => $file_path, content => '' });
-+$read_result = $read_info->{code}->({ vmid => $VMID, file => $file_path });
++call_file_write($file_path, '');
++$read_result = call_file_read($file_path);
 +check_equal(
 +    'file-read returns empty content after an empty write', $read_result->{content}, '',
 +);
@@ -1109,7 +1175,7 @@ index 00000000..eef7c119
 +    or die "unable to open $large_path for writing: $!\n";
 +print {$large_handle} 'x' x ($FILE_READ_LIMIT + 1);
 +close($large_handle) or die "unable to close $large_path: $!\n";
-+$read_result = $read_info->{code}->({ vmid => $VMID, file => $large_path });
++$read_result = call_file_read($large_path);
 +check_equal(
 +    'file-read returns four mebibytes from a larger file',
 +    length(decode_base64($read_result->{content})),
@@ -1120,26 +1186,22 @@ index 00000000..eef7c119
 +check_dies(
 +    'file-read reports a missing file',
 +    qr/Agent error: /,
-+    sub { $read_info->{code}->({ vmid => $VMID, file => "$work_directory/missing" }) },
++    sub { call_file_read("$work_directory/missing") },
 +);
 +check_dies(
 +    'file-write reports a missing parent directory',
 +    qr/Agent error: /,
-+    sub {
-+        $write_info->{code}->({
-+            vmid => $VMID, file => "$work_directory/missing/file", content => 'bmV3',
-+        });
-+    },
++    sub { call_file_write("$work_directory/missing/file", 'bmV3') },
 +);
 +check_dies(
 +    'file-read rejects a relative path',
 +    qr/parameter 'file' must be an absolute path/,
-+    sub { $read_info->{code}->({ vmid => $VMID, file => 'relative' }) },
++    sub { call_file_read('relative') },
 +);
 +check_dies(
 +    'file-write rejects invalid base64 content',
 +    qr/parameter 'content' is not valid base64/,
-+    sub { $write_info->{code}->({ vmid => $VMID, file => $file_path, content => 'a' }) },
++    sub { call_file_write($file_path, 'a') },
 +);
 +
 +my $task_count = 0;
@@ -1147,17 +1209,15 @@ index 00000000..eef7c119
 +    my $upid = PVE::UPID::decode(basename($log));
 +    next if !$upid || $upid->{type} ne 'qmexec' || $upid->{id} ne $VMID;
 +    next if $upid->{starttime} < $test_start;
-+    die "qmexec task has unexpected user $upid->{user}\n" if $upid->{user} ne $USER;
++    die "qmexec task has unexpected user $upid->{user}\n" if $upid->{user} ne $EXEC_USER;
 +    $task_count++;
 +}
 +check_equal('qmexec task count matches returned pid count', $task_count, $started_count);
 +
 +my $guest_calls = {
 +    'exec' => sub { call_exec({ command => ['true'] }) },
-+    'file-write' => sub {
-+        $write_info->{code}->({ vmid => $VMID, file => $file_path, content => 'bmV3' });
-+    },
-+    'file-read' => sub { $read_info->{code}->({ vmid => $VMID, file => $file_path }) },
++    'file-write' => sub { call_file_write($file_path, 'bmV3') },
++    'file-read' => sub { call_file_read($file_path) },
 +};
 +
 +stop_agent($agent_pid);
@@ -1212,40 +1272,51 @@ index 00000000..239fbd35
 +acl:1:/vms/101:erin@pve:guest_all:
 diff --git a/src/test/guest-permission-test.pl b/src/test/guest-permission-test.pl
 new file mode 100755
-index 00000000..067eccaf
+index 00000000..40c1ba9a
 --- /dev/null
 +++ b/src/test/guest-permission-test.pl
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,107 @@
 +#!/usr/bin/perl
 +
 +use strict;
 +use warnings;
 +
-+use lib qw(..);
++use lib qw(.. .);
 +
-+use PVE::API2::Qemu;
++use HTTP::Status qw(:constants);
++
 +use PVE::RPCEnvironment;
 +
-+my $rpcenv = PVE::RPCEnvironment->init('cli');
++use GuestTestRequest;
++
++my $rpcenv = PVE::RPCEnvironment->init('priv');
 +$rpcenv->init_request(userconfig => 'guest-permission-test.cfg');
 +
 +my $vmid = 100;
 +
-+my $guest_methods = {
-+    exec => { method => 'POST', path => '{vmid}/exec', privilege => 'VM.Guest.Exec' },
++my $guest_requests = {
++    exec => {
++        method => 'POST',
++        operation => 'exec',
++        params => { command => ['true'] },
++        privilege => 'VM.Guest.Exec',
++    },
 +    exec_status => {
 +        method => 'GET',
-+        path => '{vmid}/exec-status',
++        operation => 'exec-status',
++        params => { pid => 1 },
 +        privilege => 'VM.Guest.Exec',
 +    },
 +    file_write => {
 +        method => 'POST',
-+        path => '{vmid}/file-write',
++        operation => 'file-write',
++        params => { file => '/tmp/guest-permission-test', content => '' },
 +        privilege => 'VM.Guest.FileWrite',
 +    },
 +    file_read => {
 +        method => 'GET',
-+        path => '{vmid}/file-read',
++        operation => 'file-read',
++        params => { file => '/tmp/guest-permission-test' },
 +        privilege => 'VM.Guest.FileRead',
 +    },
 +};
@@ -1257,44 +1328,55 @@ index 00000000..067eccaf
 +    'erin@pve!write' => 'VM.Guest.FileWrite',
 +};
 +
-+for my $name (sort keys %$guest_methods) {
-+    my $expected = $guest_methods->{$name};
++# The methods return status 500 after authorization in this test without VM configuration.
++sub request_is_authorized {
++    my ($name, $user, $request_vmid) = @_;
 +
-+    my $info = PVE::API2::Qemu->map_method_by_name($name);
-+    die "method $name is not registered\n" if !$info;
-+    die "method $name has unexpected path $info->{path}\n"
-+        if $info->{path} ne $expected->{path};
-+    die "method $name has unexpected HTTP method $info->{method}\n"
-+        if $info->{method} ne $expected->{method};
++    my $request = $guest_requests->{$name};
++    my $response = GuestTestRequest::guest_request(
++        $rpcenv,
++        $user,
++        $request->{method},
++        $request_vmid,
++        $request->{operation},
++        { %{ $request->{params} } },
++    );
++    my $status = $response->{status};
++    my $message = $response->{message} // '';
 +
-+    my $check = $info->{permissions}->{check};
-+    die "method $name does not use a perm check on /vms/{vmid}\n"
-+        if $check->[0] ne 'perm' || $check->[1] ne '/vms/{vmid}';
-+    my $privileges = $check->[2];
-+    die "method $name checks privileges @$privileges instead of $expected->{privilege}\n"
-+        if "@$privileges" ne $expected->{privilege};
++    return 1 if $status == HTTP_INTERNAL_SERVER_ERROR;
++
++    my $privilege = $request->{privilege};
++    return 0
++        if $status == HTTP_FORBIDDEN
++        && $message =~ m/Permission check failed \(\/vms\/$request_vmid, \Q$privilege\E\)/;
++
++    die "request for $name as $user returned unexpected HTTP status $status with message"
++        . " $message\n";
++}
++
++for my $name (sort keys %$guest_requests) {
++    my $privilege = $guest_requests->{$name}->{privilege};
 +
 +    for my $token (sort keys %$guest_tokens) {
-+        my $allowed = $rpcenv->check_vm_perm($token, $vmid, undef, $privileges, 0, 1);
-+        my $should_pass = $guest_tokens->{$token} eq $expected->{privilege};
++        my $allowed = request_is_authorized($name, $token, $vmid);
++        my $should_pass = $guest_tokens->{$token} eq $privilege;
 +        die "token $token was rejected for $name\n" if $should_pass && !$allowed;
 +        die "token $token passed for $name\n" if !$should_pass && $allowed;
 +        print "GUEST PERM:$name:$token:" . ($allowed ? 'allowed' : 'denied') . "\n";
 +    }
 +
 +    for my $user ('erin@pve', 'root@pam') {
-+        die "user $user was rejected for $name\n"
-+            if !$rpcenv->check_vm_perm($user, $vmid, undef, $privileges, 0, 1);
++        die "user $user was rejected for $name\n" if !request_is_authorized($name, $user, $vmid);
 +    }
 +    # VM.Audit and VM.GuestAgent privileges do not authorize these methods.
 +    for my $user ('dave@pve', 'frank@pve') {
-+        die "user $user passed for $name\n"
-+            if $rpcenv->check_vm_perm($user, $vmid, undef, $privileges, 0, 1);
++        die "user $user passed for $name\n" if request_is_authorized($name, $user, $vmid);
 +    }
 +    # The token ACLs do not grant privileges on VM 101.
 +    for my $token (sort keys %$guest_tokens) {
 +        die "token $token passed for $name on VM 101\n"
-+            if $rpcenv->check_vm_perm($token, 101, undef, $privileges, 0, 1);
++            if request_is_authorized($name, $token, 101);
 +    }
 +}
 +
