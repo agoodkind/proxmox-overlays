@@ -130,7 +130,7 @@ The worker stores the result in `/run/pve/lxc-exec/<vmid>/<pid>`, which only `ro
 
 ## VM guest methods
 
-Command execution and file operations use the QEMU guest agent in a running VM. `exec` checks agent availability before starting its worker. Tests exercised all four methods against qemu-ga in a container; no test ran on a Proxmox host.
+Command execution and file operations use the QEMU guest agent in a running VM. `exec` checks agent availability before starting its worker.
 
 | Method | Path | Requirement |
 | --- | --- | --- |
