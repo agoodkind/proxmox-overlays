@@ -61,10 +61,10 @@ index 922c6599..c2c74bf3 100644
  ];
 diff --git a/src/PVE/API2/Qemu/Guest.pm b/src/PVE/API2/Qemu/Guest.pm
 new file mode 100644
-index 00000000..089fb21b
+index 00000000..00cb7ebe
 --- /dev/null
 +++ b/src/PVE/API2/Qemu/Guest.pm
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,734 @@
 +package PVE::API2::Qemu::Guest;
 +
 +use strict;
@@ -106,6 +106,9 @@ index 00000000..089fb21b
 +my $GUEST_EXEC_ID_ATTEMPTS = 10;
 +my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
 +my $GUEST_SIGNAL_EXITCODE_BASE = 128;
++# qemu-ga disables guest-exec and guest-exec-status while guest filesystems are frozen.
++my $GUEST_DISABLED_COMMAND_REGEX =
++    qr/\AAgent error: Command guest-exec(?:-status)? has been disabled/;
 +
 +my $decode_guest_base64 = sub {
 +    my ($name, $value) = @_;
@@ -149,25 +152,61 @@ index 00000000..089fb21b
 +    return $conf;
 +};
 +
++my $plan_poll = sub {
++    my ($interval, $deadline, $now) = @_;
++
++    my $remaining = $deadline - $now;
++    return (0, $interval, 1) if $remaining <= 0;
++
++    my $wait = $interval;
++    $wait = $remaining if $wait > $remaining;
++    my $next_interval = $interval * 2;
++    $next_interval = $GUEST_POLL_MAX_SECONDS if $next_interval > $GUEST_POLL_MAX_SECONDS;
++    return ($wait, $next_interval, 0);
++};
++
 +# The guest agent deletes an exited command record after returning its status.
 +my $wait_for_guest_exit = sub {
 +    my ($vmid, $conf, $guest_pid, $deadline) = @_;
 +
 +    my $interval = $GUEST_POLL_MIN_SECONDS;
 +    while (1) {
-+        my $status = PVE::QemuServer::Agent::qemu_exec_status($vmid, $conf, $guest_pid);
-+        return $status if $status->{exited};
-+
-+        my $remaining = $deadline - Time::HiRes::time();
-+        return undef if $remaining <= 0;
-+
-+        if ($interval > $remaining) {
-+            Time::HiRes::sleep($remaining);
-+        } else {
-+            Time::HiRes::sleep($interval);
++        my $status =
++            eval { PVE::QemuServer::Agent::qemu_exec_status($vmid, $conf, $guest_pid) };
++        if (my $error = $@) {
++            die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
++        } elsif ($status->{exited}) {
++            return $status;
 +        }
-+        $interval *= 2;
-+        $interval = $GUEST_POLL_MAX_SECONDS if $interval > $GUEST_POLL_MAX_SECONDS;
++
++        my ($wait, $next_interval, $expired) =
++            $plan_poll->($interval, $deadline, Time::HiRes::time());
++        return undef if $expired;
++
++        Time::HiRes::sleep($wait);
++        $interval = $next_interval;
++    }
++};
++
++# A disabled guest-exec response means the command has not started.
++my $start_guest_command = sub {
++    my ($vmid, $conf, $input, $command, $deadline) = @_;
++
++    my $interval = $GUEST_POLL_MIN_SECONDS;
++    while (1) {
++        # qemu_exec removes the program from the supplied array.
++        my $started =
++            eval { PVE::QemuServer::Agent::qemu_exec($vmid, $conf, $input, [@$command]) };
++        my $error = $@;
++        return $started if !$error;
++        die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
++
++        my ($wait, $next_interval, $expired) =
++            $plan_poll->($interval, $deadline, Time::HiRes::time());
++        die $error if $expired;
++
++        Time::HiRes::sleep($wait);
++        $interval = $next_interval;
 +    }
 +};
 +
@@ -204,11 +243,10 @@ index 00000000..089fb21b
 +    # Omitting input-data connects standard input to /dev/null.
 +    $input = undef if defined($input) && !length($input);
 +
-+    # qemu_exec removes the program from the supplied array.
-+    my $started = PVE::QemuServer::Agent::qemu_exec($vmid, $conf, $input, [@$command]);
++    my $deadline = Time::HiRes::time() + $timeout;
++    my $started = $start_guest_command->($vmid, $conf, $input, $command, $deadline);
 +    my $guest_pid = $started->{pid};
 +
-+    my $deadline = Time::HiRes::time() + $timeout;
 +    my $status = $wait_for_guest_exit->($vmid, $conf, $guest_pid, $deadline);
 +    my $timed_out = 0;
 +    if (!$status) {
@@ -870,10 +908,10 @@ index cf589f41..badd2997 100644
  	rm -rf MigrationTest/run parse-config-output
 diff --git a/src/test/guest-agent-test.pl b/src/test/guest-agent-test.pl
 new file mode 100755
-index 00000000..5896ffe0
+index 00000000..8a60f5be
 --- /dev/null
 +++ b/src/test/guest-agent-test.pl
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,498 @@
 +#!/usr/bin/perl -T
 +
 +# qemu-ga runs commands on the test host as the test user.
@@ -896,6 +934,7 @@ index 00000000..5896ffe0
 +use PVE::ProcFSTools;
 +use PVE::QemuConfig;
 +use PVE::QemuServer::Helpers;
++use PVE::QemuServer::Monitor;
 +use PVE::RPCEnvironment;
 +use PVE::UPID;
 +
@@ -912,6 +951,8 @@ index 00000000..5896ffe0
 +my $AGENT_START_SECONDS = 30;
 +my $POLL_SECONDS = 60;
 +my $EXEC_TIMEOUT_ABOVE_MAXIMUM = 3601;
++my $FROZEN_SECONDS = 3;
++my $FROZEN_COMMAND_EXITCODE = 7;
 +my $EXEC_OUTPUT_LIMIT = PVE::API2::Qemu::Guest::exec_output_limit();
 +my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 +
@@ -942,6 +983,8 @@ index 00000000..5896ffe0
 +my $socket_path = "$SOCKET_DIRECTORY/$VMID.qga";
 +
 +sub start_agent {
++    my ($socket_path, $state_directory) = @_;
++
 +    unlink($socket_path);
 +    my $pid = fork() // die "fork failed: $!\n";
 +    if (!$pid) {
@@ -949,9 +992,9 @@ index 00000000..5896ffe0
 +            $QEMU_GA,
 +            '--method', 'unix-listen',
 +            '--path', $socket_path,
-+            '--statedir', $work_directory,
-+            '--pidfile', "$work_directory/qemu-ga.pid",
-+            '--logfile', "$work_directory/qemu-ga.log",
++            '--statedir', $state_directory,
++            '--pidfile', "$state_directory/qemu-ga.pid",
++            '--logfile', "$state_directory/qemu-ga.log",
 +        ) or POSIX::_exit(127);
 +    }
 +
@@ -972,13 +1015,17 @@ index 00000000..5896ffe0
 +    waitpid($pid, 0);
 +}
 +
-+my $agent_pid = start_agent();
++my $agent_pid = start_agent($socket_path, $work_directory);
++my $frozen_agent_pid;
 +END {
-+    if ($agent_pid) {
-+        my $exit_status = $?;
-+        stop_agent($agent_pid);
-+        $? = $exit_status;
++    my $exit_status = $?;
++    stop_agent($agent_pid) if $agent_pid;
++    if ($frozen_agent_pid) {
++        # qemu-ga ignores SIGTERM while frozen.
++        kill('KILL', $frozen_agent_pid);
++        waitpid($frozen_agent_pid, 0);
 +    }
++    $? = $exit_status;
 +}
 +
 +my $rpcenv = PVE::RPCEnvironment->init('priv');
@@ -1145,6 +1192,126 @@ index 00000000..5896ffe0
 +    qr/execution of command \d+ in VM $VMID failed: Agent error: /,
 +    sub { run_command({ command => ["$work_directory/missing-program"] }) },
 +);
++
++my $thawed_socket_path = "$SOCKET_DIRECTORY/$VMID-thawed.qga";
++my $frozen_socket_path = "$SOCKET_DIRECTORY/$VMID-frozen.qga";
++my $frozen_directory = "$work_directory/frozen";
++my $marker_path = "$work_directory/marker";
++
++# The first agent continues running commands while the second agent answers requests.
++sub select_agent {
++    my ($agent_socket_path) = @_;
++
++    my $link_path = "$socket_path.link";
++    unlink($link_path);
++    link($agent_socket_path, $link_path) && rename($link_path, $socket_path)
++        or die "agent socket replacement from $agent_socket_path to $socket_path failed: $!\n";
++}
++
++sub marker_command {
++    my ($seconds) = @_;
++
++    my $script = 'echo started >> "$1"; sleep "$2"; echo finished; exit "$3"';
++    return ['sh', '-c', $script, 'sh', $marker_path, $seconds, $FROZEN_COMMAND_EXITCODE];
++}
++
++sub marker_line_count {
++    open(my $marker_handle, '<', $marker_path) or return 0;
++    my @lines = <$marker_handle>;
++    close($marker_handle);
++    return scalar(@lines);
++}
++
++sub wait_for_marker_lines {
++    my ($count) = @_;
++
++    my $deadline = Time::HiRes::time() + $POLL_SECONDS;
++    while (marker_line_count() < $count) {
++        die "marker file $marker_path did not contain $count lines within $POLL_SECONDS seconds\n"
++            if Time::HiRes::time() >= $deadline;
++        Time::HiRes::sleep(0.05);
++    }
++}
++
++# qemu-ga starts frozen when qga.state.isfrozen exists in its state directory.
++# The unprivileged test container cannot freeze a filesystem.
++make_path($frozen_directory);
++open(my $frozen_handle, '>', "$frozen_directory/qga.state.isfrozen")
++    or die "file open failed for $frozen_directory/qga.state.isfrozen: $!\n";
++close($frozen_handle) or die "file close failed for $frozen_directory/qga.state.isfrozen: $!\n";
++unlink($thawed_socket_path);
++link($socket_path, $thawed_socket_path)
++    or die "socket link from $socket_path to $thawed_socket_path failed: $!\n";
++$frozen_agent_pid = start_agent($frozen_socket_path, $frozen_directory);
++
++my $frozen_status_pid = call_exec({ command => marker_command(5) });
++wait_for_marker_lines(1);
++select_agent($frozen_socket_path);
++Time::HiRes::sleep($FROZEN_SECONDS);
++select_agent($thawed_socket_path);
++my $frozen_status = wait_for_exit($frozen_status_pid);
++check_equal(
++    'exec-status returns exit code 7 after guest-exec-status resumes',
++    $frozen_status->{exitcode},
++    $FROZEN_COMMAND_EXITCODE,
++);
++check_equal(
++    'exec-status returns standard output after guest-exec-status resumes',
++    $frozen_status->{stdout},
++    "finished\n",
++);
++check_equal('command starts once despite disabled guest-exec-status', marker_line_count(), 1);
++
++select_agent($frozen_socket_path);
++my $frozen_start_pid = call_exec({ command => marker_command(0) });
++Time::HiRes::sleep($FROZEN_SECONDS);
++check_equal('command does not start while guest-exec is disabled', marker_line_count(), 1);
++select_agent($thawed_socket_path);
++my $frozen_start_status = wait_for_exit($frozen_start_pid);
++check_equal(
++    'exec-status returns exit code 7 after guest-exec resumes',
++    $frozen_start_status->{exitcode},
++    $FROZEN_COMMAND_EXITCODE,
++);
++check_equal(
++    'exec-status returns standard output after guest-exec resumes',
++    $frozen_start_status->{stdout},
++    "finished\n",
++);
++check_equal('command starts once after guest-exec resumes', marker_line_count(), 2);
++
++# The command exits before the timeout; a successful status read would return exit code 7.
++my $frozen_timeout_pid = call_exec({ command => marker_command(2), timeout => 6 });
++wait_for_marker_lines(3);
++select_agent($frozen_socket_path);
++my $frozen_timeout_status = wait_for_exit($frozen_timeout_pid);
++check_equal(
++    'exec-status returns exit code 124 while guest-exec-status stays disabled',
++    $frozen_timeout_status->{exitcode},
++    124,
++);
++check_equal(
++    'exec-status reports timed-out while guest-exec-status stays disabled',
++    $frozen_timeout_status->{'timed-out'},
++    1,
++);
++
++# The thawed second agent has no record of commands started by the first agent.
++PVE::QemuServer::Monitor::mon_cmd($VMID, 'guest-fsfreeze-thaw');
++select_agent($thawed_socket_path);
++my $other_agent_pid = call_exec({ command => marker_command(2) });
++wait_for_marker_lines(4);
++select_agent($frozen_socket_path);
++check_dies(
++    'exec-status reports an unknown process without waiting for the command timeout',
++    qr/execution of command $other_agent_pid in VM $VMID failed: Agent error: PID /,
++    sub { wait_for_exit($other_agent_pid) },
++);
++select_agent($thawed_socket_path);
++
++stop_agent($frozen_agent_pid);
++$frozen_agent_pid = undef;
++unlink($thawed_socket_path, $frozen_socket_path);
 +
 +my $file_path = "$work_directory/written file";
 +my $file_content = join('', map { chr($_) } 0 .. 255) x 16;
