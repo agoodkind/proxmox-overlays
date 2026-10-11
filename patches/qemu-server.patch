@@ -61,10 +61,10 @@ index 922c6599..c2c74bf3 100644
  ];
 diff --git a/src/PVE/API2/Qemu/Guest.pm b/src/PVE/API2/Qemu/Guest.pm
 new file mode 100644
-index 00000000..8d222009
+index 00000000..00cb7ebe
 --- /dev/null
 +++ b/src/PVE/API2/Qemu/Guest.pm
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,734 @@
 +package PVE::API2::Qemu::Guest;
 +
 +use strict;
@@ -152,20 +152,17 @@ index 00000000..8d222009
 +    return $conf;
 +};
 +
-+my $sleep_before_poll = sub {
-+    my ($interval, $deadline) = @_;
++my $plan_poll = sub {
++    my ($interval, $deadline, $now) = @_;
 +
-+    my $remaining = $deadline - Time::HiRes::time();
-+    return undef if $remaining <= 0;
++    my $remaining = $deadline - $now;
++    return (0, $interval, 1) if $remaining <= 0;
 +
-+    if ($interval > $remaining) {
-+        Time::HiRes::sleep($remaining);
-+    } else {
-+        Time::HiRes::sleep($interval);
-+    }
-+    $interval *= 2;
-+    $interval = $GUEST_POLL_MAX_SECONDS if $interval > $GUEST_POLL_MAX_SECONDS;
-+    return $interval;
++    my $wait = $interval;
++    $wait = $remaining if $wait > $remaining;
++    my $next_interval = $interval * 2;
++    $next_interval = $GUEST_POLL_MAX_SECONDS if $next_interval > $GUEST_POLL_MAX_SECONDS;
++    return ($wait, $next_interval, 0);
 +};
 +
 +# The guest agent deletes an exited command record after returning its status.
@@ -182,8 +179,12 @@ index 00000000..8d222009
 +            return $status;
 +        }
 +
-+        $interval = $sleep_before_poll->($interval, $deadline);
-+        return undef if !defined($interval);
++        my ($wait, $next_interval, $expired) =
++            $plan_poll->($interval, $deadline, Time::HiRes::time());
++        return undef if $expired;
++
++        Time::HiRes::sleep($wait);
++        $interval = $next_interval;
 +    }
 +};
 +
@@ -200,8 +201,12 @@ index 00000000..8d222009
 +        return $started if !$error;
 +        die $error if $error !~ $GUEST_DISABLED_COMMAND_REGEX;
 +
-+        $interval = $sleep_before_poll->($interval, $deadline);
-+        die $error if !defined($interval);
++        my ($wait, $next_interval, $expired) =
++            $plan_poll->($interval, $deadline, Time::HiRes::time());
++        die $error if $expired;
++
++        Time::HiRes::sleep($wait);
++        $interval = $next_interval;
 +    }
 +};
 +
