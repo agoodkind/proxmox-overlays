@@ -1,6 +1,6 @@
 # Proxmox API connection and result reliability
 
-The API must reuse connections for complete JSON replies and save command results when a reply fails. Complete both corrections before resuming the separate network reset investigation.
+The API must reuse connections for complete JSON replies and save command results when a reply fails.
 
 ## Connection behavior
 
@@ -18,15 +18,13 @@ Expire completed results after one hour. Limit saved payload capacity to 256 MiB
 
 Cache completed QEMU guest-agent results before returning them to the caller. A crash between consuming the guest-agent result and saving its copy remains an uncertain outcome. Ordinary commands must not repeat after an uncertain start. Read-only calls may repeat an inspection after a lost start reply. Status recovery must request the same accepted command identifier. This change does not promise execution exactly once across crashes or restarts.
 
-The provider sends `result-retention=acknowledged` with every command start. Both APIs accept that single value. Older APIs reject the unknown parameter before starting a command.
+The provider sends `result-retention=acknowledged` with every command start. Both APIs accept that single value. Older APIs reject the unknown parameter before starting a command. Old clients do not acknowledge results and can exhaust bounded retention.
 
-## Verification and rollout
+## Acceptance outcomes
 
-Use real dependencies through the public API. Prove connection reuse with sequential protected read requests on one TLS socket, with client reconnection disabled. Verify compressed replies and complete streamed downloads separately.
+Acceptance uses real dependencies through the public API. Sequential protected read requests must reuse one TLS socket with client reconnection disabled. Compressed replies and complete streamed downloads require separate validation.
 
-For each guest kind, lose a completed-result reply, read the result again, decode it, acknowledge receipt, and repeat acknowledgment. Verify capacity refusal before execution, expiry, access checks, and malformed responses. Do not use fake guest agents or recorded responses.
-
-Deploy compatible server and provider releases together after testbed validation. Old clients do not acknowledge results and can exhaust bounded retention. Coordinate that deployment requirement with active callers. Do not replace resource identities or transfer infrastructure state.
+Both guest kinds must preserve completed results after a lost reply until acknowledgment or expiry. Acceptance must cover capacity refusal before execution, expiry, access checks, and malformed responses.
 
 ## References
 

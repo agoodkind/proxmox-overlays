@@ -13,9 +13,11 @@
 ## Global Constraints
 
 Do not change resource identities or state schemas.
+Do not transfer infrastructure state.
 Use isolated Git worktrees and do not revert unrelated changes.
 Exclude credentials, command input, and result contents from diagnostics.
 Use real dependencies for regression tests.
+Do not use fake guest agents or recorded responses.
 Complete both API corrections before further network reset experiments.
 Verify testbed behavior before production deployment.
 
@@ -34,7 +36,7 @@ Files: add the canonical `pve-http-server` patch, update its overlay packaging, 
 - [x] Update the canonical upstream overlay source and regenerate `patches/pve-http-server.patch`.
 - [x] Remove backend connection fields and their nominated headers before public response construction.
 - [x] Explicitly close connections for streams and responses without valid body framing.
-- [x] Verify sequential protected reads on one TLS connection without reconnecting.
+- [x] Verify sequential protected read requests on one TLS socket with client reconnection disabled.
 - [x] Verify gzip, deflate, streamed downloads, and WebSocket isolation.
 - [x] Commit only this correction and its relevant tests.
 
@@ -48,7 +50,8 @@ Interface: `GET exec-status?pid=<id>` reads a saved result without consuming it.
 - [ ] Save completed LXC results and cache completed QEMU results before replying.
 - [ ] Implement acknowledgment, expiry, concurrency protection, and capacity release.
 - [ ] Decode and validate provider results before acknowledgment. Report acknowledgment failures and return the known result.
-- [ ] Verify repeated result retrieval after a lost response, acknowledgment, expiry, capacity, and access checks with real LXC and QEMU dependencies.
+- [ ] Verify repeated result retrieval after a lost completed-result reply, complete decoding, acknowledgment, and repeated acknowledgment for both guest kinds.
+- [ ] Verify capacity refusal before execution, expiry, access checks, and malformed responses with real LXC and QEMU dependencies through the public API.
 - [ ] Commit the server and provider corrections in logical groups.
 
 ## Task 3: Integrate and verify releases
@@ -56,5 +59,5 @@ Interface: `GET exec-status?pid=<id>` reads a saved result without consuming it.
 - [ ] Review both implementations against the design and inspect their complete diffs.
 - [ ] Run existing required checks and the public API regressions on the testbed.
 - [ ] Update compatible release selections and coordinate active callers.
-- [ ] Deploy the validated corrections and verify installed revisions and behavior separately.
+- [ ] Deploy compatible server and provider releases together after testbed validation, and verify installed revisions and behavior separately.
 - [ ] Resume the network reset investigation using the retained captures and kernel evidence.
