@@ -1,14 +1,11 @@
 diff --git a/src/PVE/API2/LXC.pm b/src/PVE/API2/LXC.pm
-index 5f94d5a..db2e158 100644
+index 5f94d5a..c4c012e 100644
 --- a/src/PVE/API2/LXC.pm
 +++ b/src/PVE/API2/LXC.pm
-@@ -3,9 +3,14 @@ package PVE::API2::LXC;
- use strict;
+@@ -4,8 +4,12 @@ use strict;
  use warnings;
  
--use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
-+use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC O_RDONLY);
-+use File::Path qw(make_path remove_tree);
+ use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
 +use IO::Select;
  use IO::Socket::UNIX;
 +use MIME::Base64 qw(decode_base64 encode_base64);
@@ -18,18 +15,27 @@ index 5f94d5a..db2e158 100644
  use JSON;
  
  use PVE::AccessControl;
-@@ -711,6 +716,10 @@ __PACKAGE__->register_method({
+@@ -18,6 +22,7 @@ use PVE::INotify;
+ use PVE::JSONSchema qw(get_standard_option);
+ use PVE::RESTHandler;
+ use PVE::RPCEnvironment;
++use PVE::GuestExecResult;
+ use PVE::RRD;
+ use PVE::RS::OCI;
+ use PVE::ReplicationConfig;
+@@ -711,6 +716,11 @@ __PACKAGE__->register_method({
              { subdir => 'snapshot' },
              { subdir => 'resize' },
              { subdir => 'interfaces' },
 +            { subdir => 'exec' },
 +            { subdir => 'exec-status' },
++            { subdir => 'exec-ack' },
 +            { subdir => 'file-read' },
 +            { subdir => 'file-write' },
          ];
  
          return $res;
-@@ -3075,6 +3084,700 @@ __PACKAGE__->register_method({
+@@ -3075,6 +3085,618 @@ __PACKAGE__->register_method({
      },
  });
  
@@ -40,19 +46,13 @@ index 5f94d5a..db2e158 100644
 +my $GUEST_BASE64_REGEX = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?};
 +my $GUEST_EXEC_TIMEOUT_DEFAULT = 120;
 +my $GUEST_EXEC_TIMEOUT_MAX = 3600;
-+my $GUEST_EXEC_OUTPUT_LIMIT = 1024 * 1024;
++my $GUEST_EXEC_OUTPUT_LIMIT = PVE::GuestExecResult::output_limit();
 +my $GUEST_FILE_READ_LIMIT = 4 * 1024 * 1024;
 +my $GUEST_FILE_TIMEOUT = 60;
 +my $GUEST_FILE_PATH_MAX_LENGTH = 4096;
 +my $GUEST_KILL_GRACE_SECONDS = 5;
 +my $GUEST_POLL_MICROSECONDS = 50_000;
 +my $GUEST_IO_CHUNK_SIZE = 64 * 1024;
-+my $GUEST_EXEC_RESULT_ROOT = '/run/pve/lxc-exec';
-+my $GUEST_EXEC_RESULT_TTL = 3600;
-+# A result directory without a status file is removed after the longest timeout plus the TTL.
-+my $GUEST_EXEC_ORPHAN_TTL = $GUEST_EXEC_TIMEOUT_MAX + $GUEST_EXEC_RESULT_TTL;
-+my $GUEST_EXEC_ID_BYTES = 6;
-+my $GUEST_EXEC_ID_ATTEMPTS = 10;
 +my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
 +
 +my $decode_guest_base64 = sub {
@@ -273,101 +273,16 @@ index 5f94d5a..db2e158 100644
 +    return ($exitcode, $captured, $truncated, 0);
 +};
 +
-+my $exec_directory = sub {
-+    my ($vmid, $exec_id) = @_;
-+
-+    my $vmid_number = $untaint_decimal->('vmid', $vmid);
-+    my $exec_number = $untaint_decimal->('pid', $exec_id);
-+    return "$GUEST_EXEC_RESULT_ROOT/$vmid_number/$exec_number";
-+};
-+
-+# Process IDs can repeat before a caller reads the result.
-+# $create_exec_directory uses a random 48-bit identifier.
-+my $create_exec_directory = sub {
-+    my ($vmid) = @_;
-+
-+    my $vmid_number = $untaint_decimal->('vmid', $vmid);
-+    my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$vmid_number";
-+    for (1 .. $GUEST_EXEC_ID_ATTEMPTS) {
-+        # The cleanup can remove an empty vmid directory between attempts. Each attempt creates
-+        # the directory again.
-+        make_path($vmid_directory, { mode => 0700 });
-+        chmod(0700, $GUEST_EXEC_RESULT_ROOT, $vmid_directory);
-+
-+        sysopen(my $random_handle, '/dev/urandom', O_RDONLY)
-+            or die "unable to open /dev/urandom: $!\n";
-+        my $read_count = sysread($random_handle, my $random_bytes, $GUEST_EXEC_ID_BYTES);
-+        close($random_handle);
-+        die "unable to read /dev/urandom\n"
-+            if !defined($read_count) || $read_count != $GUEST_EXEC_ID_BYTES;
-+
-+        # The bytes from /dev/urandom are tainted.
-+        my $exec_id = $untaint_decimal->('pid', unpack('Q>', "\0\0" . $random_bytes));
-+        next if $exec_id < 1;
-+
-+        my $directory = $exec_directory->($vmid_number, $exec_id);
-+        if (mkdir($directory, 0700)) {
-+            chmod(0700, $directory);
-+            return $exec_id;
-+        }
-+        die "unable to create '$directory': $!\n" if !$!{EEXIST} && !$!{ENOENT};
-+    }
-+
-+    die "unable to allocate an identifier for the command in container '$vmid'\n";
-+};
-+
-+# $remove_expired_exec_results deletes result directories after their retention limit.
-+# A directory without a status file represents a running command or an interrupted worker.
-+my $remove_expired_exec_results = sub {
-+    my $root_handle;
-+    return if !opendir($root_handle, $GUEST_EXEC_RESULT_ROOT);
-+
-+    my $now = time();
-+    for my $vmid_name (readdir($root_handle)) {
-+        next if $vmid_name !~ m/\A(\d+)\z/;
-+        my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$1";
-+
-+        my $vmid_handle;
-+        next if !opendir($vmid_handle, $vmid_directory);
-+        for my $id_name (readdir($vmid_handle)) {
-+            next if $id_name !~ m/\A(\d+)\z/;
-+            my $directory = "$vmid_directory/$1";
-+
-+            my $reference_time = (stat("$directory/status"))[9];
-+            my $time_to_live = $GUEST_EXEC_RESULT_TTL;
-+            if (!defined($reference_time)) {
-+                $reference_time = (stat($directory))[9];
-+                $time_to_live = $GUEST_EXEC_ORPHAN_TTL;
-+            }
-+            next if !defined($reference_time);
-+
-+            if ($now - $reference_time > $time_to_live) {
-+                remove_tree($directory);
-+            }
-+        }
-+        closedir($vmid_handle);
-+        rmdir($vmid_directory); # fails while the directory contains a result
-+    }
-+    closedir($root_handle);
-+};
-+
-+# $run_exec_worker writes stdout and stderr before the status file.
-+# The status file marks a complete result.
 +my $run_exec_worker = sub {
 +    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 +
-+    my $directory = $exec_directory->($vmid, $exec_id);
++    PVE::GuestExecResult::worker_started('lxc', $vmid, $exec_id);
 +    my $status = {};
++    my $captured = { stdout => '', stderr => '' };
 +    eval {
-+        my ($exitcode, $captured, $truncated, $timed_out) = $run_in_container->(
-+            $vmid, $command, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT,
-+        );
-+
-+        PVE::Tools::file_set_contents("$directory/stdout", $captured->{stdout}, 0600);
-+        PVE::Tools::file_set_contents("$directory/stderr", $captured->{stderr}, 0600);
-+
-+        # JSON encodes a number that Perl also used as a string, such as the exit code 124 in
-+        # a message, as a JSON string. The addition returns a plain number.
++        my ($exitcode, $output, $truncated, $timed_out) =
++            $run_in_container->($vmid, $command, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT);
++        $captured = $output;
 +        $status->{exitcode} = 0 + $exitcode;
 +        $status->{'out-truncated'} = 1 if $truncated->{stdout};
 +        $status->{'err-truncated'} = 1 if $truncated->{stderr};
@@ -378,37 +293,8 @@ index 5f94d5a..db2e158 100644
 +        $status = { error => $error };
 +    }
 +
-+    PVE::Tools::file_set_contents("$directory/status", encode_json($status), 0600);
-+
-+    # The task ends with an error status after exec-status can read the result.
++    PVE::GuestExecResult::complete('lxc', $vmid, $exec_id, $status, $captured);
 +    die "command timed out after $timeout seconds\n" if $status->{'timed-out'};
-+};
-+
-+my $read_exec_result = sub {
-+    my ($vmid, $exec_id) = @_;
-+
-+    my $directory = $exec_directory->($vmid, $exec_id);
-+    die "no command with pid $exec_id found for container '$vmid'\n" if !-d $directory;
-+    return { exited => 0 } if !-e "$directory/status";
-+
-+    my $status = decode_json(PVE::Tools::file_get_contents("$directory/status"));
-+    my $result = { exited => 1 };
-+    if (!defined($status->{error})) {
-+        my $stdout = PVE::Tools::file_get_contents("$directory/stdout", $GUEST_EXEC_OUTPUT_LIMIT);
-+        my $stderr = PVE::Tools::file_get_contents("$directory/stderr", $GUEST_EXEC_OUTPUT_LIMIT);
-+        $result->{exitcode} = 0 + $status->{exitcode};
-+        $result->{'out-data'} = encode_base64($stdout, '');
-+        $result->{'err-data'} = encode_base64($stderr, '');
-+        for my $flag ('out-truncated', 'err-truncated', 'timed-out') {
-+            $result->{$flag} = 1 if $status->{$flag};
-+        }
-+    }
-+    remove_tree($directory);
-+
-+    die "command $exec_id in container '$vmid' failed: $status->{error}\n"
-+        if defined($status->{error});
-+
-+    return $result;
 +};
 +
 +__PACKAGE__->register_method({
@@ -454,6 +340,13 @@ index 5f94d5a..db2e158 100644
 +                description => 'Seconds until the command is stopped.',
 +                optional => 1,
 +            },
++            'result-retention' => {
++                type => 'string',
++                enum => ['acknowledged'],
++                default => 'acknowledged',
++                optional => 1,
++                description => 'Retain completed results until acknowledgment or expiry.',
++            },
 +        },
 +    },
 +    returns => {
@@ -489,8 +382,7 @@ index 5f94d5a..db2e158 100644
 +        my $command = $untaint_command->($param->{command});
 +
 +        $assert_container_running->($vmid);
-+        $remove_expired_exec_results->();
-+        my $exec_id = $create_exec_directory->($vmid);
++        my $exec_id = PVE::GuestExecResult::reserve('lxc', $vmid);
 +
 +        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
 +        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
@@ -529,8 +421,7 @@ index 5f94d5a..db2e158 100644
 +    permissions => {
 +        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
 +    },
-+    description => 'Get the status of a command that exec started. The read of an exited command'
-+        . ' deletes its stored result.',
++    description => 'Read a command result until exec-ack deletes it or one hour passes.',
 +    parameters => {
 +        additionalProperties => 0,
 +        properties => {
@@ -592,12 +483,45 @@ index 5f94d5a..db2e158 100644
 +    code => sub {
 +        my ($param) = @_;
 +
-+        $remove_expired_exec_results->();
-+
 +        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
 +        my $exec_id = $untaint_decimal->('pid', $param->{pid});
 +
-+        return $read_exec_result->($vmid, $exec_id);
++        return PVE::GuestExecResult::read('lxc', $vmid, $exec_id);
++    },
++});
++
++__PACKAGE__->register_method({
++    name => 'exec_ack',
++    path => '{vmid}/exec-ack',
++    method => 'POST',
++    protected => 1,
++    proxyto => 'node',
++    permissions => {
++        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
++    },
++    description => 'Acknowledge receipt and delete a completed command result.'
++        . ' Repeated acknowledgment succeeds.',
++    parameters => {
++        additionalProperties => 0,
++        properties => {
++            node => get_standard_option('pve-node'),
++            vmid => get_standard_option(
++                'pve-vmid', { completion => \&PVE::LXC::complete_ctid_running },
++            ),
++            pid => {
++                type => 'integer',
++                minimum => 1,
++                description => 'The identifier that exec returned.',
++            },
++        },
++    },
++    returns => { type => 'null' },
++    code => sub {
++        my ($param) = @_;
++
++        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
++        my $exec_id = $untaint_decimal->('pid', $param->{pid});
++        return PVE::GuestExecResult::acknowledge('lxc', $vmid, $exec_id);
 +    },
 +});
 +
@@ -745,6 +669,224 @@ index 805eac0..3f4fafa 100644
  ];
  
  __PACKAGE__->register_method({
+diff --git a/src/PVE/GuestExecResult.pm b/src/PVE/GuestExecResult.pm
+new file mode 100644
+index 0000000..6e30c1a
+--- /dev/null
++++ b/src/PVE/GuestExecResult.pm
+@@ -0,0 +1,212 @@
++package PVE::GuestExecResult;
++
++use strict;
++use warnings;
++
++use Fcntl qw(O_RDONLY);
++use File::Path qw(make_path remove_tree);
++use JSON;
++use MIME::Base64 qw(encode_base64);
++
++use PVE::ProcFSTools;
++use PVE::Tools;
++
++my %RESULT_ROOT = (lxc => '/run/pve/lxc-exec', qemu => '/run/pve/qemu-exec');
++my $RESULT_LOCK = '/run/lock/pve-guest-exec.lck';
++my $RESULT_TTL = 3600;
++my $ORPHAN_TTL = 7200;
++my $PAYLOAD_CAPACITY = 256 * 1024 * 1024;
++my $RECORD_CAPACITY = 1024;
++my $OUTPUT_LIMIT = 1024 * 1024;
++my $RESERVED_BYTES = 2 * $OUTPUT_LIMIT;
++my $ID_BYTES = 6;
++my $ID_ATTEMPTS = 10;
++
++sub output_limit {
++    return $OUTPUT_LIMIT;
++}
++
++sub with_lock {
++    my ($code) = @_;
++
++    my $result = PVE::Tools::lock_file($RESULT_LOCK, 10, $code);
++    die $@ if $@;
++    return $result;
++}
++
++sub result_directory {
++    my ($kind, $vmid, $exec_id) = @_;
++
++    die "unknown guest kind\n" if !exists($RESULT_ROOT{$kind});
++    die "invalid guest identifier\n" if !defined($vmid) || $vmid !~ m/\A(\d+)\z/;
++    my $guest_number = $1;
++    die "invalid command identifier\n" if !defined($exec_id) || $exec_id !~ m/\A(\d+)\z/;
++    return "$RESULT_ROOT{$kind}/$guest_number/$1";
++}
++
++sub remove_result {
++    my ($directory) = @_;
++
++    remove_tree($directory, { error => \my $errors });
++    die "unable to delete the saved command result\n" if @$errors;
++}
++
++# Every operation uses the host lock while inspecting or changing result storage.
++sub expire_and_measure {
++    my ($record_count, $payload_bytes) = (0, 0);
++    my $now = time();
++
++    for my $root (values %RESULT_ROOT) {
++        next if !-e $root;
++        opendir(my $root_handle, $root) or die "unable to read command result storage: $!\n";
++        for my $vmid_name (readdir($root_handle)) {
++            next if $vmid_name !~ m/\A(\d+)\z/;
++            my $vmid_directory = "$root/$1";
++            opendir(my $vmid_handle, $vmid_directory)
++                or die "unable to read guest result storage: $!\n";
++            for my $id_name (readdir($vmid_handle)) {
++                next if $id_name !~ m/\A(\d+)\z/;
++                my $directory = "$vmid_directory/$1";
++                my $reference_time = (stat("$directory/status"))[9];
++                my $time_to_live = $RESULT_TTL;
++                if (!defined($reference_time)) {
++                    $reference_time = (stat($directory))[9];
++                    $time_to_live = $ORPHAN_TTL;
++                }
++                die "unable to inspect command result storage: $!\n"
++                    if !defined($reference_time);
++                if ($now - $reference_time > $time_to_live) {
++                    remove_result($directory);
++                    next;
++                }
++                $record_count++;
++                if (-e "$directory/status") {
++                    for my $stream ('stdout', 'stderr') {
++                        next if !-e "$directory/$stream";
++                        my $size = -s "$directory/$stream";
++                        die "unable to measure saved command output: $!\n" if !defined($size);
++                        $payload_bytes += $size;
++                    }
++                } else {
++                    $payload_bytes += $RESERVED_BYTES;
++                }
++            }
++            closedir($vmid_handle);
++        }
++        closedir($root_handle);
++    }
++    return ($record_count, $payload_bytes);
++}
++
++sub reserve {
++    my ($kind, $vmid) = @_;
++
++    return with_lock(sub {
++        my ($record_count, $payload_bytes) = expire_and_measure();
++        die "command result storage capacity is full; acknowledge completed results before execution\n"
++            if $record_count >= $RECORD_CAPACITY
++            || $payload_bytes + $RESERVED_BYTES > $PAYLOAD_CAPACITY;
++
++        my $directory = result_directory($kind, $vmid, 1);
++        $directory =~ s!/1\z!!;
++        make_path($directory, { mode => 0700 });
++        die "unable to protect command result storage: $!\n"
++            if chmod(0700, $RESULT_ROOT{$kind}, $directory) != 2;
++
++        for (1 .. $ID_ATTEMPTS) {
++            sysopen(my $random_handle, '/dev/urandom', O_RDONLY)
++                or die "unable to open /dev/urandom: $!\n";
++            my $read_count = sysread($random_handle, my $random_bytes, $ID_BYTES);
++            close($random_handle);
++            die "unable to read /dev/urandom\n"
++                if !defined($read_count) || $read_count != $ID_BYTES;
++            my $exec_id = unpack('Q>', "\0\0" . $random_bytes);
++            die "invalid generated command identifier\n" if $exec_id !~ m/\A(\d+)\z/;
++            $exec_id = $1;
++            next if $exec_id < 1;
++            my $result_directory = result_directory($kind, $vmid, $exec_id);
++            return 0 + $exec_id if mkdir($result_directory, 0700);
++            die "unable to reserve command result storage: $!\n" if !$!{EEXIST};
++        }
++        die "unable to allocate a command identifier\n";
++    });
++}
++
++sub worker_started {
++    my ($kind, $vmid, $exec_id) = @_;
++
++    with_lock(sub {
++        my $directory = result_directory($kind, $vmid, $exec_id);
++        my $starttime = PVE::ProcFSTools::read_proc_starttime($$);
++        die "unable to read the command worker start time\n" if !$starttime;
++        PVE::Tools::file_set_contents("$directory/worker", "$$ $starttime", 0600);
++    });
++}
++
++sub complete {
++    my ($kind, $vmid, $exec_id, $status, $captured) = @_;
++
++    with_lock(sub {
++        my $directory = result_directory($kind, $vmid, $exec_id);
++        for my $stream ('stdout', 'stderr') {
++            die "command output exceeds its reserved capacity\n"
++                if length($captured->{$stream}) > $OUTPUT_LIMIT;
++            PVE::Tools::file_set_contents("$directory/$stream", $captured->{$stream}, 0600);
++        }
++        # The status file marks a complete saved result.
++        PVE::Tools::file_set_contents("$directory/status", encode_json($status), 0600);
++    });
++}
++
++sub read {
++    my ($kind, $vmid, $exec_id) = @_;
++
++    return with_lock(sub {
++        expire_and_measure();
++        my $directory = result_directory($kind, $vmid, $exec_id);
++        my $guest_label = "container '$vmid'";
++        $guest_label = "VM $vmid" if $kind eq 'qemu';
++        die "no stored result for command $exec_id in $guest_label\n" if !-d $directory;
++        if (!-e "$directory/status") {
++            if (-e "$directory/worker") {
++                my $worker = PVE::Tools::file_get_contents("$directory/worker");
++                die "invalid command worker record\n" if $worker !~ m/\A(\d+) (\d+)\z/;
++                my ($pid, $starttime) = ($1, $2);
++                my $running = PVE::ProcFSTools::check_process_running($pid, $starttime);
++                die "command outcome is uncertain after worker interruption; do not replay the command\n"
++                    if !$running;
++            }
++            return { exited => 0 };
++        }
++
++        my $status = decode_json(PVE::Tools::file_get_contents("$directory/status"));
++        die "execution of command $exec_id in $guest_label failed: $status->{error}\n"
++            if defined($status->{error});
++        die "saved command result omits its exit code\n" if !defined($status->{exitcode});
++        my $result = { exited => 1, exitcode => 0 + $status->{exitcode} };
++        for my $stream (['stdout', 'out-data'], ['stderr', 'err-data']) {
++            my $content = PVE::Tools::file_get_contents("$directory/$stream->[0]", $OUTPUT_LIMIT);
++            $result->{$stream->[1]} = encode_base64($content, '');
++        }
++        for my $flag ('out-truncated', 'err-truncated', 'timed-out') {
++            $result->{$flag} = 1 if $status->{$flag};
++        }
++        return $result;
++    });
++}
++
++sub acknowledge {
++    my ($kind, $vmid, $exec_id) = @_;
++
++    return with_lock(sub {
++        expire_and_measure();
++        my $directory = result_directory($kind, $vmid, $exec_id);
++        return undef if !-d $directory;
++        die "command $exec_id has not completed; acknowledgment requires a completed result\n"
++            if !-e "$directory/status";
++        remove_result($directory);
++        return undef;
++    });
++}
++
++1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
 index dee073d..186e2a8 100644
 --- a/src/PVE/LXC.pm
@@ -1504,6 +1646,16 @@ index 08b65ca..e0e5146 100644
          if ($key eq 'lxc' && $restricted) {
              my $lxc_list = $oldconf->{'lxc'};
  
+diff --git a/src/PVE/Makefile b/src/PVE/Makefile
+index aafb506..4ecdee7 100644
+--- a/src/PVE/Makefile
++++ b/src/PVE/Makefile
+@@ -1,4 +1,4 @@
+-SOURCES=LXC.pm
++SOURCES=LXC.pm GuestExecResult.pm
+ 
+ .PHONY: install
+ install: $(SOURCES)
 diff --git a/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount b/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount
 new file mode 100644
 index 0000000..2e13592
