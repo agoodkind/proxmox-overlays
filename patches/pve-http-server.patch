@@ -1,0 +1,493 @@
+diff --git a/Makefile b/Makefile
+index 9e0f38c..2f129ea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -10,6 +10,10 @@ DEB=$(PACKAGE)_$(DEB_VERSION)_all.deb
+ 
+ all:
+ 
++.PHONY: test
++test:
++	prove -I src test/*.t
++
+ $(BUILDDIR): src debian
+ 	rm -rf $@ $@.tmp
+ 	cp -a src $@.tmp
+diff --git a/src/PVE/APIServer/AnyEvent.pm b/src/PVE/APIServer/AnyEvent.pm
+index 915d678..ea3a330 100644
+--- a/src/PVE/APIServer/AnyEvent.pm
++++ b/src/PVE/APIServer/AnyEvent.pm
+@@ -859,6 +859,19 @@ sub proxy_request {
+                     delete $hdr->{URL};
+                     delete $hdr->{HTTPVersion};
+                     my $header = HTTP::Headers->new(%$hdr);
++                    if (my $connection = $header->header('Connection')) {
++                        for my $field (split(/,/, $connection)) {
++                            $field = trim($field);
++                            $header->remove_header($field) if length($field);
++                        }
++                    }
++                    $header->remove_header(qw(
++                        Connection Keep-Alive Proxy-Connection TE Trailer Transfer-Encoding Upgrade
++                    ));
++
++                    # response() does not frame streamed or empty content with Content-Length.
++                    $reqstate->{keep_alive} = 0 if $stream || !$body;
++
+                     if (my $location = $header->header('Location')) {
+                         $location =~ s|^http://localhost:85||;
+                         $header->header(Location => $location);
+diff --git a/test/proxy-response.t b/test/proxy-response.t
+new file mode 100644
+index 0000000..7bf4495
+--- /dev/null
++++ b/test/proxy-response.t
+@@ -0,0 +1,448 @@
++#!/usr/bin/env perl
++
++use strict;
++use warnings;
++
++use Compress::Zlib;
++use Digest::SHA qw(sha1 sha256_hex);
++use File::Temp qw(tempdir);
++use HTTP::Headers;
++use HTTP::Response;
++use IO::File;
++use IO::Socket::IP;
++use IO::Socket::SSL;
++use JSON qw(decode_json);
++use MIME::Base64 qw(encode_base64);
++use POSIX qw(_exit);
++use Socket qw(SOMAXCONN);
++use Test::More;
++
++use PVE::APIServer::AnyEvent;
++use PVE::APIServer::Formatter;
++use PVE::APIServer::Formatter::Standard;
++
++{
++    package ProxyResponseServer;
++
++    use base qw(PVE::APIServer::AnyEvent);
++
++    sub auth_handler {
++        my ($self, $method, $path, $ticket) = @_;
++
++        die "invalid test ticket\n" if !defined($ticket) || $ticket ne $self->{test_ticket};
++
++        return { userid => 'proxy-test@pve', ticket => ($ticket) };
++    }
++
++    sub initialize_cert_cache {
++        my ($self, $node) = @_;
++
++        die "remote proxying is unsupported\n" if defined($node);
++    }
++
++    sub rest_handler {
++        my ($self, $clientip, $method, $path, $auth, $params) = @_;
++
++        if (!$self->{trusted_env}) {
++            if ($path eq '/websocket') {
++                return { status => 200, data => { port => $self->{echo_port} } };
++            }
++
++            return { proxy => 'localhost', proxy_params => ($params) };
++        }
++
++        if ($path eq '/read') {
++            return { status => 200, data => { payload => $self->{payload} } };
++        }
++
++        if ($path eq '/download') {
++            return {
++                status => 200,
++                info => { download => 1 },
++                data => {
++                    download => {
++                        path => $self->{download_path},
++                        stream => 1,
++                        'content-type' => 'application/octet-stream',
++                        'content-disposition' => 'attachment; filename=proxy-response.bin',
++                    },
++                },
++            };
++        }
++
++        if ($path eq '/headers') {
++            my $headers = HTTP::Headers->new(
++                'Content-Type' => 'application/octet-stream',
++                'Content-Disposition' => 'attachment; filename=headers.bin',
++                'Keep-Alive' => 'timeout=30',
++                'Proxy-Connection' => 'keep-alive',
++                TE => 'trailers',
++                Trailer => 'X-Backend-Trailer',
++                Upgrade => 'backend-protocol',
++            );
++
++            return {
++                status => 200,
++                data => HTTP::Response->new(200, 'OK', $headers, 'header response'),
++            };
++        }
++
++        if ($path eq '/empty') {
++            return { status => 200, data => HTTP::Response->new(200, 'OK', undef, '') };
++        }
++
++        return { status => 404, message => 'unknown test endpoint' };
++    }
++}
++
++PVE::APIServer::Formatter::register_formatter('raw', sub { return ($_[1], undef, 1); });
++
++my $parent_pid = $$;
++my @child_pids;
++
++END {
++    my $exit_status = $?;
++    if ($$ == $parent_pid) {
++        for my $child_pid (@child_pids) {
++            kill 'KILL', $child_pid;
++            waitpid($child_pid, 0);
++        }
++    }
++    $? = $exit_status;
++}
++
++my $temporary_dir = tempdir(CLEANUP => 1);
++my $certificate_path = "$temporary_dir/certificate.pem";
++my $key_path = "$temporary_dir/key.pem";
++my $download_path = "$temporary_dir/download.bin";
++my $payload = 'protected proxy response ' x 128;
++my $download = join('', map { chr($_) } 0 .. 255) x 32;
++my $websocket_message = 'websocket echo';
++my $ticket = sha256_hex("proxy-response:$$:" . rand());
++
++system(
++    'openssl', 'req', '-quiet', '-x509', '-newkey', 'rsa:2048', '-nodes',
++    '-keyout', $key_path, '-out', $certificate_path,
++    '-subj', '/CN=localhost', '-days', '1',
++) == 0 or BAIL_OUT('openssl could not create the temporary TLS certificate');
++
++open(my $download_file, '>', $download_path) or die "open $download_path: $!\n";
++binmode($download_file);
++print {$download_file} $download or die "write $download_path: $!\n";
++close($download_file) or die "close $download_path: $!\n";
++
++sub listener {
++    my ($port) = @_;
++
++    my $socket = IO::Socket::IP->new(
++        LocalAddr => '127.0.0.1',
++        LocalPort => $port,
++        Listen => SOMAXCONN,
++        ReuseAddr => 1,
++        Proto => 'tcp',
++    ) or die "create loopback listener on port $port: $@\n";
++    return $socket;
++}
++
++my $backend_socket = listener(85);
++my $frontend_socket = listener(0);
++my $echo_socket = listener(0);
++my $frontend_port = $frontend_socket->sockport();
++my $echo_port = $echo_socket->sockport();
++
++my $echo_pid = fork();
++die "fork echo server: $!\n" if !defined($echo_pid);
++if (!$echo_pid) {
++    eval {
++        close($backend_socket);
++        close($frontend_socket);
++        my $connection = $echo_socket->accept() or die "accept echo connection: $!\n";
++        my $received = read_exact($connection, length($websocket_message));
++        print {$connection} $received or die "write echo response: $!\n";
++        close($connection);
++    };
++    if (my $error = $@) {
++        warn $error;
++        _exit(1);
++    }
++    _exit(0);
++}
++push @child_pids, $echo_pid;
++close($echo_socket);
++
++$SIG{ALRM} = sub { BAIL_OUT('the real-socket regression exceeded its 60 second limit'); };
++alarm(60);
++
++for my $configuration (
++    { socket => $backend_socket, unused_socket => $frontend_socket, trusted_env => 1, label => 'backend' },
++    {
++        socket => $frontend_socket,
++        unused_socket => $backend_socket,
++        ssl => { verify => 0, cert_file => $certificate_path, key_file => ($key_path) },
++        label => 'frontend',
++    },
++) {
++    pipe(my $ready_reader, my $ready_writer) or die "create readiness pipe: $!\n";
++    my $server_pid = fork();
++    die "fork API server: $!\n" if !defined($server_pid);
++    if (!$server_pid) {
++        close($ready_reader);
++        close($configuration->{unused_socket});
++        eval {
++            my $lockfile = "$temporary_dir/$configuration->{label}.lock";
++            my $lockfh = IO::File->new(">>$lockfile") or die "open $lockfile: $!\n";
++            my $server = ProxyResponseServer->new(
++                %$configuration,
++                lockfile => $lockfile,
++                lockfh => $lockfh,
++                keep_alive => 20,
++                timeout => 10,
++                test_ticket => $ticket,
++                payload => $payload,
++                download_path => $download_path,
++                echo_port => ($echo_port),
++            );
++            print {$ready_writer} "ready\n" or die "write server readiness: $!\n";
++            close($ready_writer);
++            $server->run();
++        };
++        if (my $error = $@) {
++            warn $error;
++            _exit(1);
++        }
++        _exit(0);
++    }
++    push @child_pids, $server_pid;
++    close($ready_writer);
++    my $ready = <$ready_reader>;
++    BAIL_OUT('the API server did not become ready') if !defined($ready) || $ready ne "ready\n";
++    close($ready_reader);
++}
++close($backend_socket);
++close($frontend_socket);
++
++sub tls_client {
++    my $socket = IO::Socket::SSL->new(
++        PeerAddr => '127.0.0.1',
++        PeerPort => $frontend_port,
++        SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE(),
++        Timeout => 10,
++    ) or die "connect TLS client: " . IO::Socket::SSL::errstr() . "\n";
++    return $socket;
++}
++
++sub write_request {
++    my ($connection, $path, $headers, $authenticated) = @_;
++
++    my $request = "GET $path HTTP/1.1\r\nHost: localhost\r\n";
++    $request .= "Cookie: PVEAuthCookie=$ticket\r\n" if $authenticated;
++    for my $header (sort keys %$headers) {
++        $request .= "$header: $headers->{$header}\r\n";
++    }
++    $request .= "\r\n";
++    print {$connection} $request or die "write TLS request: $!\n";
++}
++
++sub read_exact {
++    my ($connection, $length) = @_;
++
++    my $content = '';
++    while (length($content) < $length) {
++        my $received = '';
++        my $count = sysread($connection, $received, $length - length($content));
++        die "read socket response: $!\n" if !defined($count);
++        die "connection closed before the complete response\n" if !$count;
++        $content .= $received;
++    }
++    return $content;
++}
++
++sub read_headers {
++    my ($connection) = @_;
++
++    my $raw = '';
++    while ($raw !~ /\r\n\r\n\z/) {
++        $raw .= read_exact($connection, 1);
++        die "response headers exceed 64 KiB\n" if length($raw) > 64 * 1024;
++    }
++    my ($status, @lines) = split(/\r\n/, $raw);
++    $status =~ m{^HTTP/1\.1 ([0-9]{3}) } or die "invalid response status: $status\n";
++    my $code = int($1);
++    my %headers;
++    for my $line (@lines) {
++        next if $line eq '';
++        $line =~ /^([^:]+):\s*(.*)$/ or die "invalid response header: $line\n";
++        my ($name, $value) = (lc($1), $2);
++        if (exists($headers{$name})) {
++            $headers{$name} .= ", $value";
++        } else {
++            $headers{$name} = $value;
++        }
++    }
++    return ($code, \%headers);
++}
++
++sub read_sized_body {
++    my ($connection, $headers) = @_;
++
++    my $length = $headers->{'content-length'};
++    die "response does not provide a numeric Content-Length\n"
++        if !defined($length) || $length !~ /^[0-9]+$/;
++    return read_exact($connection, $length);
++}
++
++sub read_to_eof {
++    my ($connection) = @_;
++
++    my $body = '';
++    while (1) {
++        my $received = '';
++        my $count = sysread($connection, $received, 4096);
++        die "read TLS response to EOF: $!\n" if !defined($count);
++        last if !$count;
++        $body .= $received;
++    }
++    return $body;
++}
++
++my $plain_body;
++
++subtest 'Sequential protected replies reuse one TLS socket' => sub {
++    my $unauthenticated = tls_client();
++    write_request($unauthenticated, '/api2/json/read', {}, 0);
++    my ($denied_code, $denied_headers) = read_headers($unauthenticated);
++    is($denied_code, 401, 'The API rejects a request without a ticket');
++    read_to_eof($unauthenticated);
++    close($unauthenticated);
++
++    my $connection = tls_client();
++    my $descriptor = $connection->fileno();
++    my $local_port = $connection->sockport();
++    for my $request_number (1 .. 3) {
++        write_request($connection, '/api2/json/read', {}, 1);
++        my ($code, $headers) = read_headers($connection);
++        my $body = read_sized_body($connection, $headers);
++        is($code, 200, "Protected request $request_number succeeds");
++        unlike($headers->{connection}, qr/\bclose\b/i, 'The public response permits reuse');
++        is(length($body), $headers->{'content-length'}, 'Content-Length matches the wire body');
++        is(decode_json($body)->{data}->{payload}, $payload, 'The proxy returns the protected data');
++        is($connection->fileno(), $descriptor, 'The client retains its original socket');
++        is($connection->sockport(), $local_port, 'The client retains its original TCP port');
++        $plain_body = $body;
++    }
++    close($connection);
++};
++
++subtest 'The proxy preserves gzip and deflate responses' => sub {
++    cmp_ok(length($plain_body), '>', 1024, 'The source response exceeds the compression threshold');
++    for my $encoding (qw(gzip deflate)) {
++        my $connection = tls_client();
++        write_request($connection, '/api2/json/read', { 'Accept-Encoding' => ($encoding) }, 1);
++        my ($code, $headers) = read_headers($connection);
++        my $body = read_sized_body($connection, $headers);
++        is($code, 200, "The $encoding request succeeds");
++        is($headers->{'content-encoding'}, $encoding, 'Content-Encoding identifies the wire encoding');
++        is(length($body), $headers->{'content-length'}, 'Content-Length matches the encoded body');
++        my $decoded;
++        if ($encoding eq 'gzip') {
++            $decoded = Compress::Zlib::memGunzip($body);
++        } else {
++            $decoded = Compress::Zlib::uncompress($body);
++        }
++        is($decoded, $plain_body, 'One decompression restores the uncompressed response');
++        close($connection);
++    }
++};
++
++subtest 'The proxy removes backend connection fields' => sub {
++    my $connection = tls_client();
++    write_request($connection, '/api2/raw/headers', {}, 1);
++    my ($code, $headers) = read_headers($connection);
++    my $body = read_sized_body($connection, $headers);
++    is($code, 200, 'The custom formatter response succeeds');
++    is($body, 'header response', 'The proxy preserves the response body');
++    for my $name (qw(keep-alive proxy-connection te trailer upgrade)) {
++        ok(!exists($headers->{$name}), "The public response omits $name");
++    }
++    is($headers->{'content-type'}, 'application/octet-stream', 'The proxy preserves Content-Type');
++    is(
++        $headers->{'content-disposition'},
++        'attachment; filename=headers.bin',
++        'The proxy preserves Content-Disposition',
++    );
++    close($connection);
++};
++
++subtest 'A streamed file returns every byte and closes the connection' => sub {
++    my $connection = tls_client();
++    write_request($connection, '/api2/json/download', {}, 1);
++    my ($code, $headers) = read_headers($connection);
++    is($code, 200, 'The streamed download succeeds');
++    is(lc($headers->{connection}), 'close', 'The stream explicitly requires closure');
++    ok(!exists($headers->{'content-length'}), 'The stream does not advertise a buffered length');
++    ok(!exists($headers->{'transfer-encoding'}), 'The stream does not advertise chunked framing');
++    ok(!exists($headers->{pvestreamfile}), 'The public response omits the private stream path');
++    is($headers->{'content-type'}, 'application/octet-stream', 'The download preserves Content-Type');
++    is(
++        $headers->{'content-disposition'},
++        'attachment; filename=proxy-response.bin',
++        'The download preserves Content-Disposition',
++    );
++    my $body = read_to_eof($connection);
++    is(length($body), length($download), 'The download returns the complete byte count before EOF');
++    is(sha256_hex($body), sha256_hex($download), 'The download matches the source file');
++    close($connection);
++};
++
++subtest 'An empty response explicitly closes the connection' => sub {
++    my $connection = tls_client();
++    write_request($connection, '/api2/raw/empty', {}, 1);
++    my ($code, $headers) = read_headers($connection);
++    is($code, 200, 'The empty response succeeds');
++    is(lc($headers->{connection}), 'close', 'The empty response explicitly requires closure');
++    is(read_to_eof($connection), '', 'The client reads EOF after the empty body');
++    close($connection);
++};
++
++subtest 'The separate WebSocket handler preserves its upgrade and data' => sub {
++    open(my $random_source, '<', '/dev/urandom') or die "open random source: $!\n";
++    my $nonce = encode_base64(read_exact($random_source, 16), '');
++    close($random_source) or die "close random source: $!\n";
++    my $expected_accept = encode_base64(
++        sha1($nonce . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'),
++        '',
++    );
++    my $connection = tls_client();
++    write_request(
++        $connection,
++        '/api2/json/websocket',
++        {
++            Connection => 'Upgrade',
++            Upgrade => 'websocket',
++            'Sec-WebSocket-Version' => '13',
++            'Sec-WebSocket-Key' => ($nonce),
++        },
++        1,
++    );
++    my ($code, $headers) = read_headers($connection);
++    is($code, 101, 'The WebSocket request switches protocols');
++    is(lc($headers->{connection}), 'upgrade', 'The WebSocket response preserves Connection');
++    is(lc($headers->{upgrade}), 'websocket', 'The WebSocket response preserves Upgrade');
++    is(
++        $headers->{'sec-websocket-accept'},
++        $expected_accept,
++        'The WebSocket response validates the client nonce',
++    );
++    my $message = $websocket_message;
++    my $mask = "\x01\x02\x03\x04";
++    my $mask_bytes = substr($mask x length($message), 0, length($message));
++    my $frame = pack('CC', 0x82, 0x80 | length($message)) . $mask . ($message ^ $mask_bytes);
++    print {$connection} $frame or die "write WebSocket frame: $!\n";
++    my ($opcode, $length) = unpack('CC', read_exact($connection, 2));
++    is($opcode, 0x82, 'The WebSocket handler returns a binary frame');
++    is(read_exact($connection, $length), $message, 'The WebSocket handler returns the echoed bytes');
++    close($connection);
++};
++
++alarm(0);
++done_testing();
