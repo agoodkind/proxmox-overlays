@@ -57,7 +57,7 @@ jobs:
       - name: Show the package versions
         env:
           TAG: ${{ steps.index.outputs.tag }}
-        run: docker run --rm "$IMAGE:$TAG" dpkg-query --show pve-manager qemu-server pve-container libpve-access-control
+        run: docker run --rm "$IMAGE:$TAG" dpkg-query --show pve-manager qemu-server pve-container libpve-access-control libpve-http-server-perl
       - name: Apply the patches and load the patched modules
         env:
           TAG: ${{ steps.index.outputs.tag }}

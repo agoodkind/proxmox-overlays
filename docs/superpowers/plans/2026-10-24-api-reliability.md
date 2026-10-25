@@ -31,12 +31,12 @@ QEMU result consumption during a worker crash must report uncertainty rather tha
 
 Files: add the canonical `pve-http-server` patch, update its overlay packaging, and add public API regression coverage in the existing test harness.
 
-- [ ] Update the canonical upstream overlay source and regenerate `patches/pve-http-server.patch`.
-- [ ] Remove backend connection fields and their nominated headers before public response construction.
-- [ ] Explicitly close connections for streams and responses without valid body framing.
-- [ ] Verify sequential protected reads on one TLS connection without reconnecting.
-- [ ] Verify gzip, deflate, streamed downloads, and WebSocket isolation.
-- [ ] Commit only this correction and its relevant tests.
+- [x] Update the canonical upstream overlay source and regenerate `patches/pve-http-server.patch`.
+- [x] Remove backend connection fields and their nominated headers before public response construction.
+- [x] Explicitly close connections for streams and responses without valid body framing.
+- [x] Verify sequential protected reads on one TLS connection without reconnecting.
+- [x] Verify gzip, deflate, streamed downloads, and WebSocket isolation.
+- [x] Commit only this correction and its relevant tests.
 
 ## Task 2: Retain and acknowledge command results
 
