@@ -1734,10 +1734,10 @@ index 0000000..a2fd4cb
 +acl:1:/vms/100:erin@pve!write:guest_write:
 diff --git a/src/test/bpfdelegate-test.pl b/src/test/bpfdelegate-test.pl
 new file mode 100755
-index 0000000..390edbc
+index 0000000..9012dcd
 --- /dev/null
 +++ b/src/test/bpfdelegate-test.pl
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,182 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -1882,6 +1882,7 @@ index 0000000..390edbc
 +my $guest_methods = {
 +    exec => 'VM.Guest.Exec',
 +    exec_status => 'VM.Guest.Exec',
++    exec_ack => 'VM.Guest.Exec',
 +    file_write => 'VM.Guest.FileWrite',
 +    file_read => 'VM.Guest.FileRead',
 +};
