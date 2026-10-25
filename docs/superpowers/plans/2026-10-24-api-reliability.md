@@ -42,7 +42,7 @@ Files: add the canonical `pve-http-server` patch, update its overlay packaging, 
 
 Files: update canonical LXC and QEMU overlay modules and their generated component patches. Update provider `transport/guest.go`, the request body contract, and relevant public acceptance tests.
 
-Interface: `GET exec-status?pid=<id>` reads a saved result without consuming it. `POST exec-ack` accepts `{ "pid": <id> }` and returns a successful empty result after cleanup. Repeat acknowledgment succeeds. Both operations enforce the existing guest execution privilege.
+Interface: `GET exec-status?pid=<id>` reads a saved result without consuming it. `POST exec-ack` accepts `{ "pid": <id> }` and returns a successful empty result after cleanup. Repeat acknowledgment succeeds. Both operations enforce the existing guest execution privilege. Command starts include `result-retention=acknowledged`; an older server must reject that parameter before execution.
 
 - [ ] Reserve bounded result capacity before command execution.
 - [ ] Save completed LXC results and cache completed QEMU results before replying.

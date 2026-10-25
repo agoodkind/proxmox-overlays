@@ -16,7 +16,9 @@ Add an idempotent `POST exec-ack` operation with a numeric `pid` and the existin
 
 Expire completed results after one hour. Limit saved payload capacity to 256 MiB and result records to 1,024 per host. Reserve capacity before execution and reject new work before starting a command when capacity is unavailable. Release capacity after acknowledgment or expiry. These capacity values are implementation choices for this correction.
 
-Cache completed QEMU guest-agent results before returning them to the caller. A crash between consuming the guest-agent result and saving its copy remains an uncertain outcome. Refuse to replay a command after an uncertain start. This change does not promise execution exactly once across crashes or restarts.
+Cache completed QEMU guest-agent results before returning them to the caller. A crash between consuming the guest-agent result and saving its copy remains an uncertain outcome. Ordinary commands must not repeat after an uncertain start. Read-only calls may repeat an inspection after a lost start reply. Status recovery must request the same accepted command identifier. This change does not promise execution exactly once across crashes or restarts.
+
+The provider sends `result-retention=acknowledged` with every command start. Both APIs accept that single value. Older APIs reject the unknown parameter before starting a command.
 
 ## Verification and rollout
 
