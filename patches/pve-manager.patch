@@ -1066,10 +1066,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..76fa6f54
+index 00000000..e725126c
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,1850 @@
+@@ -0,0 +1,1933 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1145,8 +1145,10 @@ index 00000000..76fa6f54
 +my $UNIT_RE = qr/[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service/;
 +my $VERSION_RE = qr/[1-9][0-9]{0,15}/;
 +
-+my $POLICY_KEYS =
-+    [qw(workspace node environment configuration directories files secret_fields)];
++my $POLICY_KEYS = [
++    qw(workspace node environment configuration directories parent_directories files
++        secret_fields)
++];
 +my $SECRET_FIELD_KEYS =
 +    [qw(name storage_path mode owner group pattern min_length max_length consumer_units)];
 +my $CONFIGURATION_KEYS =
@@ -1278,6 +1280,33 @@ index 00000000..76fa6f54
 +    my $entries = {};
 +    for my $index (0 .. $#$list) {
 +        my $entry = $check_entry->($list->[$index], "$label\[$index\]");
++        die "$label lists '$entry->{path}' more than once\n" if $entries->{ $entry->{path} };
++        $entries->{ $entry->{path} } = $entry;
++    }
++    return $entries;
++};
++
++# The function validates the inspect-only parent directories of a policy. An entry has a path.
++# The entry must list all three of mode, owner, and group or must not list any of them.
++my $check_parent_entries = sub {
++    my ($list, $label) = @_;
++
++    die "$label is not a JSON array\n" if ref($list) ne 'ARRAY';
++    my $entries = {};
++    for my $index (0 .. $#$list) {
++        my $raw = $list->[$index];
++        my $entry_label = "$label\[$index\]";
++        $check_keys->($raw, $ENTRY_KEYS, $entry_label);
++        my $entry = { path => $check_destination->($raw->{path}, "$entry_label path") };
++        my @present = grep { exists($raw->{$_}) } qw(mode owner group);
++        if (@present) {
++            die "$entry_label must list all three of mode, owner, and group or must not list"
++                . " any of them\n"
++                if scalar(@present) != 3;
++            $entry->{mode} = $check_string->($raw, 'mode', $MODE_RE, $entry_label);
++            $entry->{owner} = $check_string->($raw, 'owner', $ACCOUNT_RE, $entry_label);
++            $entry->{group} = $check_string->($raw, 'group', $ACCOUNT_RE, $entry_label);
++        }
 +        die "$label lists '$entry->{path}' more than once\n" if $entries->{ $entry->{path} };
 +        $entries->{ $entry->{path} } = $entry;
 +    }
@@ -1447,12 +1476,23 @@ index 00000000..76fa6f54
 +    }
 +
 +    my $directories = $check_entries->($document->{directories}, "$label directories");
++    my $parents = $check_parent_entries->(
++        $document->{parent_directories} // [], "$label parent_directories",
++    );
 +    my $files = $check_entries->($document->{files}, "$label files");
 +    for my $path (sort keys %$files) {
-+        die "$label lists '$path' as a file and as a directory\n" if $directories->{$path};
++        die "$label lists '$path' as a file and as a directory\n"
++            if $directories->{$path} || $parents->{$path};
++    }
++    for my $path (sort keys %$parents) {
++        die "$label lists '$path' in directories and in parent_directories\n"
++            if $directories->{$path};
 +    }
 +    my $secret_fields = $check_secret_fields->(
-+        $document->{secret_fields} // [], "$label secret_fields", $files, $directories,
++        $document->{secret_fields} // [],
++        "$label secret_fields",
++        $files,
++        { %$directories, %$parents },
 +    );
 +
 +    return {
@@ -1463,6 +1503,7 @@ index 00000000..76fa6f54
 +        environment => $check_string->($document, 'environment', $ENVIRONMENT_RE, $label),
 +        configuration => $checked_configuration,
 +        directories => $directories,
++        parents => $parents,
 +        files => $files,
 +        secret_fields => $secret_fields,
 +    };
@@ -2036,8 +2077,16 @@ index 00000000..76fa6f54
 +    $compare_field->('node', $manifest->{node}, PVE::INotify::nodename());
 +    $compare_field->('environment', $manifest->{environment}, $policy->{environment});
 +
-+    my $directories = $check_entries->($manifest->{directories}, "$label directories");
-+    for my $path (sort keys %$directories) {
++    my $listed = $check_entries->($manifest->{directories}, "$label directories");
++    my $directories = {};
++    my $inspected = {};
++    for my $path (sort keys %$listed) {
++        # A manifest directory that the policy lists as an inspect-only parent stays as it is.
++        if ($policy->{parents}->{$path}) {
++            $inspected->{$path} = 1;
++            next;
++        }
++        $directories->{$path} = $listed->{$path};
 +        my $allowed = $policy->{directories}->{$path};
 +        die "the policy does not list the directory $path\n" if !$allowed;
 +        die "the directory $path does not match the mode, owner, and group in the policy\n"
@@ -2092,6 +2141,7 @@ index 00000000..76fa6f54
 +    return {
 +        manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
 +        directories => $directories,
++        inspected => $inspected,
 +        files => $files,
 +    };
 +}
@@ -2136,11 +2186,35 @@ index 00000000..76fa6f54
 +    return 1;
 +};
 +
-+# Each existing parent of the path must be a directory. A parent that the manifest does not
-+# list must exist, belong to root, and must not be writable by the group or other users.
-+# A parent that the manifest lists may be missing, and the policy sets its owner and mode.
++# The function checks an inspect-only parent directory and never changes it. The directory
++# must exist. With mode, owner, and group in the policy, it must have exactly these values.
++# Without them, it must belong to root. The group and other users cannot write to it.
++my $check_parent_directory = sub {
++    my ($entry) = @_;
++
++    my $path = $entry->{path};
++    my @stat = lstat($path);
++    die "the inspect-only parent directory $path does not exist\n" if !@stat;
++    die "the inspect-only parent directory $path is not a directory\n" if !S_ISDIR($stat[2]);
++    if (defined($entry->{mode})) {
++        my ($uid, $gid) = $account_ids->($entry->{owner}, $entry->{group});
++        my $mode = sprintf('%04o', S_IMODE($stat[2]));
++        die "the inspect-only parent directory $path has mode $mode, owner $stat[4], and"
++            . " group $stat[5], and the policy requires $entry->{mode}, $uid, and $gid\n"
++            if $mode ne $entry->{mode} || $stat[4] != $uid || $stat[5] != $gid;
++        return;
++    }
++    die "the inspect-only parent directory $path must belong to root\n" if $stat[4] != 0;
++    die "the group or other users can write to the inspect-only parent directory $path\n"
++        if $stat[2] & 022;
++};
++
++# Each existing parent of the path must be a directory. A parent that the manifest lists as an
++# owned directory may be missing, and the policy sets its owner and mode. The function checks
++# a parent that the policy lists as inspect-only against the policy. Every other parent must
++# exist and belong to root. The group and other users cannot write to it.
 +my $check_ancestors = sub {
-+    my ($path, $declared) = @_;
++    my ($path, $declared, $parents) = @_;
 +
 +    my $current = '';
 +    for my $component (split(m{/}, substr(dirname($path), 1))) {
@@ -2149,6 +2223,10 @@ index 00000000..76fa6f54
 +        if ($declared->{$current}) {
 +            die "the parent directory $current of $path is not a directory\n"
 +                if @stat && !S_ISDIR($stat[2]);
++            next;
++        }
++        if ($parents->{$current}) {
++            $check_parent_directory->($parents->{$current});
 +            next;
 +        }
 +        die "the parent directory $current of $path does not exist\n" if !@stat;
@@ -2325,9 +2403,14 @@ index 00000000..76fa6f54
 +    return $copies;
 +};
 +
++# The function plans changes only for the directories that the policy lets this target own.
++# It checks each inspect-only parent that the manifest lists and does not plan a change for it.
 +my $plan_directories = sub {
-+    my ($validated) = @_;
++    my ($policy, $validated) = @_;
 +
++    for my $path (sort keys %{ $validated->{inspected} }) {
++        $check_parent_directory->($policy->{parents}->{$path});
++    }
 +    my $directories = [];
 +    my $declared = { map { $_ => 1 } keys %{ $validated->{directories} } };
 +    for my $path (sort keys %{ $validated->{directories} }) {
@@ -2355,7 +2438,7 @@ index 00000000..76fa6f54
 +        push @$directories, $entry;
 +    }
 +    for my $entry (@$directories) {
-+        $check_ancestors->($entry->{path}, $declared);
++        $check_ancestors->($entry->{path}, $declared, $policy->{parents});
 +    }
 +    return ($directories, $declared);
 +};
@@ -2370,7 +2453,7 @@ index 00000000..76fa6f54
 +    my $records = [];
 +    for my $path (sort keys %{ $validated->{files} }) {
 +        my $desired = $validated->{files}->{$path};
-+        $check_ancestors->($path, $declared);
++        $check_ancestors->($path, $declared, $policy->{parents});
 +        my $observation = observe_file($path);
 +        die "$path exists and is not a regular file\n"
 +            if $observation->{present} && !$observation->{regular};
@@ -2405,7 +2488,7 @@ index 00000000..76fa6f54
 +        my $observation = observe_file($path);
 +        next if !$observation->{present};
 +        die "$path exists and is not a regular file\n" if !$observation->{regular};
-+        $check_ancestors->($path, $declared);
++        $check_ancestors->($path, $declared, $policy->{parents});
 +        push @$files, {
 +            path => $path,
 +            action => 'remove',
@@ -2507,7 +2590,7 @@ index 00000000..76fa6f54
 +        $previous_files->{ $check_destination->($entry->{path}, 'installed path') } = $entry;
 +    }
 +
-+    my ($directories, $declared) = $plan_directories->($validated);
++    my ($directories, $declared) = $plan_directories->($policy, $validated);
 +    my ($files, $records) =
 +        $plan_files->($policy, $validated, $previous_files, $declared, $upid);
 +
@@ -2847,7 +2930,7 @@ index 00000000..76fa6f54
 +            }
 +
 +            if (!$file_matches) {
-+                $check_ancestors->($path, $policy->{directories});
++                $check_ancestors->($path, $policy->{directories}, $policy->{parents});
 +                die "the parent directory of $path does not exist\n" if !-d dirname($path);
 +                $next->{temporary} = $sibling_name->($path, 'new');
 +            }
@@ -3417,10 +3500,10 @@ index 00000000..64dcdc1f
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..b8b8f622
+index 00000000..dfe4fe50
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1222 @@
+@@ -0,0 +1,1309 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -3624,9 +3707,10 @@ index 00000000..b8b8f622
 +
 +# The function writes the policy of a new target and returns the policy document and loaded policy.
 +sub new_target {
-+    my ($workspace, $files, $directories) = @_;
++    my ($workspace, $files, $directories, $parents) = @_;
 +
 +    my $document = HostArtifactsTest::base_policy($workspace, $files, $directories);
++    $document->{parent_directories} = $parents if $parents;
 +    my $target = HostArtifactsTest::write_policy($document);
 +    return ($document, PVE::HostArtifacts::load_policy($target));
 +}
@@ -4580,63 +4664,149 @@ index 00000000..b8b8f622
 +    $lock_state->{state} eq 'committed' && !grep { !$_->{matches} } @{ $lock_state->{files} },
 +);
 +
-+# The tests check two targets that list the same directory.
++# The tests check two targets that share an inspect-only parent directory.
 +
 +my $shared_dir = "$ROOT/shared";
 +make_path($shared_dir, { mode => 0700 });
 +chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
++my $shared_parent = [{ path => $shared_dir, mode => '0755', owner => 'root', group => 'root' }];
 +my $shared_b_paths = numbered_paths($shared_dir, 'b');
 +my $shared_a_file = "$shared_dir/a.conf";
-+my ($shared_b_document, $shared_b_policy) = new_target(
-+    'suburban/shared-b',
-+    file_entries($shared_b_paths),
-+    [{ path => $shared_dir, mode => '0755', owner => 'root', group => 'root' }],
-+);
++my ($shared_b_document, $shared_b_policy) =
++    new_target('suburban/shared-b', file_entries($shared_b_paths), [], $shared_parent);
 +my $shared_b_archive = write_artifact(
 +    'shared-b', HostArtifactsTest::artifact($shared_b_document, contents($shared_b_paths, 'b')),
 +);
 +my $shared_a_files = { $shared_a_file => { content => "a\n" } };
-+my ($shared_a_document, $shared_a_policy) = new_target(
-+    'suburban/shared-a',
-+    file_entries([$shared_a_file]),
-+    [{ path => $shared_dir, mode => '0750', owner => 'root', group => 'root' }],
-+);
++my ($shared_a_document, $shared_a_policy) =
++    new_target('suburban/shared-a', file_entries([$shared_a_file]), [], $shared_parent);
 +my $shared_a_archive =
 +    write_artifact('shared-a', HostArtifactsTest::artifact($shared_a_document, $shared_a_files));
 +
-+stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
-+$check->(
-+    'the install of target B stops with its directory mode',
-+    -e journal_of($shared_b_policy) && directory_mode($shared_dir) eq '0755',
++$check_error->(
++    'the install fails when the inspect-only parent has another mode',
++    sub { install_archive($shared_b_policy, $shared_b_archive) },
++    qr/inspect-only parent directory \Q$shared_dir\E has mode 0700/,
 +);
-+install_archive($shared_a_policy, $shared_a_archive);
-+$check->('target A sets its directory mode', directory_mode($shared_dir) eq '0750');
-+recover_target($shared_b_policy);
 +$check->(
-+    'the rollback of target B keeps the directory mode that target A set',
-+    directory_mode($shared_dir) eq '0750',
++    'the failed install does not write a file or a journal',
++    (!grep { -e $_ } @$shared_b_paths) && !-e journal_of($shared_b_policy),
 +);
-+$check->('the rollback of target B deletes its new files', !grep { -e $_ } @$shared_b_paths);
-+$check->('the rollback of target B keeps the file of target A', -e $shared_a_file);
-+
-+$shared_a_document->{directories}->[0]->{mode} = '0755';
-+HostArtifactsTest::write_policy($shared_a_document);
-+$shared_a_policy = PVE::HostArtifacts::load_policy($shared_a_policy->{target});
-+my $shared_a_same = write_artifact(
-+    'shared-a-same', HostArtifactsTest::artifact($shared_a_document, $shared_a_files),
-+);
-+chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
-+stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
-+install_archive($shared_a_policy, $shared_a_same);
-+recover_target($shared_b_policy);
 +$check->(
-+    'the rollback of target B restores the mode that target B changed and target A also lists',
++    'the failed install leaves the parent mode unchanged',
 +    directory_mode($shared_dir) eq '0700',
 +);
-+install_archive($shared_a_policy, $shared_a_same);
++chmod(0755, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
++chown(1, 1, $shared_dir) or die "cannot change the owner of $shared_dir: $!\n";
++$check_error->(
++    'the install fails when the inspect-only parent has another owner',
++    sub { install_archive($shared_b_policy, $shared_b_archive) },
++    qr/inspect-only parent directory \Q$shared_dir\E has mode 0755, owner 1/,
++);
 +$check->(
-+    'the next install of target A sets its directory mode again',
-+    directory_mode($shared_dir) eq '0755',
++    'the failed install leaves the parent owner unchanged',
++    (lstat($shared_dir))[4] == 1 && !-e journal_of($shared_b_policy),
++);
++chown(0, 0, $shared_dir) or die "cannot change the owner of $shared_dir: $!\n";
++
++# The host owner sets the parent directory to the mode that both policies require.
++stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
++$check->('the install of target B stops with a journal', -e journal_of($shared_b_policy));
++install_archive($shared_a_policy, $shared_a_archive);
++my $shared_committed = $json->encode([(lstat($shared_dir))[2, 4, 5]]);
++my $shared_a_committed = snapshot($shared_a_file);
++recover_target($shared_b_policy);
++$check->(
++    'the recovery of target B leaves the parent of the committed target A unchanged',
++    $json->encode([(lstat($shared_dir))[2, 4, 5]]) eq $shared_committed
++        && directory_mode($shared_dir) eq '0755',
++);
++$check->('the recovery of target B deletes its new files', !grep { -e $_ } @$shared_b_paths);
++$check->(
++    'the recovery of target B leaves the file of target A unchanged',
++    snapshot($shared_a_file) eq $shared_a_committed,
++);
++my $shared_a_state = get_state($shared_a_policy->{target});
++$check->(
++    'GET reports every file of target A as matching',
++    $shared_a_state->{state} eq 'committed'
++        && !grep { !$_->{matches} } @{ $shared_a_state->{files} },
++);
++
++# The install does not change an inspect-only parent that the manifest lists as a directory.
++my $listed_document = { %$shared_a_document, directories => $shared_parent };
++my $listed_archive =
++    write_artifact('shared-listed', HostArtifactsTest::artifact($listed_document, $shared_a_files));
++my $listed_before = $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]);
++install_archive($shared_a_policy, $listed_archive);
++$check->(
++    'a manifest directory that the policy lists as inspect-only stays unchanged',
++    $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]) eq $listed_before,
++);
++my $listed_record = $json->decode(
++    HostArtifactsTest::read_file("$STATE_DIR/$shared_a_policy->{target}/installed.json"),
++);
++$check->(
++    'the installed record does not list the inspect-only directory',
++    !@{ $listed_record->{directories} },
++);
++
++# The policy lists an inspect-only parent without mode, owner, and group.
++my $plain_dir = "$ROOT/plain";
++make_path($plain_dir, { mode => 0755 });
++chmod(0775, $plain_dir) or die "cannot change the mode of $plain_dir: $!\n";
++my $plain_file = "$plain_dir/p.conf";
++my ($plain_document, $plain_policy) =
++    new_target('suburban/plain', file_entries([$plain_file]), [], [{ path => $plain_dir }]);
++my $plain_archive = write_artifact(
++    'plain', HostArtifactsTest::artifact($plain_document, { $plain_file => { content => "p\n" } }),
++);
++$check_error->(
++    'the install fails when the group can write to the inspect-only parent',
++    sub { install_archive($plain_policy, $plain_archive) },
++    qr/the group or other users can write to the inspect-only parent directory \Q$plain_dir\E\n/,
++);
++$check->('the failed install does not write the file', !-e $plain_file);
++chmod(0755, $plain_dir) or die "cannot change the mode of $plain_dir: $!\n";
++install_archive($plain_policy, $plain_archive);
++$check->('the install succeeds when root owns the inspect-only parent', -e $plain_file);
++
++# The recovery of an owned directory restores the change of the same target.
++my $owned_c_dir = "$ROOT/owned-c";
++make_path($owned_c_dir, { mode => 0700 });
++chmod(0700, $owned_c_dir) or die "cannot change the mode of $owned_c_dir: $!\n";
++my $owned_c_paths = numbered_paths($owned_c_dir, 'c');
++my ($owned_c_document, $owned_c_policy) = new_target(
++    'suburban/owned-c',
++    file_entries($owned_c_paths),
++    [{ path => $owned_c_dir, mode => '0750', owner => 'root', group => 'root' }],
++);
++my $owned_c_archive = write_artifact(
++    'owned-c', HostArtifactsTest::artifact($owned_c_document, contents($owned_c_paths, 'c')),
++);
++stop_install($owned_c_policy, $owned_c_archive, 'KILL', sub { -e $owned_c_paths->[0] });
++$check->(
++    'the install of an owned directory stops with the new mode',
++    -e journal_of($owned_c_policy) && directory_mode($owned_c_dir) eq '0750',
++);
++recover_target($owned_c_policy);
++$check->(
++    'the recovery restores the mode of the owned directory',
++    directory_mode($owned_c_dir) eq '0700',
++);
++
++# A policy cannot list one path as an owned directory and as an inspect-only parent.
++my $overlap_document = HostArtifactsTest::base_policy(
++    'suburban/overlap',
++    [],
++    [{ path => $plain_dir, mode => '0755', owner => 'root', group => 'root' }],
++);
++$overlap_document->{parent_directories} = [{ path => $plain_dir }];
++my $overlap_target = HostArtifactsTest::write_policy($overlap_document);
++$check_error->(
++    'policy loading rejects a path in directories and in parent_directories',
++    sub { PVE::HostArtifacts::load_policy($overlap_target) },
++    qr/in directories and in parent_directories/,
 +);
 +
 +remove_tree($ROOT, $WORK);
