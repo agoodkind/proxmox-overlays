@@ -218,6 +218,8 @@ Each method runs as root in `pvedaemon` on `{node}`. `{target}` is the lowercase
 
 The OpenTofu overlay module in `agoodkind/configs` writes the policy files over root SSH. The API cannot change them. A request reads only the policy file of its target, and the install method also reads the trusted root. A request fails with the path when a required file does not exist. An invalid policy file of another target does not change the result.
 
+The installer relies on valid policy files and does not compare one target policy with another. Policy provisioning must reject two policies of one host that both list the same path in `directories[]`, even when their mode, owner, and group match. Policy provisioning must also reject a path that one policy lists in `directories[]` and another policy of the host lists in `parent_directories[]`. A directory that several targets use belongs to the host owner, and each of those targets lists it in `parent_directories[]`. Task 4 in `agoodkind/configs` implements these checks.
+
 Host files:
 
 | Path | Content |
@@ -245,7 +247,8 @@ Policy fields:
 | `configuration.signer_digest` | Optional 40-character signer revision |
 | `configuration.max_archive_bytes` | Largest archive stage |
 | `configuration.max_bundle_bytes` | Largest bundle stage |
-| `directories[]` | `path`, `mode`, `owner`, and `group` of each directory that an archive may create |
+| `directories[]` | Each entry has the `path`, `mode`, `owner`, and `group` of a directory that the target owns. An install may create the directory or change its owner and mode. |
+| `parent_directories[]` | Optional. Each entry has the `path` of an inspect-only parent directory and may also have all three of `mode`, `owner`, and `group`. An install checks the directory and never creates or changes it. |
 | `files[]` | `path`, `mode`, `owner`, and `group` of each file that an archive may write |
 | `secret_fields[]` | Optional. `name`, `storage_path`, `mode`, `owner`, `group`, `pattern`, `min_length`, `max_length`, and `consumer_units` of each secret field |
 
@@ -280,12 +283,14 @@ The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<p
 - The manifest has an unknown field, a `schema_version` other than 1, or a `repository`, `source_revision`, `workspace`, `node`, or `environment` that differs from the policy, the request, or the local node.
 - A manifest file or directory does not equal a policy entry in `path`, `mode`, `owner`, and `group`.
 - The owner or group does not exist on the node.
-- A parent directory of a destination is not a directory. A parent directory that the manifest does not list does not exist, does not belong to root, or is writable by the group or other users.
+- A parent of a destination is not a directory. A parent that the manifest does not list as an owned directory and the policy does not list as an inspect-only parent does not exist, does not belong to root, or permits the group or other users to write to it.
+- An inspect-only parent directory does not exist, or it differs from the `mode`, `owner`, and `group` of its policy entry. When the policy entry does not list these values, the directory does not belong to root or permits the group or other users to write to it.
+- A manifest directory is not in `directories[]` or `parent_directories[]` of the policy. The install does not change a manifest directory that the policy lists in `parent_directories[]`, and the installed record does not list it.
 - A destination exists and is not a regular file.
 
 The task compares each manifest file with the live file. A file with the same content, size, mode, owner, and group keeps its bytes and its `write_id`. The task writes each other file to a temporary file in the same directory, then renames it over the destination. It deletes each file of the earlier installed record that the manifest omits and that the policy lists. A manifest with an empty `files` list deletes every installed file of the target. An install that matches every live file writes only `installed.json`.
 
-The task writes a journal listing each planned temporary file, backup, and directory before the first change. The task links each existing destination to a backup before it replaces or deletes the destination. When a step fails, the task renames each backup over its destination, deletes each new file that did not exist before, deletes the temporary files, and deletes each directory it created if the directory is empty. The task restores the previous owner or mode of an existing directory only when the transaction changed that value and the directory still has the value that the transaction set. The task then fails with the original error. When the restore also fails, the error contains both messages. When the task stops before it finishes, the journal remains. The next install of the target restores the files in the same way before it checks the new archive. When the journal is in the committed phase, the restore step instead writes the installed record from the journal and deletes the backups.
+The task writes a journal listing each planned temporary file, backup, and directory before the first change. The task links each existing destination to a backup before it replaces or deletes the destination. When a step fails, the task renames each backup over its destination, deletes each new file that did not exist before, deletes the temporary files, and deletes each directory it created if the directory is empty. The journal lists only owned directories. The task restores the previous owner or mode of an existing owned directory only when the transaction changed that value and the directory still has the value that the transaction set. The task then fails with the original error. When the restore also fails, the error contains both messages. When the task stops before it finishes, the journal remains. The next install of the target restores the files in the same way before it checks the new archive. When the journal is in the committed phase, the restore step instead writes the installed record from the journal and deletes the backups.
 
 ### Secret method
 
