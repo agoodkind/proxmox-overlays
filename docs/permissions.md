@@ -37,6 +37,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.ACME.Config.Domain.Remove` | `/nodes/<node>` | Delete an `acmedomain<n>` option of the node config |
 | `Sys.KernelModules.Audit` | `/nodes/<node>` | Read the node's persistent kernel module list and loaded status |
 | `Sys.KernelModules.Modify` | `/nodes/<node>` | Set the node's persistent kernel module list and load its allowlisted modules |
+| `Sys.HostArtifacts.Audit` | `/nodes/<node>` | Read the installed record and the live file state of a host artifact target on the node |
+| `Sys.HostArtifacts.Modify` | `/nodes/<node>` | Stage and install a host artifact on the node |
 
 ## ACL paths
 
@@ -199,6 +201,95 @@ The OpenTofu overlay module in `agoodkind/configs` writes each host's `/etc/pve-
 `PUT` removes duplicate names, then runs `/sbin/modprobe -- <name>` for each accepted name in request order. `PUT` writes the accepted names to the persistent module file, one per line, only after every command exits 0. A `modprobe` failure stops the request with an error containing the module name and standard error. The persistent file retains its pre-request content. Modules loaded before the failure remain loaded. A successful request returns the `GET` result. `PUT` never unloads a module. A failed `modinfo -n` check rejects the request with the existing condition message plus any nonempty standard error.
 
 At boot, `systemd-modules-load.service` reads `/etc/modules-load.d` before `pve-guests.service` starts guests.
+
+## Host artifact methods
+
+| Method | Path | Requirement |
+| --- | --- | --- |
+| `POST` | `/nodes/{node}/host-artifacts/{target}/stage` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
+| `POST` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
+| `GET` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Audit` on `/nodes/{node}` |
+
+Each method runs as root in `pvedaemon` on `{node}`. `{target}` is the lowercase hexadecimal SHA-256 of the UTF-8 bytes of a workspace selector. The installer accepts every selector that `validateWorkspaceSelector` in configsctl accepts, including nested selectors and selectors with underscores.
+
+### Host policy
+
+The OpenTofu overlay module in `agoodkind/configs` writes the policy files over root SSH. The API cannot change them. A request reads only the policy file of its target, and the install method also reads the trusted root. A request fails with the path when a required file does not exist. An invalid policy file of another target does not change the result.
+
+Host files:
+
+| Path | Content |
+| --- | --- |
+| `/etc/pve-overlay/host-artifacts/targets/<target>.json` | Policy of one target |
+| `/etc/pve-overlay/host-artifacts/trusted_root.jsonl` | Output of `gh attestation trusted-root --hostname github.com` |
+| `/var/lib/pve-overlay/host-artifacts/<target>/stages/<stage>` | Staged bytes, with `<stage>.json` for the user, kind, and creation time |
+| `/var/lib/pve-overlay/host-artifacts/<target>/journal.json` | Journal of an incomplete file transaction |
+| `/var/lib/pve-overlay/host-artifacts/<target>/installed.json` | Installed record |
+| `/run/lock/pve-overlay-host-artifact-<target>.lck` | Lock file of the target |
+
+The policy file and each directory above it must belong to root, must not be writable by the group or other users, and must not be a symbolic link. The same rule applies to the trusted root.
+
+Policy fields:
+
+| Field | Value |
+| --- | --- |
+| `workspace` | Exact workspace selector. Its SHA-256 must equal `<target>`. |
+| `node` | Proxmox node name. It must equal the local node name. |
+| `environment` | Environment name, such as `testbed` |
+| `configuration.repository` | Repository that built the archive, such as `agoodkind/configs` |
+| `configuration.workflow_uri` | Complete workflow identity, such as `https://github.com/agoodkind/configs/.github/workflows/ci.yml@refs/heads/main` |
+| `configuration.source_ref` | Source ref of the build, such as `refs/heads/main` |
+| `configuration.signer_digest` | Optional 40-character signer revision |
+| `configuration.max_archive_bytes` | Largest archive stage |
+| `configuration.max_bundle_bytes` | Largest bundle stage |
+| `directories[]` | `path`, `mode`, `owner`, and `group` of each directory that an archive may create |
+| `files[]` | `path`, `mode`, `owner`, and `group` of each file that an archive may write |
+
+A policy rejects unknown fields. Each path is absolute, does not contain empty, `.`, or `..` components, and is outside `/etc/pve-overlay` and `/var/lib/pve-overlay`. A mode has the form `0` followed by three octal digits.
+
+### Stage method
+
+The request has `kind` (`archive` or `bundle`), `offset`, `data`, and `stage`. `data` accepts at most 128 KiB of base64. Offset 0 creates a stage, and the request omits `stage`. Every other offset must equal the current stage length, and the request must include the stage. The response returns `stage`, 32 hexadecimal characters that the host chooses, and `length`.
+
+A stage belongs to the authenticated user, the target, and the kind. A chunk from another user or for another kind fails. A stage cannot exceed `max_archive_bytes` or `max_bundle_bytes`. Each stage call deletes stages of the same target that are older than one hour and that the journal does not list.
+
+### Install method
+
+The request has `release-tag`, `asset`, `sha256`, `source-revision`, `archive-stage`, and `bundle-stage`. The method checks the policy, the node, and both stages, then starts a `hostartifact` task and returns its UPID. The task takes the target lock with a 10-second timeout and runs these steps:
+
+1. The task runs `/usr/bin/gh attestation verify` on the staged archive with `--hostname github.com`, `--repo`, `--cert-identity`, `--source-digest`, `--source-ref`, `--signer-digest` when the policy has `signer_digest`, `--deny-self-hosted-runners`, `--bundle`, `--custom-trusted-root`, and `--format json`. The environment contains only `HOME` and `GH_CONFIG_DIR`, both a new 0700 directory, and `GH_HOST=github.com`.
+2. The task requires a subject with the requested `asset` and `sha256` in every verified statement, and compares the SHA-256 of the staged archive with `sha256`.
+3. The task restores the files of an incomplete journal.
+4. The task checks the archive and the manifest.
+5. The task writes the changed files and the installed record.
+6. The task deletes both stages.
+
+The task does not start, stop, restart, or reload a service.
+
+The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<path without the leading slash>` member for each manifest file. The task rejects the archive before any write in these cases:
+
+- A member is not a regular file, has a link target, or has mode bits outside 0777.
+- A member name is absolute or contains a backslash or an empty, `.`, or `..` component.
+- A member is missing, extra, or listed twice.
+- A member size or SHA-256 differs from the manifest.
+- The archive has data after its end marker or after the gzip stream.
+- The manifest has an unknown field, a `schema_version` other than 1, or a `repository`, `source_revision`, `workspace`, `node`, or `environment` that differs from the policy, the request, or the local node.
+- A manifest file or directory does not equal a policy entry in `path`, `mode`, `owner`, and `group`.
+- The owner or group does not exist on the node.
+- A parent directory of a destination does not exist, is not a directory, does not belong to root, or is writable by the group or other users.
+- A destination exists and is not a regular file.
+
+The task compares each manifest file with the live file. A file with the same content, size, mode, owner, and group keeps its bytes and its `write_id`. The task writes each other file to a temporary file in the same directory, then renames it over the destination. It deletes each file of the earlier installed record that the manifest omits and that the policy lists. A manifest with an empty `files` list deletes every installed file of the target. An install that matches every live file writes only `installed.json`.
+
+The task writes a journal listing each planned temporary file, backup, and directory before the first change. The task links each existing destination to a backup before it replaces or deletes the destination. When a step fails, the task renames each backup over its destination, deletes each new file that did not exist before, deletes the temporary files, and deletes each directory it created if the directory is empty. The task then fails with the error. When the task stops before it finishes, the journal remains. The next install of the target restores the files in the same way before it checks the new archive. When the journal is in the committed phase, the restore step instead writes the installed record from the journal and deletes the backups.
+
+### Read method
+
+The response has `workspace`, `node`, `environment`, `state`, `installed`, `files`, and `observed_sha256`. `state` is `none` without an installed record, `interrupted` while the journal exists, and `committed` otherwise. `installed` is null without an installed record. Otherwise it has `release_tag`, `asset`, `sha256`, `source_revision`, `manifest_sha256`, `upid`, `user`, and `installed_at`.
+
+`files` has one entry for each file of the installed record. Without a record, it has one entry for each policy file. Each entry has `path` and `present`, and the live `sha256`, `size`, `mode`, `owner`, `group`, `uid`, and `gid` of a present file. With a record, each entry also has `write_id` and `matches`. `matches` is 1 only when the live file has the recorded content, size, mode, owner, and group. `write_id` is the UPID of the task that last wrote the file.
+
+`observed_sha256` is the SHA-256 of the path, presence, SHA-256, size, mode, owner, and group of every listed live file. A missing or changed file changes the value. The read method does not change a file.
 
 ## Tokens
 
