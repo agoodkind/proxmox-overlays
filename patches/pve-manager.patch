@@ -1066,10 +1066,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..e725126c
+index 00000000..5b88078b
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,1933 @@
+@@ -0,0 +1,1947 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1109,6 +1109,13 @@ index 00000000..e725126c
 +my $UNIT_STDERR_LIMIT = 1024;
 +my $SECRET_VALUE_MAX_LENGTH = 512;
 +my $SECRET_PATTERN_MAX_LENGTH = 1024;
++
++# org.freedesktop.systemd1(5) lists these ActiveState values. A consumer unit counts as running
++# in these states.
++my $RUNNING_STATES = { map { $_ => 1 } qw(active activating reloading refreshing) };
++# The task also restarts a failed unit because a failed restart of the field leaves the unit
++# failed. The task does not restart an inactive, deactivating, or maintenance unit.
++my $RESTART_STATES = { %$RUNNING_STATES, failed => 1 };
 +
 +my $LOCK_TIMEOUT_SECONDS = 10;
 +my $STAGE_MAX_AGE_SECONDS = 3600;
@@ -2820,12 +2827,12 @@ index 00000000..e725126c
 +    return $output;
 +};
 +
-+# A unit counts as running when systemd reports it as active, activating, or reloading.
-+my $unit_running = sub {
++my $unit_state = sub {
 +    my ($unit) = @_;
 +
 +    my $state = $run_systemctl->('show', '--property=ActiveState', '--value', $unit);
-+    return $state =~ m/\A(?:active|activating|reloading)\s*\z/ ? 1 : 0;
++    $state =~ s/\s+\z//;
++    return $state;
 +};
 +
 +my $write_secret_file = sub {
@@ -2849,8 +2856,10 @@ index 00000000..e725126c
 +# matches, and the record does not list a consumer restart, the task does not change anything.
 +# Otherwise, the task records the version first and writes the storage file when its bytes,
 +# mode, owner, or group differ. Before writing, the task records a restart for each consumer
-+# unit that is running. The task then restarts each recorded unit. The record retains a failed
-+# restart, and the next accepted request for the field restarts the unit.
++# unit that is running. The task then restarts each recorded unit that is running or failed.
++# It removes a recorded unit that is inactive, deactivating, or in maintenance from the record
++# without starting it. The record retains a failed restart. The next accepted request for the
++# field checks the state of the unit.
 +sub set_secret {
 +    my ($target, $field, $value, $version, $upid) = @_;
 +
@@ -2909,7 +2918,7 @@ index 00000000..e725126c
 +            }
 +            if (!$file_matches) {
 +                for my $unit (@{ $descriptor->{consumer_units} }) {
-+                    if ($unit_running->($unit)) {
++                    if ($RUNNING_STATES->{ $unit_state->($unit) }) {
 +                        $pending->{$unit} = 1;
 +                    } else {
 +                        print "the consumer unit $unit is not running, and the task does not"
@@ -2945,8 +2954,13 @@ index 00000000..e725126c
 +            }
 +
 +            for my $unit (sort keys %$pending) {
-+                $run_systemctl->('restart', $unit);
-+                print "the task restarted the consumer unit $unit\n";
++                my $state = $unit_state->($unit);
++                if ($RESTART_STATES->{$state}) {
++                    $run_systemctl->('restart', $unit);
++                    print "the task restarted the consumer unit $unit\n";
++                } else {
++                    print "the consumer unit $unit is $state, and the task does not start it\n";
++                }
 +                $next->{pending} = [grep { $_ ne $unit } @{ $next->{pending} }];
 +                $write_secrets->($policy->{target}, $secrets);
 +            }
@@ -4815,10 +4829,10 @@ index 00000000..dfe4fe50
 +exit(0);
 diff --git a/test/HostSecrets_test.pl b/test/HostSecrets_test.pl
 new file mode 100755
-index 00000000..5d2771e7
+index 00000000..e755f293
 --- /dev/null
 +++ b/test/HostSecrets_test.pl
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,564 @@
 +#!/usr/bin/perl -T
 +
 +# The test sets host secret fields through the REST method and checks the storage files, the
@@ -4947,7 +4961,7 @@ index 00000000..5d2771e7
 +        $rpcenv, $user, 'PUT', "$target/secrets/$field",
 +        { value => $value, version => $version },
 +    );
-+    push @messages, $response->{message} // '';
++    push @messages, ($response->{message} // '') . $json->encode($response->{errors} // {});
 +    return $response;
 +}
 +
@@ -5188,7 +5202,7 @@ index 00000000..5d2771e7
 +    $rpcenv, $SECRET_TOKEN, 'PUT', "$target/secrets/$FIELD",
 +    { value => value('three'), version => 3, mode => '0644' },
 +);
-+push @messages, $extra->{message} // '';
++push @messages, ($extra->{message} // '') . $json->encode($extra->{errors} // {});
 +$check->('an extra parameter fails', $extra->{status} == 400);
 +
 +my $invalid_values = {
@@ -5197,6 +5211,7 @@ index 00000000..5d2771e7
 +    quote => "$MARKER-'value'",
 +    '[email]' => "$MARKER-[email]-value",
 +    'too few characters' => 'short',
++    'more than 512 characters' => "$MARKER-" . ('a' x 520),
 +};
 +for my $label (sort keys %$invalid_values) {
 +    my $response =
@@ -5262,24 +5277,32 @@ index 00000000..5d2771e7
 +
 +# The tests check an interrupted task and its recovery.
 +
-+HostArtifactsTest::write_file("$ROOT/state/hold", '');
-+my $interrupted = secret_request($SECRET_TOKEN, $target, $FIELD, value('four'), 4);
-+die "the secret request returned status $interrupted->{status}\n"
-+    if $interrupted->{status} != 200;
-+push @upids, $interrupted->{data};
-+wait_for_state($CONSUMER, 'activating');
-+my ($task) = PVE::Tools::upid_decode($interrupted->{data});
-+die "the task has an unexpected process ID\n" if $task->{pid} !~ m/\A([0-9]+)\z/;
-+my $task_pid = $1;
-+kill('KILL', -$task_pid);
-+HostArtifactsTest::wait_for_task($interrupted->{data});
-+$check->(
-+    'the stopped task leaves version 4 with the restart of the consumer',
-+    secret_record($target, $FIELD)->{version} == 4
-+        && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
-+);
-+unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
-+wait_for_state($CONSUMER, 'active');
++# The function starts a rotation, kills the task process group while the consumer restart
++# waits, and lets the consumer finish its start.
++sub interrupt_rotation {
++    my ($label, $version) = @_;
++
++    HostArtifactsTest::write_file("$ROOT/state/hold", '');
++    my $interrupted = secret_request($SECRET_TOKEN, $target, $FIELD, value($label), $version);
++    die "the secret request returned status $interrupted->{status}\n"
++        if $interrupted->{status} != 200;
++    push @upids, $interrupted->{data};
++    wait_for_state($CONSUMER, 'activating');
++    my ($task) = PVE::Tools::upid_decode($interrupted->{data});
++    die "the task has an unexpected process ID\n" if $task->{pid} !~ m/\A([0-9]+)\z/;
++    my $task_pid = $1;
++    kill('KILL', -$task_pid);
++    HostArtifactsTest::wait_for_task($interrupted->{data});
++    $check->(
++        "the stopped task records version $version and the consumer restart",
++        secret_record($target, $FIELD)->{version} == $version
++            && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
++    );
++    unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
++    wait_for_state($CONSUMER, 'active');
++}
++
++interrupt_rotation('four', 4);
 +$consumer_before = unit_property($CONSUMER, 'InvocationID');
 +$status = set_secret($target, $FIELD, value('four'), 4);
 +$check->('a retry of version 4 succeeds', $status eq 'OK', $status);
@@ -5290,6 +5313,34 @@ index 00000000..5d2771e7
 +$check->('the consumer receives version 4', received() eq received_value('four'));
 +$check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
 +$check_unrelated->('the interrupted task and its recovery');
++
++# The tests check a retry after an operator stops the consumer.
++
++interrupt_rotation('five', 5);
++run_systemctl('stop', $CONSUMER);
++$check->('the operator stops the consumer', unit_property($CONSUMER, 'ActiveState') eq 'inactive');
++my $stopped_response = secret_request($SECRET_TOKEN, $target, $FIELD, value('five'), 5);
++die "the secret request returned status $stopped_response->{status}\n"
++    if $stopped_response->{status} != 200;
++push @upids, $stopped_response->{data};
++my ($stopped_status, $stopped_log) = HostArtifactsTest::wait_for_task($stopped_response->{data});
++$check->('a retry of version 5 succeeds', $stopped_status eq 'OK', $stopped_status);
++$check->(
++    'the retry does not start the stopped consumer',
++    unit_property($CONSUMER, 'ActiveState') eq 'inactive',
++);
++$check_match->(
++    'the task log records the stopped consumer state',
++    $stopped_log,
++    qr/the consumer unit \Q$CONSUMER\E is inactive, and the task does not start it/,
++);
++$check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
++$check->(
++    'the storage file contains version 5',
++    secret_state($target, $FIELD)->{sha256} eq content_sha($FIELD, value('five')),
++);
++run_systemctl('start', $CONSUMER);
++$check_unrelated->('the retry after an operator stop');
 +
 +# The tests check logs, responses, and records.
 +
