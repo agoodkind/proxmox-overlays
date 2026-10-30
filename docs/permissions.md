@@ -39,6 +39,7 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.KernelModules.Modify` | `/nodes/<node>` | Set the node's persistent kernel module list and load its allowlisted modules |
 | `Sys.HostArtifacts.Audit` | `/nodes/<node>` | Read the installed record and the live file state of a host artifact target on the node |
 | `Sys.HostArtifacts.Modify` | `/nodes/<node>` | Stage and install a host artifact on the node |
+| `Sys.HostSecrets.Modify` | `/nodes/<node>` | Set a secret field of a host artifact target on the node |
 
 ## ACL paths
 
@@ -209,6 +210,7 @@ At boot, `systemd-modules-load.service` reads `/etc/modules-load.d` before `pve-
 | `POST` | `/nodes/{node}/host-artifacts/{target}/stage` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
 | `POST` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
 | `GET` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Audit` on `/nodes/{node}` |
+| `PUT` | `/nodes/{node}/host-artifacts/{target}/secrets/{field}` | `Sys.HostSecrets.Modify` on `/nodes/{node}` |
 
 Each method runs as root in `pvedaemon` on `{node}`. `{target}` is the lowercase hexadecimal SHA-256 of the UTF-8 bytes of a workspace selector. The installer accepts every selector that `validateWorkspaceSelector` in configsctl accepts, including nested selectors and selectors with underscores.
 
@@ -225,6 +227,7 @@ Host files:
 | `/var/lib/pve-overlay/host-artifacts/<target>/stages/<stage>` | Staged bytes, with `<stage>.json` for the user, kind, and creation time |
 | `/var/lib/pve-overlay/host-artifacts/<target>/journal.json` | Journal of an incomplete file transaction |
 | `/var/lib/pve-overlay/host-artifacts/<target>/installed.json` | Installed record |
+| `/var/lib/pve-overlay/host-artifacts/<target>/secrets.json` | Secret record: version, SHA-256 of the storage file content, and outstanding consumer restarts of each field |
 | `/run/lock/pve-overlay-host-artifact-<target>.lck` | Lock file of the target |
 
 The policy file and each directory above it must belong to root, must not be writable by the group or other users, and must not be a symbolic link. The same rule applies to the trusted root.
@@ -244,6 +247,7 @@ Policy fields:
 | `configuration.max_bundle_bytes` | Largest bundle stage |
 | `directories[]` | `path`, `mode`, `owner`, and `group` of each directory that an archive may create |
 | `files[]` | `path`, `mode`, `owner`, and `group` of each file that an archive may write |
+| `secret_fields[]` | Optional. `name`, `storage_path`, `mode`, `owner`, `group`, `pattern`, `min_length`, `max_length`, and `consumer_units` of each secret field |
 
 A policy rejects unknown fields. Each path is absolute, does not contain empty, `.`, or `..` components, and is outside `/etc/pve-overlay` and `/var/lib/pve-overlay`. A mode has the form `0` followed by three octal digits.
 
@@ -264,7 +268,7 @@ The request has `release-tag`, `asset`, `sha256`, `source-revision`, `archive-st
 5. The task writes the changed files and the installed record.
 6. The task deletes both stages.
 
-The task does not start, stop, restart, or reload a service.
+The install task does not start, stop, restart, or reload a service.
 
 The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<path without the leading slash>` member for each manifest file. The task rejects the archive before any write in these cases:
 
@@ -283,9 +287,28 @@ The task compares each manifest file with the live file. A file with the same co
 
 The task writes a journal listing each planned temporary file, backup, and directory before the first change. The task links each existing destination to a backup before it replaces or deletes the destination. When a step fails, the task renames each backup over its destination, deletes each new file that did not exist before, deletes the temporary files, and deletes each directory it created if the directory is empty. The task restores the previous owner or mode of an existing directory only when the transaction changed that value and the directory still has the value that the transaction set. The task then fails with the original error. When the restore also fails, the error contains both messages. When the task stops before it finishes, the journal remains. The next install of the target restores the files in the same way before it checks the new archive. When the journal is in the committed phase, the restore step instead writes the installed record from the journal and deletes the backups.
 
+### Secret method
+
+The request has `value` and `version`. `{field}` is the `name` of a secret field in the target policy. The method rejects other parameters, a field that the policy does not list, a value with a control character, and a value that does not match the length limits and the anchored `pattern` of the field. Responses, errors, task arguments, and task logs do not contain the value. The method then starts a `hostsecret` task and returns its UPID.
+
+Secret field values:
+
+| Field | Value |
+| --- | --- |
+| `name` | Field name of uppercase letters, digits, and `_` |
+| `storage_path` | File with the line `<name>=<value>`. It is not a policy file or directory, and each field has its own file. |
+| `mode`, `owner`, `group` | Metadata of the storage file |
+| `pattern` | Regular expression that the whole value must match |
+| `min_length`, `max_length` | Length limits of the value, from 1 to 512 |
+| `consumer_units` | Service units that read the storage file |
+
+The task takes the target lock with a 10-second timeout and restores an incomplete artifact journal first. A version lower than the recorded version fails. The recorded version with another value fails. When the version and value match the record, the storage file has the recorded content and metadata, and the record does not list an outstanding restart, the task does not change anything.
+
+In every other case, the task records the version before it writes. When the storage file differs in content, mode, owner, or group, the task records a restart for each consumer unit that is running, then writes the file through a temporary file in the same directory and a rename. The task then runs `systemctl restart` for each recorded unit and removes each unit from the record after its restart succeeds. A failed or stopped task leaves the remaining restarts in the record. The next request for the field that passes the version checks runs them.
+
 ### Read method
 
-The response has `workspace`, `node`, `environment`, `state`, `installed`, `files`, and `observed_sha256`. `state` is `none` without an installed record, `interrupted` while the journal exists, and `committed` otherwise. `installed` is null without an installed record. Otherwise it has `release_tag`, `asset`, `sha256`, `source_revision`, `manifest_sha256`, `upid`, `user`, and `installed_at`.
+The response has `workspace`, `node`, `environment`, `state`, `installed`, `files`, `observed_sha256`, and `secrets`. `secrets` has one entry for each secret field of the policy with `field`, `configured` (1 when the storage file exists), the recorded `version`, and the `sha256` of the storage file. An entry does not contain the value. `state` is `none` without an installed record, `interrupted` while the journal exists, and `committed` otherwise. `installed` is null without an installed record. Otherwise it has `release_tag`, `asset`, `sha256`, `source_revision`, `manifest_sha256`, `upid`, `user`, and `installed_at`.
 
 `files` has one entry for each file of the installed record. Without a record, it has one entry for each policy file. Each entry has `path` and `present`, and the live `sha256`, `size`, `mode`, `owner`, `group`, `uid`, and `gid` of a present file. With a record, each entry also has `write_id` and `matches`. `matches` is 1 only when the live file has the recorded content, size, mode, owner, and group. `write_id` is the UPID of the task that last wrote the file.
 
