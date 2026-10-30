@@ -1,8 +1,8 @@
 diff --git a/README b/README
-index 1e64786..8e8e4e6 100644
+index 1e64786..477a514 100644
 --- a/README
 +++ b/README
-@@ -90,9 +90,29 @@ privileges:
+@@ -90,9 +90,31 @@ privileges:
  	Realm.Allocate: create/modify/remove authentication realms
  	SDN.Allocate: manage SDN configuration
  	SDN.Audit: view SDN configuration
@@ -25,6 +25,8 @@ index 1e64786..8e8e4e6 100644
 +	Sys.ACME.Plugin.Secret.Modify: set ACME plugin credentials
  	Sys.Audit: view node status/config, Corosync cluster config, and HA config
  	Sys.Console: console access to node
++	Sys.HostArtifacts.Audit: view the installed host artifact of a node
++	Sys.HostArtifacts.Modify: stage and install a host artifact on a node
 +	Sys.HostNIC.Use: use a host network interface in a container
  	Sys.Incoming: allow incoming data streams from other clusters (experimental)
 +	Sys.KernelModules.Audit: view the persistent kernel module list of a node
@@ -32,7 +34,7 @@ index 1e64786..8e8e4e6 100644
  	Sys.Modify: create/modify/remove node network parameters
  	Sys.PowerMgmt: node power management (start, stop, reset, shutdown, ...)
  	Sys.Syslog: view syslog
-@@ -105,15 +125,26 @@ privileges:
+@@ -105,15 +127,26 @@ privileges:
  	VM.Audit: view VM config
  	VM.Backup: backup/restore VMs
  	VM.Clone: clone/copy a VM
@@ -60,7 +62,7 @@ index 1e64786..8e8e4e6 100644
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
  	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index 8879ab8..a91d05d 100644
+index 8879ab8..70984bc 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
 @@ -1049,6 +1049,113 @@ sub delete_pool_acl {
@@ -195,7 +197,7 @@ index 8879ab8..a91d05d 100644
          admin => [
              'VM.Config.Disk',
              'VM.Config.CPU',
-@@ -1092,6 +1208,26 @@ my $privgroups = {
+@@ -1092,6 +1208,28 @@ my $privgroups = {
              'Sys.Modify', # edit/change node settings
              'Sys.Incoming', # incoming storage/guest migrations
              'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
@@ -219,10 +221,12 @@ index 8879ab8..a91d05d 100644
 +            'Sys.KernelModules.Audit',
 +            'Sys.KernelModules.Modify',
 +            'Sys.HostNIC.Use',
++            'Sys.HostArtifacts.Audit',
++            'Sys.HostArtifacts.Modify',
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1282,11 +1418,18 @@ sub check_path {
+@@ -1282,11 +1420,18 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -242,15 +246,16 @@ index 8879ab8..a91d05d 100644
  	|/nodes/[[:alnum:]\.\-\_]+
  	|/pool
 diff --git a/src/test/Makefile b/src/test/Makefile
-index 53f2da7..56634b6 100644
+index 53f2da7..3759b7f 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
-@@ -12,5 +12,7 @@ check:
+@@ -12,5 +12,8 @@ check:
  	perl -I.. perm-test6.pl
  	perl -I.. perm-test7.pl
  	perl -I.. perm-test8.pl
 +	perl -I.. bpf-delegate-test.pl
 +	perl -I.. hostnic-test.pl
++	perl -I.. host-artifacts-test.pl
  	perl -I.. realm_sync_test.pl
  	perl -I.. api-tests.pl
 diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
@@ -318,6 +323,93 @@ index 0000000..439310e
 +        if !PVE::AccessControl::verify_privname($privilege, 1);
 +    print "OK:registered:$privilege\n";
 +}
++
++print "all tests passed\n";
++
++exit(0);
+diff --git a/src/test/host-artifacts-test.cfg b/src/test/host-artifacts-test.cfg
+new file mode 100644
+index 0000000..99b6511
+--- /dev/null
++++ b/src/test/host-artifacts-test.cfg
+@@ -0,0 +1,14 @@
++user:alice@pve:1:
++user:bob@pve:1:
++user:carol@pve:1:
++user:dave@pve:1:
++token:bob@pve!audit::1:
++
++role:host_artifacts_audit:Sys.HostArtifacts.Audit:
++role:host_artifacts_modify:Sys.HostArtifacts.Audit,Sys.HostArtifacts.Modify:
++
++acl:1:/:alice@pve:Administrator:
++acl:1:/nodes/node1:bob@pve:host_artifacts_modify:
++acl:1:/nodes/node1:bob@pve!audit:host_artifacts_audit:
++acl:1:/nodes/node1:carol@pve:host_artifacts_audit:
++acl:1:/:dave@pve:PVEAdmin:
+diff --git a/src/test/host-artifacts-test.pl b/src/test/host-artifacts-test.pl
+new file mode 100755
+index 0000000..d6ea174
+--- /dev/null
++++ b/src/test/host-artifacts-test.pl
+@@ -0,0 +1,61 @@
++#!/usr/bin/perl -w
++
++use strict;
++use warnings;
++
++use PVE::AccessControl;
++use PVE::RPCEnvironment;
++
++my $rpcenv = PVE::RPCEnvironment->init('cli');
++$rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
++
++my $AUDIT_PRIVILEGE = 'Sys.HostArtifacts.Audit';
++my $MODIFY_PRIVILEGE = 'Sys.HostArtifacts.Modify';
++
++sub check_equal {
++    my ($label, $got, $expected) = @_;
++
++    die "unexpected result for $label\nneed '${expected}'\ngot '${got}'\n" if $got ne $expected;
++    print "OK:$label:$got\n";
++}
++
++sub has_permission {
++    my ($user, $path, $privilege) = @_;
++
++    my $permissions = $rpcenv->permissions($user, $path);
++    return $permissions->{$privilege} ? 1 : 0;
++}
++
++for my $privilege ($AUDIT_PRIVILEGE, $MODIFY_PRIVILEGE) {
++    die "privilege '$privilege' is not registered\n"
++        if !PVE::AccessControl::verify_privname($privilege, 1);
++    print "OK:registered:$privilege\n";
++}
++
++check_equal('alice audit', has_permission('alice@pve', '/nodes/node1', $AUDIT_PRIVILEGE), 1);
++check_equal('alice modify', has_permission('alice@pve', '/nodes/node1', $MODIFY_PRIVILEGE), 1);
++
++check_equal('bob audit', has_permission('bob@pve', '/nodes/node1', $AUDIT_PRIVILEGE), 1);
++check_equal('bob modify', has_permission('bob@pve', '/nodes/node1', $MODIFY_PRIVILEGE), 1);
++check_equal('bob modify node2', has_permission('bob@pve', '/nodes/node2', $MODIFY_PRIVILEGE), 0);
++
++check_equal(
++    'bob audit token audit',
++    has_permission('bob@pve!audit', '/nodes/node1', $AUDIT_PRIVILEGE),
++    1,
++);
++check_equal(
++    'bob audit token modify',
++    has_permission('bob@pve!audit', '/nodes/node1', $MODIFY_PRIVILEGE),
++    0,
++);
++
++check_equal('carol audit', has_permission('carol@pve', '/nodes/node1', $AUDIT_PRIVILEGE), 1);
++check_equal('carol modify', has_permission('carol@pve', '/nodes/node1', $MODIFY_PRIVILEGE), 0);
++
++check_equal('dave audit', has_permission('dave@pve', '/nodes/node1', $AUDIT_PRIVILEGE), 0);
++check_equal('dave modify', has_permission('dave@pve', '/nodes/node1', $MODIFY_PRIVILEGE), 0);
 +
 +print "all tests passed\n";
 +
@@ -414,7 +506,7 @@ index 0000000..440a9d9
 +
 +exit(0);
 diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
-index d323447..fdc7b3e 100755
+index d323447..77a7f00 100755
 --- a/src/test/perm-test1.pl
 +++ b/src/test/perm-test1.pl
 @@ -70,10 +70,8 @@ check_permission(
@@ -430,7 +522,7 @@ index d323447..fdc7b3e 100755
          . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
          . 'Group.Allocate,'
          . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
-@@ -81,13 +79,29 @@ check_permission(
+@@ -81,13 +79,31 @@ check_permission(
          . 'Pool.Allocate,Pool.Audit,'
          . 'Realm.Allocate,Realm.AllocateUser,'
          . 'SDN.Allocate,SDN.Audit,SDN.Use,'
@@ -442,7 +534,9 @@ index d323447..fdc7b3e 100755
 +        . 'Sys.ACME.Config.Domain.Remove,'
 +        . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
 +        . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
-+        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
++        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
++        . 'Sys.HostArtifacts.Audit,Sys.HostArtifacts.Modify,'
++        . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
          . 'User.Modify,'
          . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
 -        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'
