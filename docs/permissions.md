@@ -285,7 +285,7 @@ The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<p
 - The owner or group does not exist on the node.
 - A parent of a destination is not a directory. A parent that the manifest does not list as an owned directory and the policy does not list as an inspect-only parent does not exist, does not belong to root, or permits the group or other users to write to it.
 - An inspect-only parent directory does not exist, or it differs from the `mode`, `owner`, and `group` of its policy entry. When the policy entry does not list these values, the directory does not belong to root or permits the group or other users to write to it.
-- A manifest directory is not in `directories[]` or `parent_directories[]` of the policy. The install does not change a manifest directory that the policy lists in `parent_directories[]`, and the installed record does not list it.
+- The policy does not list a manifest directory in `directories[]`. This includes a directory that the policy lists only in `parent_directories[]`.
 - A destination exists and is not a regular file.
 
 The task compares each manifest file with the live file. A file with the same content, size, mode, owner, and group keeps its bytes and its `write_id`. The task writes each other file to a temporary file in the same directory, then renames it over the destination. It deletes each file of the earlier installed record that the manifest omits and that the policy lists. A manifest with an empty `files` list deletes every installed file of the target. An install that matches every live file writes only `installed.json`.
