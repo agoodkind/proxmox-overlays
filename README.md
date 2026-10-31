@@ -1,6 +1,6 @@
 # Proxmox VE permission overlays
 
-This repository adds narrow privileges to Proxmox VE. A non-root API token can then do one specific operation on one guest or one ACME account.
+This repository adds narrow privileges to Proxmox VE. A non-root API token can then do one specific operation on one guest, host, or ACME account.
 
 ## What the overlay adds
 
@@ -17,6 +17,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.
 - Four `Sys.ACME.Config` privileges read and change only the ACME options of one node.
 - `Sys.KernelModules.Audit` reads one node's persistent kernel module list. `Sys.KernelModules.Modify` sets the list and loads allowlisted modules.
+- Host configuration methods verify trusted builds and install files within a target policy. Separate secret fields support rotation without rebuilding the configuration archive.
 
 The [permission reference](docs/permissions.md) lists the ACL path and the API method for each privilege.
 
