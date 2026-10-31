@@ -1088,10 +1088,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..2dd10fb1
+index 00000000..55da35a3
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2009 @@
+@@ -0,0 +1,2007 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1191,7 +1191,6 @@ index 00000000..2dd10fb1
 +
 +my $json = JSON->new->utf8->canonical;
 +
-+# The function checks the value against the pattern and returns it without the taint flag.
 +my $untaint = sub {
 +    my ($value, $pattern, $label) = @_;
 +
@@ -1315,8 +1314,7 @@ index 00000000..2dd10fb1
 +    return $entries;
 +};
 +
-+# The function validates the inspect-only parent directories of a policy. An entry has a path.
-+# The entry must list all three of mode, owner, and group or must not list any of them.
++# A parent entry must list all three of mode, owner, and group or must not list any of them.
 +my $check_parent_entries = sub {
 +    my ($list, $label) = @_;
 +
@@ -3115,10 +3113,10 @@ index efcb250d..73cf7879 100644
  	PullMetric.pm		\
 diff --git a/test/HostArtifactsTest.pm b/test/HostArtifactsTest.pm
 new file mode 100644
-index 00000000..cdca229c
+index 00000000..fae75a03
 --- /dev/null
 +++ b/test/HostArtifactsTest.pm
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,368 @@
 +package HostArtifactsTest;
 +
 +use strict;
@@ -3346,7 +3344,6 @@ index 00000000..cdca229c
 +    );
 +}
 +
-+# The function stages a file in chunks with the stage method and returns the stage identifier.
 +sub stage_file {
 +    my ($rpcenv, $user, $target, $kind, $content) = @_;
 +
