@@ -1088,10 +1088,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..d461a842
+index 00000000..fdab6c14
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2019 @@
+@@ -0,0 +1,2013 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -2108,13 +2108,12 @@ index 00000000..d461a842
 +
 +    my $listed = $check_entries->($manifest->{directories}, "$label directories");
 +    my $directories = {};
-+    my $inspected = {};
 +    for my $path (sort keys %$listed) {
-+        # A manifest directory that the policy lists as an inspect-only parent stays as it is.
-+        if ($policy->{parents}->{$path}) {
-+            $inspected->{$path} = 1;
-+            next;
-+        }
++        # A manifest directory sets directory metadata. The target may set it only for a
++        # directory that it owns.
++        die "the manifest lists the directory $path, and the policy lists it only as an"
++            . " inspect-only parent\n"
++            if $policy->{parents}->{$path};
 +        $directories->{$path} = $listed->{$path};
 +        my $allowed = $policy->{directories}->{$path};
 +        die "the policy does not list the directory $path\n" if !$allowed;
@@ -2170,7 +2169,6 @@ index 00000000..d461a842
 +    return {
 +        manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
 +        directories => $directories,
-+        inspected => $inspected,
 +        files => $files,
 +    };
 +}
@@ -2456,13 +2454,9 @@ index 00000000..d461a842
 +};
 +
 +# The function plans changes only for the directories that the policy lets this target own.
-+# It checks each inspect-only parent that the manifest lists and does not plan a change for it.
 +my $plan_directories = sub {
 +    my ($policy, $validated) = @_;
 +
-+    for my $path (sort keys %{ $validated->{inspected} }) {
-+        $check_parent_directory->($policy->{parents}->{$path});
-+    }
 +    my $directories = [];
 +    my $declared = { map { $_ => 1 } keys %{ $validated->{directories} } };
 +    for my $path (sort keys %{ $validated->{directories} }) {
@@ -3125,10 +3119,10 @@ index efcb250d..73cf7879 100644
  	PullMetric.pm		\
 diff --git a/test/HostArtifactsTest.pm b/test/HostArtifactsTest.pm
 new file mode 100644
-index 00000000..28fea3b3
+index 00000000..de8d1f8e
 --- /dev/null
 +++ b/test/HostArtifactsTest.pm
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,315 @@
 +package HostArtifactsTest;
 +
 +use strict;
@@ -3398,6 +3392,32 @@ index 00000000..28fea3b3
 +    print "OK: $label\n";
 +}
 +
++# The function returns the content and metadata of the listed files and of the installed record,
++# secret record, journal, and lock file of one target. A test compares the result before and
++# after a request for another target.
++sub target_state {
++    my ($target, @paths) = @_;
++
++    my $state_dir = "/var/lib/pve-overlay/host-artifacts/$target";
++    my $state = {};
++    for my $path (
++        @paths,
++        "$state_dir/installed.json",
++        "$state_dir/secrets.json",
++        "$state_dir/journal.json",
++        "/run/lock/pve-overlay-host-artifact-$target.lck",
++    ) {
++        my @stat = lstat($path);
++        if (!@stat) {
++            $state->{$path} = 'absent';
++            next;
++        }
++        my $digest = -f _ ? Digest::SHA->new(256)->addfile($path)->hexdigest() : '';
++        $state->{$path} = join(':', $digest, @stat[1, 2, 4, 5, 7, 9]);
++    }
++    return $json->encode($state);
++}
++
 +sub check_match {
 +    my ($label, $value, $pattern) = @_;
 +
@@ -3608,10 +3628,10 @@ index 00000000..64dcdc1f
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..299e0b13
+index 00000000..3b4dcd03
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1404 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -4056,6 +4076,39 @@ index 00000000..299e0b13
 +    $state->{observed_sha256} eq $clean_digest,
 +);
 +
++# The tests install an unrelated target and compare its files, installed record, journal, and
++# lock file after directory repair, install recovery, target B recovery, manifest rejection,
++# and owned directory recovery.
++
++my $unrelated_dir = "$ROOT/unrelated";
++my $unrelated_file = "$unrelated_dir/u.conf";
++my $unrelated_document = HostArtifactsTest::base_policy(
++    'suburban/observation-unrelated',
++    [{ path => $unrelated_file, mode => '0644', owner => 'root', group => 'root' }],
++    [{ path => $unrelated_dir, mode => '0750', owner => 'root', group => 'root' }],
++);
++my $unrelated_target = HostArtifactsTest::write_policy($unrelated_document);
++my $unrelated_policy = PVE::HostArtifacts::load_policy($unrelated_target);
++install_archive(
++    $unrelated_policy,
++    write_artifact(
++        'unrelated',
++        HostArtifactsTest::artifact($unrelated_document, { $unrelated_file => { content => "u\n" } }),
++    ),
++);
++my $unrelated_before =
++    HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file);
++my $check_unrelated = sub {
++    my ($label) = @_;
++
++    $check->(
++        "the unrelated target's files, record, journal, and lock file remain unchanged"
++            . " after the test of $label",
++        HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file) eq
++            $unrelated_before,
++    );
++};
++
 +# The tests check drift of an owned directory.
 +
 +my $owned_new = "$ROOT/etc/new";
@@ -4103,6 +4156,7 @@ index 00000000..299e0b13
 +    'the directory repair keeps every file write_id',
 +    !grep { $_->{write_id} eq $directory_repair_upid } @{ $state->{files} },
 +);
++$check_unrelated->('the directory drift and repair');
 +
 +# Identity and member rejections. Every rejection leaves the files unchanged.
 +
@@ -4479,6 +4533,7 @@ index 00000000..299e0b13
 +);
 +my @many_leftovers = list_leftovers("$ROOT/many");
 +$check->('recovery leaves no temporary or backup file', !@many_leftovers, "@many_leftovers");
++$check_unrelated->('the interrupted install and its recovery');
 +
 +# Stage expiry deletes an old stage and keeps an old stage that the journal lists.
 +
@@ -4888,24 +4943,35 @@ index 00000000..299e0b13
 +    $shared_a_state->{state} eq 'committed'
 +        && !grep { !$_->{matches} } @{ $shared_a_state->{files} },
 +);
++$check_unrelated->('the recovery of target B');
 +
-+# The install does not change an inspect-only parent that the manifest lists as a directory.
++# The install rejects a manifest directory that the policy lists only as an inspect-only parent.
 +my $listed_document = { %$shared_a_document, directories => $shared_parent };
-+my $listed_archive =
-+    write_artifact('shared-listed', HostArtifactsTest::artifact($listed_document, $shared_a_files));
-+my $listed_before = $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]);
-+install_archive($shared_a_policy, $listed_archive);
++my $listed_archive = write_artifact(
++    'shared-listed',
++    HostArtifactsTest::artifact($listed_document, { $shared_a_file => { content => "a two\n" } }),
++);
++my $listed_installed = "$STATE_DIR/$shared_a_policy->{target}/installed.json";
++my $listed_before = $json->encode({
++    parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
++    file => snapshot($shared_a_file),
++    installed => HostArtifactsTest::read_file($listed_installed),
++});
++$check_error->(
++    'the install rejects a manifest directory that the policy lists as inspect-only',
++    sub { install_archive($shared_a_policy, $listed_archive) },
++    qr/manifest lists the directory \Q$shared_dir\E, and the policy lists it only as an/,
++);
 +$check->(
-+    'a manifest directory that the policy lists as inspect-only stays unchanged',
-+    $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]) eq $listed_before,
++    'the rejection leaves the parent, the file, and the installed record unchanged',
++    $json->encode({
++        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
++        file => snapshot($shared_a_file),
++        installed => HostArtifactsTest::read_file($listed_installed),
++    }) eq $listed_before
++        && !-e journal_of($shared_a_policy),
 +);
-+my $listed_record = $json->decode(
-+    HostArtifactsTest::read_file("$STATE_DIR/$shared_a_policy->{target}/installed.json"),
-+);
-+$check->(
-+    'the installed record does not list the inspect-only directory',
-+    !@{ $listed_record->{directories} },
-+);
++$check_unrelated->('the rejected manifest directory');
 +
 +# The policy lists an inspect-only parent without mode, owner, and group.
 +my $plain_dir = "$ROOT/plain";
@@ -4950,6 +5016,7 @@ index 00000000..299e0b13
 +    'the recovery restores the mode of the owned directory',
 +    directory_mode($owned_c_dir) eq '0700',
 +);
++$check_unrelated->('the owned directory recovery');
 +
 +# A policy cannot list one path as an owned directory and as an inspect-only parent.
 +my $overlap_document = HostArtifactsTest::base_policy(
@@ -4971,10 +5038,10 @@ index 00000000..299e0b13
 +exit(0);
 diff --git a/test/HostSecrets_test.pl b/test/HostSecrets_test.pl
 new file mode 100755
-index 00000000..96c9b4f0
+index 00000000..386713d8
 --- /dev/null
 +++ b/test/HostSecrets_test.pl
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,629 @@
 +#!/usr/bin/perl -T
 +
 +# The test sets host secret fields through the REST method and checks the storage files, the
@@ -5178,7 +5245,11 @@ index 00000000..96c9b4f0
 +my $target = HostArtifactsTest::write_policy($document);
 +my $policy = PVE::HostArtifacts::load_policy($target);
 +
-+my $other_document = HostArtifactsTest::base_policy('suburban/secret-other', []);
++my $other_artifact_file = "$ROOT/other/app.conf";
++my $other_document = HostArtifactsTest::base_policy(
++    'suburban/secret-other',
++    [{ path => $other_artifact_file, mode => '0644', owner => 'root', group => 'root' }],
++);
 +$other_document->{secret_fields} = [{
 +    %$secret_descriptor,
 +    name => $OTHER_FIELD,
@@ -5197,20 +5268,31 @@ index 00000000..96c9b4f0
 +system({$SYSTEMCTL} $SYSTEMCTL, 'reset-failed', $CONSUMER, $OTHER_CONSUMER, $UNRELATED);
 +run_systemctl('restart', $CONSUMER, $OTHER_CONSUMER, $UNRELATED);
 +
-+my $archive = "$ROOT/app.tar.gz";
-+my ($manifest, $members) =
-+    HostArtifactsTest::artifact($document, { $artifact_file => { content => "app\n" } });
-+HostArtifactsTest::write_archive(
-+    $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
-+);
-+PVE::HostArtifacts::with_target_lock(
-+    $target,
-+    sub {
-+        PVE::HostArtifacts::install_verified_archive(
-+            $policy, HostArtifactsTest::request($archive), $archive, 'UPID:test:artifact',
-+            'deploy@pve!install',
-+        );
-+    },
++# The function installs one file for a target using the module entry point.
++sub install_file {
++    my ($install_document, $install_policy, $path, $name) = @_;
++
++    my $archive = "$ROOT/$name.tar.gz";
++    my ($manifest, $members) =
++        HostArtifactsTest::artifact($install_document, { $path => { content => "$name\n" } });
++    HostArtifactsTest::write_archive(
++        $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
++    );
++    PVE::HostArtifacts::with_target_lock(
++        $install_policy->{target},
++        sub {
++            PVE::HostArtifacts::install_verified_archive(
++                $install_policy, HostArtifactsTest::request($archive), $archive,
++                "UPID:test:$name", 'deploy@pve!install',
++            );
++        },
++    );
++}
++
++install_file($document, $policy, $artifact_file, 'app');
++install_file(
++    $other_document, PVE::HostArtifacts::load_policy($other_target), $other_artifact_file,
++    'other-app',
 +);
 +my $other_status = set_secret($other_target, $OTHER_FIELD, value('other'), 1);
 +$check->('the unrelated target sets its field', $other_status eq 'OK', $other_status);
@@ -5221,8 +5303,9 @@ index 00000000..96c9b4f0
 +    return $json->encode({
 +        artifact => file_state($artifact_file),
 +        installed => read_or_absent("$STATE_DIR/$target/installed.json"),
-+        other_secret => file_state($other_secret_file),
-+        other_record => read_or_absent("$STATE_DIR/$other_target/secrets.json"),
++        other_target => HostArtifactsTest::target_state(
++            $other_target, $other_artifact_file, $other_secret_file,
++        ),
 +        other_consumer => unit_property($OTHER_CONSUMER, 'InvocationID'),
 +        unrelated => unit_property($UNRELATED, 'InvocationID'),
 +    });
@@ -5232,7 +5315,8 @@ index 00000000..96c9b4f0
 +    my ($label) = @_;
 +
 +    $check->(
-+        "$label leaves the unrelated files, records, and units unchanged",
++        "the unrelated files, records, journal, lock file, and units remain unchanged"
++            . " after the test of $label",
 +        unrelated_state() eq $unrelated_before,
 +    );
 +};
