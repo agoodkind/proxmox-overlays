@@ -309,10 +309,10 @@ index 2f210903..0b780254 100644
              undef,
 diff --git a/PVE/API2/HostArtifacts.pm b/PVE/API2/HostArtifacts.pm
 new file mode 100644
-index 00000000..95cdf399
+index 00000000..38abbab7
 --- /dev/null
 +++ b/PVE/API2/HostArtifacts.pm
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,426 @@
 +package PVE::API2::HostArtifacts;
 +
 +use strict;
@@ -427,6 +427,18 @@ index 00000000..95cdf399
 +        optional => 1,
 +        description => 'The value is set when the live file equals the installed record in'
 +            . ' content, size, mode, owner, and group.',
++    },
++};
++
++my $directory_properties = {
++    path => { type => 'string', description => 'The path is the absolute path of the directory.' },
++    present => { type => 'boolean', description => 'The value is true when the path exists.' },
++    map { $_ => $file_properties->{$_} } qw(mode owner group uid gid),
++    matches => {
++        type => 'boolean',
++        optional => 1,
++        description => 'The value is true when the path is a directory with the mode, owner, and'
++            . ' group of the installed record.',
 +    },
 +};
 +
@@ -674,10 +686,19 @@ index 00000000..95cdf399
 +                    . ' Without a record, the array has one entry for each file in the policy.',
 +                items => { type => 'object', properties => $file_properties },
 +            },
++            directories => {
++                type => 'array',
++                description => 'The array has one entry for each owned directory in the installed'
++                    . ' record. Without a record, the array has one entry for each owned'
++                    . ' directory in the policy. The array does not include inspect-only parent'
++                    . ' directories.',
++                items => { type => 'object', properties => $directory_properties },
++            },
 +            observed_sha256 => {
 +                type => 'string',
 +                description => 'The value is the SHA-256 of the path, presence, SHA-256, size,'
-+                    . ' mode, owner, and group of every listed file.',
++                    . ' mode, owner, and group of every listed file and of the path, presence,'
++                    . ' type, mode, owner, and group of every listed directory.',
 +            },
 +            secrets => {
 +                type => 'array',
@@ -692,7 +713,8 @@ index 00000000..95cdf399
 +                        },
 +                        configured => {
 +                            type => 'boolean',
-+                            description => 'The value is true when the storage file exists.',
++                            description => 'The value is true when the storage file is a regular'
++                                . ' file with the mode, owner, and group of the policy.',
 +                        },
 +                        version => {
 +                            type => 'integer',
@@ -1066,10 +1088,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..5b88078b
+index 00000000..d461a842
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,1947 @@
+@@ -0,0 +1,2019 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -2167,6 +2189,7 @@ index 00000000..5b88078b
 +        path => $path,
 +        present => 1,
 +        regular => S_ISREG($stat[2]) ? 1 : 0,
++        directory => S_ISDIR($stat[2]) ? 1 : 0,
 +        size => $stat[7],
 +        mode => sprintf('%04o', S_IMODE($stat[2])),
 +        uid => $stat[4],
@@ -2181,16 +2204,38 @@ index 00000000..5b88078b
 +    return $observation;
 +}
 +
-+my $observation_matches = sub {
++my $content_matches = sub {
 +    my ($observation, $expected) = @_;
 +
 +    return 0 if !$observation->{present} || !$observation->{regular};
 +    return 0 if $observation->{sha256} ne $expected->{sha256};
 +    return 0 if $observation->{size} != $expected->{size};
-+    return 0 if $observation->{mode} ne $expected->{mode};
-+    return 0 if $observation->{uid} != $expected->{uid};
-+    return 0 if $observation->{gid} != $expected->{gid};
 +    return 1;
++};
++
++my $metadata_matches = sub {
++    my ($observation, $expected) = @_;
++
++    return 0 if !$observation->{present};
++    return 0 if $observation->{mode} ne $expected->{mode};
++    return 0 if !defined($expected->{uid}) || $observation->{uid} != $expected->{uid};
++    return 0 if !defined($expected->{gid}) || $observation->{gid} != $expected->{gid};
++    return 1;
++};
++
++my $observation_matches = sub {
++    my ($observation, $expected) = @_;
++
++    return $content_matches->($observation, $expected)
++        && $metadata_matches->($observation, $expected) ? 1 : 0;
++};
++
++my $directory_matches = sub {
++    my ($observation, $expected) = @_;
++
++    return $observation->{present}
++        && $observation->{directory}
++        && $metadata_matches->($observation, $expected) ? 1 : 0;
 +};
 +
 +# The function checks an inspect-only parent directory and never changes it. The directory
@@ -2755,7 +2800,17 @@ index 00000000..5b88078b
 +    for my $name (sort keys %{ $policy->{secret_fields} }) {
 +        my $descriptor = $policy->{secret_fields}->{$name};
 +        my $observation = observe_file($descriptor->{path});
-+        my $state = { field => $name, configured => $observation->{present} };
++        # configured is true when the storage file is a regular file with the mode, owner, and
++        # group of the policy. The SHA-256 represents the content of a regular storage file.
++        my $expected = {
++            mode => $descriptor->{mode},
++            uid => scalar(getpwnam($descriptor->{owner})),
++            gid => scalar(getgrnam($descriptor->{group})),
++        };
++        my $configured = $observation->{present}
++            && $observation->{regular}
++            && $metadata_matches->($observation, $expected) ? 1 : 0;
++        my $state = { field => $name, configured => $configured };
 +        $state->{sha256} = $observation->{sha256} if defined($observation->{sha256});
 +        my $record = $secrets->{fields}->{$name};
 +        $state->{version} = $record->{version} if $record;
@@ -2851,12 +2906,28 @@ index 00000000..5b88078b
 +    $sync_dir->(dirname($path));
 +};
 +
++# The function sets the mode, owner, and group of the policy on the existing storage file and
++# does not change its content.
++my $repair_secret_metadata = sub {
++    my ($descriptor, $uid, $gid) = @_;
++
++    my $path = $descriptor->{path};
++    sysopen(my $handle, $path, O_RDONLY | O_NOFOLLOW) or die "cannot open $path: $!\n";
++    my @stat = stat($handle);
++    die "$path does not identify a regular file\n" if !S_ISREG($stat[2]);
++    chown($uid, $gid, $handle) or die "cannot change the owner of $path: $!\n";
++    chmod(oct($descriptor->{mode}), $handle) or die "cannot change the mode of $path: $!\n";
++    $handle->sync() or die "cannot sync $path: $!\n";
++    close($handle) or die "cannot close $path: $!\n";
++};
++
 +# The function sets one secret field in a task worker. A lower version fails. The same version
 +# with another value fails. When the version and value match the record, the storage file
 +# matches, and the record does not list a consumer restart, the task does not change anything.
-+# Otherwise, the task records the version first and writes the storage file when its bytes,
-+# mode, owner, or group differ. Before writing, the task records a restart for each consumer
-+# unit that is running. The task then restarts each recorded unit that is running or failed.
++# Otherwise, the task records the version first. When the content differs, the task records a
++# restart for each consumer unit that is running and writes the storage file. When only the
++# mode, owner, or group differs, the task changes them on the existing file and does not record
++# a restart. The task then restarts each recorded unit that is running or failed.
 +# It removes a recorded unit that is inactive, deactivating, or in maintenance from the record
 +# without starting it. The record retains a failed restart. The next accepted request for the
 +# field checks the state of the unit.
@@ -2898,16 +2969,15 @@ index 00000000..5b88078b
 +            my $observation = observe_file($path);
 +            die "$path exists and is not a regular file\n"
 +                if $observation->{present} && !$observation->{regular};
-+            my $file_matches = $observation_matches->(
-+                $observation,
-+                {
-+                    sha256 => $sha256,
-+                    size => length($content),
-+                    mode => $descriptor->{mode},
-+                    uid => $uid,
-+                    gid => $gid,
-+                },
-+            );
++            my $expected = {
++                sha256 => $sha256,
++                size => length($content),
++                mode => $descriptor->{mode},
++                uid => $uid,
++                gid => $gid,
++            };
++            my $same_content = $content_matches->($observation, $expected);
++            my $same_metadata = $same_content && $metadata_matches->($observation, $expected);
 +
 +            # A recorded restart counts only for a unit that the policy still lists.
 +            my $declared = { map { $_ => 1 } @{ $descriptor->{consumer_units} } };
@@ -2916,7 +2986,9 @@ index 00000000..5b88078b
 +                my $checked = $untaint->($unit, $UNIT_RE, 'recorded consumer unit');
 +                $pending->{$checked} = 1 if $declared->{$checked};
 +            }
-+            if (!$file_matches) {
++            # The task records new restarts only when the content changes. A metadata repair
++            # keeps the restarts that an earlier failed or stopped task recorded.
++            if (!$same_content) {
 +                for my $unit (@{ $descriptor->{consumer_units} }) {
 +                    if ($RUNNING_STATES->{ $unit_state->($unit) }) {
 +                        $pending->{$unit} = 1;
@@ -2932,25 +3004,28 @@ index 00000000..5b88078b
 +                pending => [sort keys %$pending],
 +            };
 +
-+            if ($file_matches && !%$pending && $record && $record->{version} == $version) {
++            if ($same_metadata && !%$pending && $record && $record->{version} == $version) {
 +                print "the secret field $name already has version $version, and the task did"
 +                    . " not change a file or a unit\n";
 +                return;
 +            }
 +
-+            if (!$file_matches) {
++            if (!$same_metadata) {
 +                $check_ancestors->($path, $policy->{directories}, $policy->{parents});
 +                die "the parent directory of $path does not exist\n" if !-d dirname($path);
-+                $next->{temporary} = $sibling_name->($path, 'new');
 +            }
++            $next->{temporary} = $sibling_name->($path, 'new') if !$same_content;
 +            $secrets->{fields}->{$name} = $next;
 +            $write_secrets->($policy->{target}, $secrets);
 +
-+            if (!$file_matches) {
++            if (!$same_content) {
 +                $write_secret_file->($descriptor, $content, $next->{temporary});
 +                delete $next->{temporary};
 +                $write_secrets->($policy->{target}, $secrets);
 +                print "the task wrote version $version of the secret field $name to $path\n";
++            } elsif (!$same_metadata) {
++                $repair_secret_metadata->($descriptor, $uid, $gid);
++                print "the task restored the mode, owner, and group of $path\n";
 +            }
 +
 +            for my $unit (sort keys %$pending) {
@@ -2969,8 +3044,8 @@ index 00000000..5b88078b
 +}
 +
 +# The function returns the policy identity, the installed record, and the live state of each
-+# installed file. Without an installed record, the files are the policy destinations. The
-+# function does not change a file.
++# installed file and owned directory. Without an installed record, the files and directories
++# are those of the policy. The function does not change a file.
 +sub read_state {
 +    my ($target) = @_;
 +
@@ -3002,6 +3077,24 @@ index 00000000..5b88078b
 +        $observed .= join("\0", map { $_ // '' } @fields) . "\n";
 +    }
 +
++    # The function returns the owned directories of the installed record, or the owned
++    # directories of the policy without a record. It does not include inspect-only parents.
++    my $expected_directories = [values %{ $policy->{directories} }];
++    $expected_directories = $installed->{directories} // [] if $installed;
++    my $directories = [];
++    for my $expected (sort { $a->{path} cmp $b->{path} } @$expected_directories) {
++        my $path = $check_destination->($expected->{path}, 'installed directory');
++        my $observation = observe_file($path);
++        my $directory = { path => $path, present => $observation->{present} };
++        for my $key (qw(mode owner group uid gid)) {
++            $directory->{$key} = $observation->{$key} if defined($observation->{$key});
++        }
++        $directory->{matches} = $directory_matches->($observation, $expected) if $installed;
++        push @$directories, $directory;
++        my @fields = ($path, @$observation{qw(present directory mode uid gid)});
++        $observed .= join("\0", 'directory', map { $_ // '' } @fields) . "\n";
++    }
++
 +    my $installed_fields = undef;
 +    $installed_fields = { map { $_ => $installed->{$_} } @$INSTALLED_KEYS } if $installed;
 +    return {
@@ -3011,6 +3104,7 @@ index 00000000..5b88078b
 +        state => $state,
 +        installed => $installed_fields,
 +        files => $files,
++        directories => $directories,
 +        observed_sha256 => Digest::SHA::sha256_hex($observed),
 +        secrets => $secret_states->($policy),
 +    };
@@ -3514,10 +3608,10 @@ index 00000000..64dcdc1f
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..dfe4fe50
+index 00000000..299e0b13
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1309 @@
+@@ -0,0 +1,1357 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -3960,6 +4054,54 @@ index 00000000..dfe4fe50
 +$check->(
 +    'the observed digest returns to its clean value',
 +    $state->{observed_sha256} eq $clean_digest,
++);
++
++# The tests check drift of an owned directory.
++
++my $owned_new = "$ROOT/etc/new";
++my $directory_entry = sub {
++    my ($current) = @_;
++
++    my ($entry) = grep { $_->{path} eq $owned_new } @{ $current->{directories} };
++    return $entry;
++};
++$check->(
++    'GET reports the owned directory as matching',
++    $directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0750',
++);
++chmod(0755, $owned_new) or die "cannot change the mode of $owned_new: $!\n";
++my $files_before_directory_drift = snapshot(@all_paths);
++$state = get_state($target);
++$check->(
++    'GET reports that an owned directory with another mode does not match',
++    !$directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0755',
++);
++$check->(
++    'the observed digest changes with directory drift',
++    $state->{observed_sha256} ne $clean_digest,
++);
++$check->('GET leaves the owned directory unchanged', directory_mode($owned_new) eq '0755');
++my $directory_repair_upid = install_archive($policy, $archive_one);
++$state = get_state($target);
++$check->(
++    'a repeat install restores the owned directory mode',
++    directory_mode($owned_new) eq '0750',
++);
++$check->(
++    'GET reports the repaired owned directory as matching',
++    $directory_entry->($state)->{matches},
++);
++$check->(
++    'the observed digest returns to its clean value after the directory repair',
++    $state->{observed_sha256} eq $clean_digest,
++);
++$check->(
++    'the directory repair leaves every file unchanged',
++    snapshot(@all_paths) eq $files_before_directory_drift,
++);
++$check->(
++    'the directory repair keeps every file write_id',
++    !grep { $_->{write_id} eq $directory_repair_upid } @{ $state->{files} },
 +);
 +
 +# Identity and member rejections. Every rejection leaves the files unchanged.
@@ -4829,10 +4971,10 @@ index 00000000..dfe4fe50
 +exit(0);
 diff --git a/test/HostSecrets_test.pl b/test/HostSecrets_test.pl
 new file mode 100755
-index 00000000..e755f293
+index 00000000..96c9b4f0
 --- /dev/null
 +++ b/test/HostSecrets_test.pl
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,612 @@
 +#!/usr/bin/perl -T
 +
 +# The test sets host secret fields through the REST method and checks the storage files, the
@@ -5245,6 +5387,49 @@ index 00000000..e755f293
 +);
 +$check_unrelated->('the drift repair');
 +
++# The tests check drift of the storage file mode and owner.
++
++for my $drift (
++    ['mode', sub { chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n" }],
++    ['owner', sub { chown(1, 1, $secret_file) or die "cannot change $secret_file: $!\n" }],
++) {
++    my ($kind, $change) = @$drift;
++    $change->();
++    my $drifted = file_state($secret_file);
++    my $drift_state = secret_state($target, $FIELD);
++    $check->(
++        "GET reports that a storage file with another $kind does not match the policy",
++        !$drift_state->{configured},
++    );
++    $check->(
++        "GET reports the content SHA-256 of a storage file with another $kind",
++        $drift_state->{sha256} eq content_sha($FIELD, value('two')),
++    );
++    $check->(
++        "GET leaves the storage file with another $kind unchanged",
++        file_state($secret_file) eq $drifted,
++    );
++    $consumer_before = unit_property($CONSUMER, 'InvocationID');
++    my $inode_before = (lstat($secret_file))[1];
++    $status = set_secret($target, $FIELD, value('two'), 2);
++    $check->("a retry of version 2 repairs the $kind", $status eq 'OK', $status);
++    my @repaired = lstat($secret_file);
++    $check->(
++        "the repair restores mode 0600 and owner root",
++        ($repaired[2] & 07777) == 0600 && $repaired[4] == 0 && $repaired[5] == 0,
++    );
++    $check->("the $kind repair keeps the inode of the storage file", $repaired[1] == $inode_before);
++    $check->(
++        "the $kind repair does not restart the consumer",
++        unit_property($CONSUMER, 'InvocationID') eq $consumer_before,
++    );
++    $check->(
++        'GET reports the repaired storage file as configured',
++        secret_state($target, $FIELD)->{configured},
++    );
++    $check_unrelated->("the $kind repair");
++}
++
 +# The tests check a failed consumer restart and its retry.
 +
 +HostArtifactsTest::write_file("$ROOT/state/fail", '');
@@ -5263,9 +5448,14 @@ index 00000000..e755f293
 +    join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
 +);
 +unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
++chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n";
 +$consumer_before = unit_property($CONSUMER, 'InvocationID');
 +$status = set_secret($target, $FIELD, value('three'), 3);
 +$check->('a retry of version 3 succeeds', $status eq 'OK', $status);
++$check->(
++    'the retry restores the mode and keeps the recorded restart',
++    ((lstat($secret_file))[2] & 07777) == 0600,
++);
 +$check->(
 +    'the retry restarts the consumer',
 +    unit_property($CONSUMER, 'InvocationID') ne $consumer_before
