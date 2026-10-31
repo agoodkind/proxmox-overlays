@@ -1088,10 +1088,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..fdab6c14
+index 00000000..2dd10fb1
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2013 @@
+@@ -0,0 +1,2009 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1656,8 +1656,6 @@ index 00000000..fdab6c14
 +    return $stat[7];
 +};
 +
-+# The function checks that the stage exists for the target and matches the user and kind.
-+# The function returns the stage record.
 +sub check_stage {
 +    my ($target, $stage, $user, $kind) = @_;
 +
@@ -1733,8 +1731,6 @@ index 00000000..fdab6c14
 +    close($handle) or die "cannot close $path: $!\n";
 +};
 +
-+# The function adds one chunk to a stage. Offset 0 creates a new stage. Every other offset
-+# must equal the current length of the stage.
 +sub stage_chunk {
 +    my ($target, $user, $kind, $offset, $data, $stage) = @_;
 +
@@ -3682,10 +3678,10 @@ index 00000000..64dcdc1f
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..7536b2cc
+index 00000000..fcff0805
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1454 @@
+@@ -0,0 +1,1452 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -5047,25 +5043,23 @@ index 00000000..7536b2cc
 +    'shared-listed',
 +    HostArtifactsTest::artifact($listed_document, { $shared_a_file => { content => "a two\n" } }),
 +);
-+my $listed_installed = "$STATE_DIR/$shared_a_policy->{target}/installed.json";
-+my $listed_before = $json->encode({
-+    parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
-+    file => snapshot($shared_a_file),
-+    installed => HostArtifactsTest::read_file($listed_installed),
-+});
++my $listed_state = sub {
++    return $json->encode({
++        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
++        file => snapshot($shared_a_file),
++        target => HostArtifactsTest::target_state($shared_a_policy->{target}, $shared_a_file),
++    });
++};
++my $listed_before = $listed_state->();
 +$check_error->(
 +    'the install rejects a manifest directory that the policy lists as inspect-only',
 +    sub { install_archive($shared_a_policy, $listed_archive) },
 +    qr/manifest lists the directory \Q$shared_dir\E, and the policy lists it only as an/,
 +);
 +$check->(
-+    'the rejection leaves the parent, the file, and the installed record unchanged',
-+    $json->encode({
-+        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
-+        file => snapshot($shared_a_file),
-+        installed => HostArtifactsTest::read_file($listed_installed),
-+    }) eq $listed_before
-+        && !-e journal_of($shared_a_policy),
++    'the rejection does not change the parent, the file, the installed record, the journal,'
++        . ' or the lock file',
++    $listed_state->() eq $listed_before && !-e journal_of($shared_a_policy),
 +);
 +$check_unrelated->('the rejected manifest directory');
 +
