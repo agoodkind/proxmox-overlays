@@ -1093,7 +1093,7 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..35f2363c
+index 00000000..11302771
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
 @@ -0,0 +1,2009 @@
@@ -1397,7 +1397,7 @@ index 00000000..35f2363c
 +    }
 +};
 +
-+# Artifact installation and secret rotation use different storage paths.
++# Secret storage paths must differ from artifact file and directory paths.
 +my $check_secret_fields = sub {
 +    my ($list, $label, $files, $directories) = @_;
 +
@@ -5135,10 +5135,10 @@ index 00000000..b6509665
 +exit(0);
 diff --git a/test/HostSecrets_test.pl b/test/HostSecrets_test.pl
 new file mode 100755
-index 00000000..ec1dd874
+index 00000000..dc992d43
 --- /dev/null
 +++ b/test/HostSecrets_test.pl
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,715 @@
 +#!/usr/bin/perl -T
 +
 +# The test sets host secret fields through the REST method and checks the storage files, the
@@ -5640,7 +5640,6 @@ index 00000000..ec1dd874
 +    secret_state($target, $FIELD)->{restart_pending} eq '1',
 +);
 +
-+# The function returns the storage file and secret record state of the selected target.
 +sub secret_files_state {
 +    return join(' ', file_state($secret_file), file_state("$STATE_DIR/$target/secrets.json"));
 +}
