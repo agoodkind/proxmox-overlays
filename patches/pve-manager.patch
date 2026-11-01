@@ -309,10 +309,10 @@ index 2f210903..0b780254 100644
              undef,
 diff --git a/PVE/API2/HostArtifacts.pm b/PVE/API2/HostArtifacts.pm
 new file mode 100644
-index 00000000..38abbab7
+index 00000000..61369f61
 --- /dev/null
 +++ b/PVE/API2/HostArtifacts.pm
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,431 @@
 +package PVE::API2::HostArtifacts;
 +
 +use strict;
@@ -716,6 +716,11 @@ index 00000000..38abbab7
 +                            description => 'The value is true when the storage file is a regular'
 +                                . ' file with the mode, owner, and group of the policy.',
 +                        },
++                        restart_pending => {
++                            type => 'boolean',
++                            description => 'The value is true when the secret record lists a'
++                                . ' consumer restart for a unit that the policy lists.',
++                        },
 +                        version => {
 +                            type => 'integer',
 +                            optional => 1,
@@ -1088,10 +1093,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..55da35a3
+index 00000000..1d5252d9
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2007 @@
+@@ -0,0 +1,2012 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -2802,6 +2807,11 @@ index 00000000..55da35a3
 +        $state->{sha256} = $observation->{sha256} if defined($observation->{sha256});
 +        my $record = $secrets->{fields}->{$name};
 +        $state->{version} = $record->{version} if $record;
++        # A recorded restart counts only for a unit that the policy still lists.
++        my $listed_units = { map { $_ => 1 } @{ $descriptor->{consumer_units} } };
++        my $recorded_units = $record ? $record->{pending} // [] : [];
++        my @pending_units = grep { $listed_units->{$_} } @$recorded_units;
++        $state->{restart_pending} = @pending_units ? 1 : 0;
 +        push @$states, $state;
 +    }
 +    return $states;
@@ -5133,10 +5143,10 @@ index 00000000..fcff0805
 +exit(0);
 diff --git a/test/HostSecrets_test.pl b/test/HostSecrets_test.pl
 new file mode 100755
-index 00000000..acd1e987
+index 00000000..ec1dd874
 --- /dev/null
 +++ b/test/HostSecrets_test.pl
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,716 @@
 +#!/usr/bin/perl -T
 +
 +# The test sets host secret fields through the REST method and checks the storage files, the
@@ -5182,6 +5192,7 @@ index 00000000..acd1e987
 +my $CONSUMER = 'hostsecret-consumer.service';
 +my $OTHER_CONSUMER = 'hostsecret-other.service';
 +my $UNRELATED = 'hostsecret-unrelated.service';
++my $OTHER_POLICY_UNIT = 'hostsecret-other-policy.service';
 +my $SECRET_TOKEN = 'deploy@pve!rotate';
 +my $WAIT_SECONDS = 120;
 +
@@ -5445,9 +5456,10 @@ index 00000000..acd1e987
 +);
 +my $state = secret_state($target, $FIELD);
 +$check->(
-+    'GET reports only the field, configured, version, and SHA-256',
-+    join(',', sort keys %$state) eq 'configured,field,sha256,version',
++    'GET reports only the field, configured, restart_pending, version, and SHA-256',
++    join(',', sort keys %$state) eq 'configured,field,restart_pending,sha256,version',
 +);
++$check->('GET reports restart_pending 0 after version 1', $state->{restart_pending} eq '0');
 +$check->(
 +    'GET reports version 1 and the SHA-256 of the storage file',
 +    $state->{configured}
@@ -5631,6 +5643,33 @@ index 00000000..acd1e987
 +    'the record keeps the restart of the consumer',
 +    join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
 +);
++$check->(
++    'GET reports restart_pending 1 after the failed restart',
++    secret_state($target, $FIELD)->{restart_pending} eq '1',
++);
++
++# The function returns the storage file and secret record state of the selected target.
++sub secret_files_state {
++    return join(' ', file_state($secret_file), file_state("$STATE_DIR/$target/secrets.json"));
++}
++
++my $files_before_get = secret_files_state();
++my $audit_response =
++    HostArtifactsTest::api_request($rpcenv, 'deploy@pve!audit', 'GET', $target, {});
++my ($audit_state) = grep { $_->{field} eq $FIELD } @{ $audit_response->{data}->{secrets} // [] };
++$check->(
++    'GET reports restart_pending 1 for an audit-only token',
++    $audit_response->{status} == 200 && $audit_state->{restart_pending} eq '1',
++);
++my $audit_text = $json->encode($audit_response->{data});
++$check->(
++    'the audit response does not contain the value or a unit name',
++    index($audit_text, $MARKER) < 0 && index($audit_text, $CONSUMER) < 0,
++);
++$check->(
++    'GET does not change the storage file or the secret record while a restart is pending',
++    secret_files_state() eq $files_before_get,
++);
 +unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
 +chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n";
 +$consumer_before = unit_property($CONSUMER, 'InvocationID');
@@ -5647,6 +5686,10 @@ index 00000000..acd1e987
 +);
 +$check->('the consumer receives version 3', received() eq received_value('three'));
 +$check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
++$check->(
++    'GET reports restart_pending 0 after the retry of version 3',
++    secret_state($target, $FIELD)->{restart_pending} eq '0',
++);
 +$check_unrelated->('the failed restart and its retry');
 +
 +# The tests check an interrupted task and its recovery.
@@ -5672,6 +5715,10 @@ index 00000000..acd1e987
 +        secret_record($target, $FIELD)->{version} == $version
 +            && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
 +    );
++    $check->(
++        "GET reports restart_pending 1 after the stopped task of version $version",
++        secret_state($target, $FIELD)->{restart_pending} eq '1',
++    );
 +    unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
 +    wait_for_state($CONSUMER, 'active');
 +}
@@ -5686,6 +5733,10 @@ index 00000000..acd1e987
 +);
 +$check->('the consumer receives version 4', received() eq received_value('four'));
 +$check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
++$check->(
++    'GET reports restart_pending 0 after the retry of version 4',
++    secret_state($target, $FIELD)->{restart_pending} eq '0',
++);
 +$check_unrelated->('the interrupted task and its recovery');
 +
 +# The tests check a retry after an operator stops the consumer.
@@ -5715,6 +5766,37 @@ index 00000000..acd1e987
 +);
 +run_systemctl('start', $CONSUMER);
 +$check_unrelated->('the retry after an operator stop');
++
++# The tests check a recorded restart of a unit that the policy does not list anymore.
++
++HostArtifactsTest::write_file("$ROOT/state/fail", '');
++$status = set_secret($target, $FIELD, value('six'), 6);
++$check_match->(
++    'the request for version 6 fails when the consumer restart fails',
++    $status,
++    qr/systemctl restart \Q$CONSUMER\E failed/,
++);
++unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
++$secret_descriptor->{consumer_units} = [$OTHER_POLICY_UNIT];
++HostArtifactsTest::write_policy($document);
++$check->(
++    'GET reports restart_pending 0 when the policy does not list the recorded unit',
++    secret_state($target, $FIELD)->{restart_pending} eq '0'
++        && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
++);
++$secret_descriptor->{consumer_units} = [$CONSUMER];
++HostArtifactsTest::write_policy($document);
++$check->(
++    'GET reports restart_pending 1 when the policy lists the recorded unit again',
++    secret_state($target, $FIELD)->{restart_pending} eq '1',
++);
++$status = set_secret($target, $FIELD, value('six'), 6);
++$check->('a retry of version 6 succeeds', $status eq 'OK', $status);
++$check->(
++    'GET reports restart_pending 0 after the retry of version 6',
++    secret_state($target, $FIELD)->{restart_pending} eq '0',
++);
++$check_unrelated->('the recorded restart of an unlisted unit');
 +
 +# The stopped target keeps its journal and uses that journal to restore its files.
 +
