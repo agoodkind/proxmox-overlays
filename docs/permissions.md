@@ -216,7 +216,7 @@ Each method runs as root in `pvedaemon` on `{node}`. `{target}` is the lowercase
 
 ### Host policy
 
-The OpenTofu overlay module in `agoodkind/configs` writes the policy files over root SSH. The API cannot change them. A request reads only the policy file of its target, and the install method also reads the trusted root. A request fails with the path when a required file does not exist. An invalid policy file of another target does not change the result.
+The OpenTofu overlay module in `agoodkind/configs` writes the policy files over root SSH. The API cannot change them. A request reads only the policy file of its target. The install request does not read or check the trusted root. A request fails with the path when a required file does not exist. An invalid policy file of another target does not change the result.
 
 The installer relies on valid policy files and does not compare one target policy with another. Policy provisioning must reject two policies of one host that both list the same path in `directories[]`, even when their mode, owner, and group match. Policy provisioning must also reject a path that one policy lists in `directories[]` and another policy of the host lists in `parent_directories[]`. Policy provisioning must also reject policies when an owned directory of one target equals or contains a file, a secret `storage_path`, an owned directory, or an inspect-only parent of another target on the host. This requirement applies to implicit ancestors. The comparison uses clean absolute paths and matches whole path components. For example, `/etc/mwan` contains `/etc/mwan/a.conf` and does not contain `/etc/mwanctl`. Sibling directories of two targets stay valid. The physical host workspace or the operating system manages a directory that several targets use, and each of those targets lists it in `parent_directories[]`. Task 4 in `agoodkind/configs` implements and tests these checks.
 
@@ -251,25 +251,71 @@ Policy fields:
 | `parent_directories[]` | Optional. Each entry has the `path` of an inspect-only parent directory and may also have all three of `mode`, `owner`, and `group`. An install checks the directory and never creates or changes it. |
 | `files[]` | `path`, `mode`, `owner`, and `group` of each file that an archive may write |
 | `secret_fields[]` | Optional. `name`, `storage_path`, `mode`, `owner`, `group`, `pattern`, `min_length`, `max_length`, and `consumer_units` of each secret field |
+| `programs[]` | This optional JSON array defines the programs that the target may install. |
+
+A program is an executable that a target installs together with its configuration archive. Each program comes from its own repository and its own release archive.
+
+Each `programs[]` entry requires exactly the following keys, and the policy rejects unknown keys.
+
+| Key | Requirement |
+|---|---|
+| `name` | The value starts with a lowercase letter and contains only lowercase letters, digits, or `-` after that letter. Each name is unique within the policy. |
+| `repository` | The value specifies the repository that built the program archive, such as `agoodkind/mwan`. |
+| `workflow_uri` | The value specifies the complete workflow identity of the build, such as `https://github.com/agoodkind/mwan/.github/workflows/release.yml@refs/tags/v1.0.0`. |
+| `source_ref` | The value specifies the source ref of the build. |
+| `path` | The value specifies the absolute destination path of the executable and follows the same rules as other policy paths. Each path is unique within `programs`. |
+| `mode` | The value contains `0` followed by three octal digits. |
+| `owner` | The value specifies an account name. |
+| `group` | The value specifies a group account name. |
+| `max_archive_bytes` | The value is a positive integer. |
+| `max_bundle_bytes` | The value is a positive integer. |
+
+A program `path` cannot equal a policy file path, an owned directory, an inspect-only parent directory, or a secret `storage_path` of the same target.
 
 A policy rejects unknown fields. Each path is absolute, does not contain empty, `.`, or `..` components, and is outside `/etc/pve-overlay` and `/var/lib/pve-overlay`. A mode has the form `0` followed by three octal digits.
 
 ### Stage method
 
-The request has `kind` (`archive` or `bundle`), `offset`, `data`, and `stage`. `data` accepts at most 128 KiB of base64. Offset 0 creates a stage, and the request omits `stage`. Every other offset must equal the current stage length, and the request must include the stage. The response returns `stage`, 32 hexadecimal characters that the host chooses, and `length`.
+The request has `kind`, `offset`, `data`, and `stage`, with an optional `program` parameter.
 
-A stage belongs to the authenticated user, the target, and the kind. A chunk from another user or for another kind fails. A stage cannot exceed `max_archive_bytes` or `max_bundle_bytes`. Each stage call deletes stages of the same target that are older than one hour and that the journal does not list.
+The host accepts the following stage kinds.
+
+| `kind` | Content | `program` requirement |
+|---|---|---|
+| `archive` | The stage stores the configuration archive. | The request must omit `program`. |
+| `bundle` | The stage stores the attestation bundle of the configuration archive. | The request must omit `program`. |
+| `program` | The stage stores a program archive. | The request must include `program`. |
+| `program-bundle` | The stage stores the attestation bundle of a program archive. | The request must include `program`. |
+
+The `program` value specifies the name of an entry in the policy `programs`. The host rejects an unknown program name or a request that violates the `program` requirement for its kind.
+
+The `data` parameter accepts at most 128 KiB of base64. Offset 0 creates a stage, and the request omits `stage`. Every other offset must equal the current stage length, and the request must include `stage`. The response returns `stage`, 32 hexadecimal characters that the host chooses, and `length`.
+
+The stage record stores the authenticated user, target, kind, and program name. Each later chunk must match those values. The host rejects a chunk from another user or for another target, kind, or program.
+
+The host applies the following size limits.
+
+| `kind` | Size limit |
+|---|---|
+| `archive` | The host uses `max_archive_bytes` from `configuration`. |
+| `bundle` | The host uses `max_bundle_bytes` from `configuration`. |
+| `program` | The host uses `max_archive_bytes` from the program policy entry. |
+| `program-bundle` | The host uses `max_bundle_bytes` from the program policy entry. |
+
+Each stage call deletes stages of the same target that are older than one hour unless the journal lists them.
 
 ### Install method
 
-The request has `release-tag`, `asset`, `sha256`, `source-revision`, `archive-stage`, and `bundle-stage`. The method checks the policy, the node, and both stages, then starts a `hostartifact` task and returns its UPID. The task takes the target lock with a 10-second timeout and runs these steps:
+The request has `release-tag`, `asset`, `sha256`, `source-revision`, `archive-stage`, and `bundle-stage`. The optional `program-stages` parameter accepts a comma separated list of `<name>=<archive-stage>:<bundle-stage>` entries. Each entry specifies a program name and its archive and bundle stages.
 
-1. The task runs `/usr/bin/gh attestation verify` on the staged archive with `--hostname github.com`, `--repo`, `--cert-identity`, `--source-digest`, `--source-ref`, `--signer-digest` when the policy has `signer_digest`, `--deny-self-hosted-runners`, `--bundle`, `--custom-trusted-root`, and `--format json`. The environment contains only `HOME` and `GH_CONFIG_DIR`, both a new 0700 directory, and `GH_HOST=github.com`.
-2. The task requires a subject with the requested `asset` and `sha256` in every verified statement, and compares the SHA-256 of the staged archive with `sha256`.
-3. The task restores the files of an incomplete journal.
-4. The task checks the archive and the manifest.
+The method checks the policy, the node, and all stages in the request, then starts a `hostartifact` task and returns its UPID. The task takes the target lock with a 10-second timeout and runs these steps:
+
+1. The task restores the files of an incomplete journal without running `gh` or using the network. It then checks all stages in the request.
+2. The task checks that the trusted root exists and meets the trusted root ownership and mode rules. Journal restoration has already completed if this check or a later `gh` command fails.
+3. The task runs `/usr/bin/gh attestation verify` on the configuration archive with `--hostname github.com`, `--repo`, `--cert-identity`, `--source-digest`, `--source-ref`, `--signer-digest` when the policy has `signer_digest`, `--deny-self-hosted-runners`, `--bundle`, `--custom-trusted-root`, and `--format json`. The environment contains only `HOME` and `GH_CONFIG_DIR`, both set to the path of a new directory with mode `0700`, and `GH_HOST=github.com`. The task requires a subject with the requested `asset` and `sha256` in every verified statement and compares the SHA-256 of the archive with `sha256`. The task then checks the archive and the manifest.
+4. The task verifies each program archive separately under the checks in Program installation before writing the new files.
 5. The task writes the changed files and the installed record.
-6. The task deletes both stages.
+6. The task deletes the configuration archive stage, the configuration bundle stage, and all program stages in the request.
 
 The install task does not start, stop, restart, or reload a service.
 
@@ -280,7 +326,9 @@ The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<p
 - A member is missing, extra, or listed twice.
 - A member size or SHA-256 differs from the manifest.
 - The archive has data after its end marker or after the gzip stream.
-- The manifest has an unknown field, a `schema_version` other than 1, or a `repository`, `source_revision`, `workspace`, `node`, or `environment` that differs from the policy, the request, or the local node.
+- The host rejects a manifest that contains an unknown field, uses a `schema_version` other than 1 or 2, or specifies a `repository`, `source_revision`, `workspace`, `node`, or `environment` that differs from the policy, the request, or the local node.
+- The host rejects a schema 1 manifest that contains `programs`. It rejects a schema 2 manifest that omits the required `programs` array or uses another type for it. The array may be empty.
+- The host rejects the request before writing the new files if the names in the manifest `programs` and the names in `program-stages` differ.
 - A manifest file or directory does not equal a policy entry in `path`, `mode`, `owner`, and `group`.
 - The owner or group does not exist on the node.
 - A parent of a destination is not a directory. A parent that the manifest does not list as an owned directory and the policy does not list as an inspect-only parent does not exist, does not belong to root, or permits the group or other users to write to it.
@@ -291,6 +339,63 @@ The archive is a gzip POSIX ustar archive with `manifest.json` and one `files/<p
 The task compares each manifest file with the live file. A file with the same content, size, mode, owner, and group keeps its bytes and its `write_id`. The task writes each other file to a temporary file in the same directory, then renames it over the destination. It deletes each file of the earlier installed record that the manifest omits and that the policy lists. A manifest with an empty `files` list deletes every installed file of the target. An install that matches every live file writes only `installed.json`.
 
 The task writes a journal listing each planned temporary file, backup, and directory before the first change. The task links each existing destination to a backup before it replaces or deletes the destination. When a step fails, the task renames each backup over its destination, deletes each new file that did not exist before, deletes the temporary files, and deletes each directory it created if the directory is empty. The journal lists only owned directories. The task restores the previous owner or mode of an existing owned directory only when the transaction changed that value and the directory still has the value that the transaction set. The task then fails with the original error. When the restore also fails, the error contains both messages. When the task stops before it finishes, the journal remains. The next install of the target restores the files in the same way before it checks the new archive. When the journal is in the committed phase, the restore step instead writes the installed record from the journal and deletes the backups.
+
+### Program installation
+
+The following example specifies the `program-stages` value for `mwan`:
+
+```text
+mwan=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210
+```
+
+Each stage identifier contains exactly 32 lowercase hexadecimal characters. The host rejects `program-stages` entries in the following cases.
+
+- A program appears more than once.
+- A stage appears more than once anywhere in the request, including `archive-stage` and `bundle-stage`.
+- An archive stage does not have kind `program`, or a bundle stage does not have kind `program-bundle`.
+- The archive and bundle stages specify different programs, or either stage specifies a program other than the entry name.
+- Either stage belongs to another user or target.
+- The policy does not list the program.
+
+Each schema 2 manifest `programs` entry requires exactly the following keys, and the host checks each value.
+
+| Key | Requirement |
+|---|---|
+| `name` | The value specifies the program name. |
+| `repository` | The value equals `repository` in the program policy entry. |
+| `release_tag` | The value specifies the release tag of the program archive. |
+| `asset` | The value specifies the release asset of the program archive. |
+| `sha256` | The value contains 64 lowercase hexadecimal characters. |
+| `source_revision` | The value contains a 40-character source revision. |
+| `signer_revision` | The value contains a 40-character signer revision. |
+| `member` | The value specifies the archive member that the task installs. |
+| `member_sha256` | The value contains 64 lowercase hexadecimal characters. |
+| `path` | The value equals `path` in the program policy entry. The host rejects a path that equals a policy file path or a secret `storage_path` of the target. |
+| `mode` | The value equals `mode` in the program policy entry. |
+| `owner` | The value equals `owner` in the program policy entry, and the account exists on the node. |
+| `group` | The value equals `group` in the program policy entry, and the group exists on the node. |
+
+For each program archive, the task runs `/usr/bin/gh attestation verify` with the same options as configuration archive verification, except for the following values.
+
+| Option | Value |
+|---|---|
+| `--repo` | The task uses `repository` from the program policy entry. |
+| `--cert-identity` | The task uses `workflow_uri` from the program policy entry. |
+| `--source-ref` | The task uses `source_ref` from the program policy entry. |
+| `--source-digest` | The task uses `source_revision` from the manifest program entry. |
+| `--signer-digest` | The task uses `signer_revision` from the manifest program entry. |
+
+Every verified statement must contain a subject with the manifest program `asset` and `sha256`. The task also compares the SHA-256 of the program archive with that `sha256`.
+
+The task scans the whole program archive and requires exactly one regular member with the name in `member`. That member must have a SHA-256 equal to `member_sha256`. The task scans every other member, such as `README.md`, but does not install it.
+
+The task installs the selected member at `path` with the `mode`, `owner`, and `group` from the program policy entry. It writes a temporary file in the destination directory, creates a backup and journal entry before replacement, and renames the temporary file over the destination. The file has a `write_id` equal to the UPID of the writing task. If the live file already has identical content, size, mode, owner, and group, the task does not rewrite its bytes or change its `write_id`.
+
+The task deletes a program file when the earlier installed record lists the program and the new manifest omits it. The program policy path counts as a listed path for deletion.
+
+The journal also lists the program stages of the install. A failed install leaves all request stages in place until their one-hour expiry.
+
+A policy without `programs` is valid and defines a target without programs. A host with that policy processes requests as schema 1 did. It accepts schema 1 manifests, rejects the stage method's `program` parameter, rejects every `program-stages` entry because the policy does not list any programs, and returns an installed record without `programs`.
 
 ### Secret method
 
@@ -313,7 +418,9 @@ In every other case, the task records the version before it writes. When the sto
 
 ### Read method
 
-The response has `workspace`, `node`, `environment`, `state`, `installed`, `files`, `directories`, `observed_sha256`, and `secrets`. `secrets` has one entry for each secret field of the policy with `field`, `configured`, `restart_pending`, the recorded `version`, and the `sha256` of the storage file content. `restart_pending` is 1 when the secret record lists a consumer restart for a unit that the policy lists, and it is 0 otherwise. An entry does not list unit names. `configured` is 1 only when the storage file is a regular file with the `mode`, `owner`, and `group` of the policy. A storage file with other metadata has `configured` 0 and the SHA-256 of its actual content. An entry does not contain the value. `state` is `none` without an installed record, `interrupted` while the journal exists, and `committed` otherwise. `installed` is null without an installed record. Otherwise it has `release_tag`, `asset`, `sha256`, `source_revision`, `manifest_sha256`, `upid`, `user`, and `installed_at`.
+The response has `workspace`, `node`, `environment`, `state`, `installed`, `files`, `directories`, `observed_sha256`, and `secrets`. `secrets` has one entry for each secret field of the policy with `field`, `configured`, `restart_pending`, the recorded `version`, and the `sha256` of the storage file content. `restart_pending` is 1 when the secret record lists a consumer restart for a unit that the policy lists, and it is 0 otherwise. An entry does not list unit names. `configured` is 1 only when the storage file is a regular file with the `mode`, `owner`, and `group` of the policy. A storage file with other metadata has `configured` 0 and the SHA-256 of its actual content. An entry does not contain the value. `state` is `none` without an installed record, `interrupted` while the journal exists, and `committed` otherwise. The response returns `installed` as null when the target does not have an installed record. Otherwise, `installed` contains `release_tag`, `asset`, `sha256`, `source_revision`, `manifest_sha256`, `upid`, `user`, and `installed_at`. It contains a `programs` array only when the installed manifest lists at least one program. Each entry contains `name`, `repository`, `release_tag`, `asset`, `sha256`, `source_revision`, and `signer_revision`. A schema 1 install does not change the bytes of its installed record.
+
+The `files` array lists each installed program path with the same fields as other files. A target without an installed record lists only policy files and does not list policy program paths.
 
 `files` has one entry for each file of the installed record. Without a record, it has one entry for each policy file. Each entry has `path` and `present`, and the live `sha256`, `size`, `mode`, `owner`, `group`, `uid`, and `gid` of a present file. With a record, each entry also has `write_id` and `matches`. `matches` is 1 only when the live file has the recorded content, size, mode, owner, and group. `write_id` is the UPID of the task that last wrote the file.
 

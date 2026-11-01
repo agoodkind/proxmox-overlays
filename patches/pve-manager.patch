@@ -309,10 +309,10 @@ index 2f210903..0b780254 100644
              undef,
 diff --git a/PVE/API2/HostArtifacts.pm b/PVE/API2/HostArtifacts.pm
 new file mode 100644
-index 00000000..61369f61
+index 00000000..6681a74a
 --- /dev/null
 +++ b/PVE/API2/HostArtifacts.pm
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,469 @@
 +package PVE::API2::HostArtifacts;
 +
 +use strict;
@@ -333,6 +333,8 @@ index 00000000..61369f61
 +my $CHUNK_BASE64_MAX_LENGTH = 128 * 1024;
 +my $NAME_MAX_LENGTH = 255;
 +my $SECRET_VALUE_MAX_LENGTH = 512;
++my $PROGRAM_NAME_PATTERN = '[a-z][a-z0-9-]*';
++my $PROGRAM_STAGE_PATTERN = "$PROGRAM_NAME_PATTERN=[0-9a-f]{32}:[0-9a-f]{32}";
 +
 +my $target_property = {
 +    type => 'string',
@@ -462,8 +464,16 @@ index 00000000..61369f61
 +            target => $target_property,
 +            kind => {
 +                type => 'string',
-+                enum => ['archive', 'bundle'],
++                enum => ['archive', 'bundle', 'program', 'program-bundle'],
 +                description => 'The value identifies the content of the stage.',
++            },
++            program => {
++                type => 'string',
++                pattern => $PROGRAM_NAME_PATTERN,
++                optional => 1,
++                description => 'The value is the name of a program in the target policy. The'
++                    . ' kinds program and program-bundle require it. The kinds archive and'
++                    . ' bundle reject it.',
 +            },
 +            offset => {
 +                type => 'integer',
@@ -499,6 +509,7 @@ index 00000000..61369f61
 +            $param->{offset},
 +            $param->{data},
 +            $param->{stage},
++            $param->{program},
 +        );
 +    },
 +});
@@ -513,8 +524,9 @@ index 00000000..61369f61
 +    permissions => {
 +        check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Modify']],
 +    },
-+    description => 'The hostartifact task verifies a staged archive with its staged'
-+        . ' attestation bundle and installs its files.',
++    description => 'The hostartifact task restores an interrupted install, verifies a staged'
++        . ' archive and each program archive with their staged attestation bundles, and'
++        . ' installs the files and programs.',
 +    parameters => {
 +        additionalProperties => 0,
 +        properties => {
@@ -534,6 +546,13 @@ index 00000000..61369f61
 +            },
 +            'archive-stage' => $stage_property,
 +            'bundle-stage' => $stage_property,
++            'program-stages' => {
++                type => 'string',
++                pattern => "$PROGRAM_STAGE_PATTERN(?:,$PROGRAM_STAGE_PATTERN)*",
++                optional => 1,
++                description => 'The value lists the stages for each program as'
++                    . ' `<name>=<archive-stage>:<bundle-stage>` entries separated by commas.',
++            },
 +        },
 +    },
 +    returns => {
@@ -678,6 +697,25 @@ index 00000000..61369f61
 +                    upid => { type => 'string' },
 +                    user => { type => 'string' },
 +                    installed_at => { type => 'string' },
++                    programs => {
++                        type => 'array',
++                        optional => 1,
++                        description => 'The array has one entry for each program in the'
++                            . ' installed manifest. An installed record without programs does'
++                            . ' not have this field.',
++                        items => {
++                            type => 'object',
++                            properties => {
++                                name => { type => 'string' },
++                                repository => { type => 'string' },
++                                release_tag => { type => 'string' },
++                                asset => { type => 'string' },
++                                sha256 => { type => 'string' },
++                                source_revision => { type => 'string' },
++                                signer_revision => { type => 'string' },
++                            },
++                        },
++                    },
 +                },
 +            },
 +            files => {
@@ -1093,10 +1131,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..11302771
+index 00000000..d3a2b7df
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2009 @@
+@@ -0,0 +1,2307 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1158,9 +1196,16 @@ index 00000000..11302771
 +my $STATE_DIR_MODE = 0700;
 +
 +my $SCHEMA_VERSION = 1;
++my $PROGRAM_SCHEMA_VERSION = 2;
 +my $MANIFEST_MEMBER = 'manifest.json';
 +my $FILES_PREFIX = 'files/';
-+my $STAGE_KINDS = { archive => 'max_archive_bytes', bundle => 'max_bundle_bytes' };
++my $STAGE_KINDS = {
++    archive => 'max_archive_bytes',
++    bundle => 'max_bundle_bytes',
++    program => 'max_archive_bytes',
++    'program-bundle' => 'max_bundle_bytes',
++};
++my $PROGRAM_STAGE_KINDS = { program => 1, 'program-bundle' => 1 };
 +
 +my $TARGET_RE = qr/[0-9a-f]{64}/;
 +my $STAGE_RE = qr/[0-9a-f]{32}/;
@@ -1178,21 +1223,36 @@ index 00000000..11302771
 +my $SECRET_FIELD_RE = qr/[A-Z_][A-Z0-9_]{0,63}/;
 +my $UNIT_RE = qr/[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service/;
 +my $VERSION_RE = qr/[1-9][0-9]{0,15}/;
++my $PROGRAM_NAME_RE = qr/[a-z][a-z0-9-]*/;
 +
 +my $POLICY_KEYS = [
 +    qw(workspace node environment configuration directories parent_directories files
-+        secret_fields)
++        secret_fields programs)
 +];
 +my $SECRET_FIELD_KEYS =
 +    [qw(name storage_path mode owner group pattern min_length max_length consumer_units)];
++my $PROGRAM_KEYS = [
++    qw(name repository workflow_uri source_ref path mode owner group max_archive_bytes
++        max_bundle_bytes)
++];
 +my $CONFIGURATION_KEYS =
 +    [qw(repository workflow_uri source_ref signer_digest max_archive_bytes max_bundle_bytes)];
 +my $ENTRY_KEYS = [qw(path mode owner group)];
 +my $MANIFEST_KEYS =
 +    [qw(schema_version repository source_revision workspace node environment directories files)];
++my $MANIFEST_KEYS_BY_SCHEMA = {
++    $SCHEMA_VERSION => $MANIFEST_KEYS,
++    $PROGRAM_SCHEMA_VERSION => [@$MANIFEST_KEYS, 'programs'],
++};
 +my $MANIFEST_FILE_KEYS = [qw(member path size sha256 mode owner group)];
++my $MANIFEST_PROGRAM_KEYS = [
++    qw(name repository release_tag asset sha256 source_revision signer_revision member
++        member_sha256 path mode owner group)
++];
 +my $INSTALLED_KEYS =
 +    [qw(release_tag asset sha256 source_revision manifest_sha256 upid user installed_at)];
++my $INSTALLED_PROGRAM_KEYS =
++    [qw(name repository release_tag asset sha256 source_revision signer_revision)];
 +
 +my $json = JSON->new->utf8->canonical;
 +
@@ -1232,6 +1292,14 @@ index 00000000..11302771
 +    die "$label field '$key' is not a nonnegative integer\n"
 +        if ref($value) || $value !~ m/\A(0|[1-9][0-9]{0,15})\z/;
 +    return $1 + 0;
++};
++
++my $check_positive_count = sub {
++    my ($hash, $key, $label) = @_;
++
++    my $value = $check_count->($hash, $key, $label);
++    die "$label field '$key' is not a positive integer\n" if $value < 1;
++    return $value;
 +};
 +
 +my $random_hex = sub {
@@ -1453,6 +1521,44 @@ index 00000000..11302771
 +    return $fields;
 +};
 +
++my $check_programs = sub {
++    my ($list, $label, $reserved, $target) = @_;
++
++    die "$label is not a JSON array\n" if ref($list) ne 'ARRAY';
++    my $programs = {};
++    my $paths = {};
++    for my $index (0 .. $#$list) {
++        my $raw = $list->[$index];
++        my $entry_label = "$label\[$index\]";
++        $check_keys->($raw, $PROGRAM_KEYS, $entry_label);
++        my $name = $check_string->($raw, 'name', $PROGRAM_NAME_RE, $entry_label);
++        die "$label lists the program $name more than once\n" if $programs->{$name};
++        my $path = $check_destination->($raw->{path}, "$entry_label path");
++        die "$label lists the path $path more than once\n" if $paths->{$path}++;
++        die "$entry_label path $path is also a policy file, a policy directory, or a secret"
++            . " storage path\n"
++            if $reserved->{$path};
++
++        $programs->{$name} = {
++            target => $target,
++            name => $name,
++            repository => $check_string->($raw, 'repository', $REPOSITORY_RE, $entry_label),
++            workflow_uri =>
++                $check_string->($raw, 'workflow_uri', $WORKFLOW_URI_RE, $entry_label),
++            source_ref => $check_string->($raw, 'source_ref', $SOURCE_REF_RE, $entry_label),
++            path => $path,
++            mode => $check_string->($raw, 'mode', $MODE_RE, $entry_label),
++            owner => $check_string->($raw, 'owner', $ACCOUNT_RE, $entry_label),
++            group => $check_string->($raw, 'group', $ACCOUNT_RE, $entry_label),
++            max_archive_bytes =>
++                $check_positive_count->($raw, 'max_archive_bytes', $entry_label),
++            max_bundle_bytes =>
++                $check_positive_count->($raw, 'max_bundle_bytes', $entry_label),
++        };
++    }
++    return $programs;
++};
++
 +sub policy_path {
 +    my ($target) = @_;
 +
@@ -1484,6 +1590,7 @@ index 00000000..11302771
 +    my $configuration_label = "$label configuration";
 +    $check_keys->($configuration, $CONFIGURATION_KEYS, $configuration_label);
 +    my $checked_configuration = {
++        target => $target,
 +        repository => $check_string->(
 +            $configuration, 'repository', $REPOSITORY_RE, $configuration_label,
 +        ),
@@ -1525,6 +1632,13 @@ index 00000000..11302771
 +        $files,
 +        { %$directories, %$parents },
 +    );
++    my $reserved = { %$files, %$directories, %$parents };
++    for my $field (values %$secret_fields) {
++        $reserved->{ $field->{path} } = $field;
++    }
++    my $programs = $check_programs->(
++        $document->{programs} // [], "$label programs", $reserved, $target,
++    );
 +
 +    return {
 +        target => $target,
@@ -1537,6 +1651,7 @@ index 00000000..11302771
 +        parents => $parents,
 +        files => $files,
 +        secret_fields => $secret_fields,
++        programs => $programs,
 +    };
 +}
 +
@@ -1637,10 +1752,14 @@ index 00000000..11302771
 +        || !defined($record->{user})
 +        || !defined($record->{kind})
 +        || !defined($record->{created});
++    die "the stage record $record_path is not valid\n"
++        if $PROGRAM_STAGE_KINDS->{ $record->{kind} }
++        && (!defined($record->{program}) || ($record->{target} // '') ne $target);
 +    return {
 +        stage => $stage,
 +        user => $record->{user},
 +        kind => $record->{kind},
++        program => $record->{program},
 +        created => $record->{created},
 +        data_path => $stage_dir->($target) . "/$stage",
 +        record_path => $record_path,
@@ -1657,12 +1776,14 @@ index 00000000..11302771
 +};
 +
 +sub check_stage {
-+    my ($target, $stage, $user, $kind) = @_;
++    my ($target, $stage, $user, $kind, $program) = @_;
 +
 +    my $record = $read_stage_record->($target, $stage);
 +    die "stage $stage does not exist for this target\n" if !$record;
 +    die "stage $stage belongs to another user\n" if $record->{user} ne $user;
 +    die "stage $stage has the kind $record->{kind}, not $kind\n" if $record->{kind} ne $kind;
++    die "stage $stage belongs to another program\n"
++        if ($record->{program} // '') ne ($program // '');
 +    $stage_length->($record);
 +    return $record;
 +}
@@ -1690,6 +1811,7 @@ index 00000000..11302771
 +        if ref($journal) ne 'HASH'
 +        || ref($journal->{files}) ne 'ARRAY'
 +        || ref($journal->{directories}) ne 'ARRAY'
++        || ref($journal->{program_stages} // []) ne 'ARRAY'
 +        || !defined($journal->{phase});
 +    return $journal;
 +};
@@ -1704,6 +1826,10 @@ index 00000000..11302771
 +    if ($journal) {
 +        for my $key (qw(archive_stage bundle_stage)) {
 +            $referenced->{ $journal->{$key} } = 1 if defined($journal->{$key});
++        }
++        for my $reference (@{ $journal->{program_stages} // [] }) {
++            $referenced->{ $reference->{archive_stage} } = 1;
++            $referenced->{ $reference->{bundle_stage} } = 1;
 +        }
 +    }
 +
@@ -1731,16 +1857,35 @@ index 00000000..11302771
 +    close($handle) or die "cannot close $path: $!\n";
 +};
 +
-+sub stage_chunk {
-+    my ($target, $user, $kind, $offset, $data, $stage) = @_;
++my $program_entry = sub {
++    my ($policy, $program) = @_;
 +
-+    die "the stage kind is not archive or bundle\n"
++    my $entry = $policy->{programs}->{$program};
++    die "the policy of this target does not list the program $program\n" if !$entry;
++    return $entry;
++};
++
++my $stage_limits = sub {
++    my ($policy, $kind, $program) = @_;
++
++    if (!$PROGRAM_STAGE_KINDS->{$kind}) {
++        die "the kind $kind rejects parameter 'program'\n" if defined($program);
++        return $policy->{configuration};
++    }
++    die "the kind $kind requires parameter 'program'\n" if !defined($program);
++    return $program_entry->($policy, $program);
++};
++
++sub stage_chunk {
++    my ($target, $user, $kind, $offset, $data, $stage, $program) = @_;
++
++    die "the stage kind is not archive, bundle, program, or program-bundle\n"
 +        if !defined($kind) || !$STAGE_KINDS->{$kind};
-+    $kind = $untaint->($kind, qr/archive|bundle/, 'kind');
++    $kind = $untaint->($kind, qr/archive|bundle|program|program-bundle/, 'kind');
 +    $offset = $untaint->($offset, qr/[0-9]{1,16}/, 'offset') + 0;
 +    my $policy = load_policy($target);
 +    check_node($policy);
-+    my $limit = $policy->{configuration}->{ $STAGE_KINDS->{$kind} };
++    my $limit = $stage_limits->($policy, $kind, $program)->{ $STAGE_KINDS->{$kind} };
 +    die "parameter 'data' is not valid base64\n" if $data !~ m/\A$BASE64_RE\z/;
 +    my $bytes = decode_base64($data);
 +
@@ -1756,16 +1901,17 @@ index 00000000..11302771
 +                die "the $kind is larger than $limit bytes\n" if length($bytes) > $limit;
 +                my $new_stage = substr($random_hex->(), 0, 32);
 +                my $record_path = $stage_dir->($policy->{target}) . "/$new_stage.json";
-+                $write_file_atomic->(
-+                    $record_path,
-+                    $json->encode({ user => $user, kind => $kind, created => time() }),
-+                    $STATE_FILE_MODE,
-+                );
++                my $fields = { user => $user, kind => $kind, created => time() };
++                if ($PROGRAM_STAGE_KINDS->{$kind}) {
++                    $fields->{target} = $policy->{target};
++                    $fields->{program} = $program;
++                }
++                $write_file_atomic->($record_path, $json->encode($fields), $STATE_FILE_MODE);
 +                $record = $read_stage_record->($policy->{target}, $new_stage);
 +                $append_chunk->($record->{data_path}, $bytes, O_WRONLY | O_CREAT | O_EXCL);
 +            } else {
 +                die "parameter 'stage' is required at offset $offset\n" if !defined($stage);
-+                $record = check_stage($policy->{target}, $stage, $user, $kind);
++                $record = check_stage($policy->{target}, $stage, $user, $kind, $program);
 +                my $length = $stage_length->($record);
 +                die "offset $offset does not equal the stage length $length\n"
 +                    if $offset != $length;
@@ -1831,18 +1977,18 @@ index 00000000..11302771
 +    return ($status, $stdout, $stderr);
 +};
 +
-+# The function runs gh attestation verify offline with the policy identity, the trusted root,
-+# and the bundle. Every verified statement must have a subject with the requested asset name
-+# and SHA-256, and the SHA-256 of the archive must equal the request.
++# The function runs gh attestation verify offline with the identity, the trusted root, and the
++# bundle. The identity uses the policy configuration or a policy program entry. For a program,
++# signer_digest comes from the manifest entry. Every verified statement must have a subject with
++# the requested asset name and SHA-256. The archive SHA-256 must match the request SHA-256.
 +sub verify_attestation {
-+    my ($policy, $request, $archive_path, $bundle_path) = @_;
++    my ($identity, $request, $archive_path, $bundle_path) = @_;
 +
-+    my $configuration = $policy->{configuration};
 +    die "the trusted root $TRUSTED_ROOT_FILE does not exist\n" if !-e $TRUSTED_ROOT_FILE;
 +    $check_root_owned->($TRUSTED_ROOT_FILE);
 +
-+    $ensure_target_dir->($policy->{target});
-+    my $work_dir = $target_dir->($policy->{target}) . '/work-' . $random_hex->();
++    $ensure_target_dir->($identity->{target});
++    my $work_dir = $target_dir->($identity->{target}) . '/work-' . $random_hex->();
 +    mkdir($work_dir, $STATE_DIR_MODE) or die "cannot create $work_dir: $!\n";
 +
 +    # gh accepts a bundle only in a file that ends in .json or .jsonl.
@@ -1850,13 +1996,13 @@ index 00000000..11302771
 +    my @arguments = (
 +        'attestation', 'verify', $archive_path,
 +        '--hostname', $GH_HOST,
-+        '--repo', $configuration->{repository},
-+        '--cert-identity', $configuration->{workflow_uri},
++        '--repo', $identity->{repository},
++        '--cert-identity', $identity->{workflow_uri},
 +        '--source-digest', $request->{source_revision},
-+        '--source-ref', $configuration->{source_ref},
++        '--source-ref', $identity->{source_ref},
 +    );
-+    push @arguments, '--signer-digest', $configuration->{signer_digest}
-+        if defined($configuration->{signer_digest});
++    push @arguments, '--signer-digest', $identity->{signer_digest}
++        if defined($identity->{signer_digest});
 +    push @arguments,
 +        '--deny-self-hosted-runners',
 +        '--bundle', $bundle_copy,
@@ -1864,7 +2010,7 @@ index 00000000..11302771
 +        '--format', 'json';
 +
 +    my ($status, $stdout, $stderr) = eval {
-+        my $bundle = $read_limited->($bundle_path, $configuration->{max_bundle_bytes});
++        my $bundle = $read_limited->($bundle_path, $identity->{max_bundle_bytes});
 +        sysopen(my $handle, $bundle_copy, O_WRONLY | O_CREAT | O_EXCL, $STATE_FILE_MODE)
 +            or die "cannot create $bundle_copy: $!\n";
 +        $write_all->($handle, $bundle, $bundle_copy);
@@ -2063,6 +2209,65 @@ index 00000000..11302771
 +        if $actual ne $expected;
 +};
 +
++# The function checks the programs of a manifest against the request and the policy. The
++# manifest and the program stages of the request must list the same programs. Each program
++# gets a file entry with the path, mode, owner, group, member, and SHA-256 of its executable.
++my $check_manifest_programs = sub {
++    my ($policy, $request, $list) = @_;
++
++    my $label = 'the manifest programs';
++    die "$label field is not a JSON array\n" if ref($list) ne 'ARRAY';
++    my $reserved = { %{ $policy->{files} } };
++    for my $field (values %{ $policy->{secret_fields} }) {
++        $reserved->{ $field->{path} } = $field;
++    }
++    my $staged = { map { $_->{name} => 1 } @{ $request->{program_stages} // [] } };
++
++    my $programs = {};
++    for my $index (0 .. $#$list) {
++        my $raw = $list->[$index];
++        my $entry_label = "$label\[$index\]";
++        $check_keys->($raw, $MANIFEST_PROGRAM_KEYS, $entry_label);
++        my $name = $check_string->($raw, 'name', $PROGRAM_NAME_RE, $entry_label);
++        die "the manifest lists the program $name more than once\n" if $programs->{$name};
++        die "the manifest lists the program $name, and the request does not have a stage for"
++            . " it\n"
++            if !$staged->{$name};
++        my $file = $check_entry->({ map { $_ => $raw->{$_} } @$ENTRY_KEYS }, $entry_label);
++        die "the path $file->{path} of the program $name matches a file path or a secret"
++            . " storage path of this target\n"
++            if $reserved->{ $file->{path} };
++        my $allowed = $program_entry->($policy, $name);
++        $compare_field->(
++            "repository of the program $name", $raw->{repository}, $allowed->{repository},
++        );
++        die "the program $name does not match the path, mode, owner, and group in the policy\n"
++            if !$same_entry->($file, $allowed);
++
++        my $member = $check_string->($raw, 'member', qr/[^\0]+/, $entry_label);
++        $file->{member} = $check_member_name->($member);
++        $file->{sha256} = $check_string->($raw, 'member_sha256', $SHA256_RE, $entry_label);
++        @$file{qw(uid gid)} = $account_ids->($file->{owner}, $file->{group});
++        $programs->{$name} = {
++            name => $name,
++            repository => $allowed->{repository},
++            release_tag => $check_string->($raw, 'release_tag', $NAME_RE, $entry_label),
++            asset => $check_string->($raw, 'asset', $NAME_RE, $entry_label),
++            sha256 => $check_string->($raw, 'sha256', $SHA256_RE, $entry_label),
++            source_revision =>
++                $check_string->($raw, 'source_revision', $REVISION_RE, $entry_label),
++            signer_revision =>
++                $check_string->($raw, 'signer_revision', $REVISION_RE, $entry_label),
++            file => $file,
++        };
++    }
++    for my $name (sort keys %$staged) {
++        die "the request has a stage for the program $name, and the manifest does not list it\n"
++            if !$programs->{$name};
++    }
++    return $programs;
++};
++
 +# The function validates the manifest against the request, the policy, and the local node.
 +# It validates the archive members against the manifest. The function does not write a file.
 +sub validate_archive {
@@ -2085,11 +2290,12 @@ index 00000000..11302771
 +    my $manifest = eval { $json->decode($manifest_content) };
 +    die "$MANIFEST_MEMBER is not valid JSON: $@" if $@;
 +    my $label = 'the manifest';
-+    $check_keys->($manifest, $MANIFEST_KEYS, $label);
-+    die "the manifest schema_version is not $SCHEMA_VERSION\n"
-+        if !defined($manifest->{schema_version})
-+        || ref($manifest->{schema_version})
-+        || "$manifest->{schema_version}" ne "$SCHEMA_VERSION";
++    my $version = ref($manifest) eq 'HASH' ? $manifest->{schema_version} : undef;
++    my $manifest_keys;
++    $manifest_keys = $MANIFEST_KEYS_BY_SCHEMA->{$version} if defined($version) && !ref($version);
++    $check_keys->($manifest, $manifest_keys // $MANIFEST_KEYS, $label);
++    die "the manifest schema_version is neither $SCHEMA_VERSION nor $PROGRAM_SCHEMA_VERSION\n"
++        if !$manifest_keys;
 +
 +    $compare_field->(
 +        'repository', $manifest->{repository}, $policy->{configuration}->{repository},
@@ -2162,11 +2368,33 @@ index 00000000..11302771
 +            if $actual->{sha256} ne $expected->{sha256};
 +    }
 +
++    my $program_list = [];
++    $program_list = $manifest->{programs} if "$version" eq "$PROGRAM_SCHEMA_VERSION";
 +    return {
 +        manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
 +        directories => $directories,
 +        files => $files,
++        programs => $check_manifest_programs->($policy, $request, $program_list),
 +    };
++}
++
++# The function scans the complete program archive and requires exactly one regular member with
++# the member name and SHA-256 in the manifest. It adds the archive path and the member size to
++# the file entry of the program.
++sub check_program_archive {
++    my ($program, $archive_path) = @_;
++
++    my $file = $program->{file};
++    my $members = scan_archive($archive_path, sub { return undef });
++    my ($member) = grep { $_->{name} eq $file->{member} } @$members;
++    die "the archive of the program $program->{name} does not contain the member"
++        . " '$file->{member}'\n"
++        if !$member;
++    die "the member '$file->{member}' of the program $program->{name} has SHA-256"
++        . " $member->{sha256}, and the manifest lists $file->{sha256}\n"
++        if $member->{sha256} ne $file->{sha256};
++    $file->{size} = $member->{size};
++    $file->{archive_path} = $archive_path;
 +}
 +
 +# The function returns the live state of the path without following a symbolic link at the
@@ -2487,14 +2715,24 @@ index 00000000..11302771
 +
 +# The function returns the file actions and the installed file records. A file that matches
 +# the manifest keeps its earlier write_id. Every changed file gets the UPID of this task as
-+# its write_id.
++# its write_id. The function adds each program as a file entry for the executable member in its
++# own archive.
 +my $plan_files = sub {
 +    my ($policy, $validated, $previous_files, $declared, $upid) = @_;
 +
++    my $wanted = { %{ $validated->{files} } };
++    for my $program (values %{ $validated->{programs} }) {
++        $wanted->{ $program->{file}->{path} } = $program->{file};
++    }
++    my $listed = { %{ $policy->{files} } };
++    for my $program (values %{ $policy->{programs} }) {
++        $listed->{ $program->{path} } = $program;
++    }
++
 +    my $files = [];
 +    my $records = [];
-+    for my $path (sort keys %{ $validated->{files} }) {
-+        my $desired = $validated->{files}->{$path};
++    for my $path (sort keys %$wanted) {
++        my $desired = $wanted->{$path};
 +        $check_ancestors->($path, $declared, $policy->{parents});
 +        my $observation = observe_file($path);
 +        die "$path exists and is not a regular file\n"
@@ -2522,8 +2760,8 @@ index 00000000..11302771
 +    }
 +
 +    for my $path (sort keys %$previous_files) {
-+        next if $validated->{files}->{$path};
-+        if (!$policy->{files}->{$path}) {
++        next if $wanted->{$path};
++        if (!$listed->{$path}) {
 +            print "kept $path because the policy does not list it\n";
 +            next;
 +        }
@@ -2562,8 +2800,10 @@ index 00000000..11302771
 +        print "prepared the directory $entry->{path}\n";
 +    }
 +
-+    my $by_member = {};
-+    my $handles = {};
++    # The function reads each program file from its own archive and every other file from
++    # $archive_path.
++    my $by_source = { $archive_path => {} };
++    my $writes = [];
 +    for my $entry (grep { $_->{action} eq 'replace' } @$files) {
 +        sysopen(
 +            my $handle,
@@ -2571,21 +2811,26 @@ index 00000000..11302771
 +            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
 +            $STATE_FILE_MODE,
 +        ) or die "cannot create $entry->{temporary}: $!\n";
-+        $handles->{ $entry->{member} } = $handle;
-+        $by_member->{ $entry->{member} } = $entry;
++        my $write = { entry => $entry, handle => $handle };
++        my $source = $entry->{desired}->{archive_path} // $archive_path;
++        $by_source->{$source}->{ $entry->{member} } = $write;
++        push @$writes, $write;
 +    }
-+    scan_archive(
-+        $archive_path,
-+        sub {
-+            my ($member) = @_;
-+            my $entry = $by_member->{ $member->{name} } or return undef;
-+            my $handle = $handles->{ $member->{name} };
-+            return sub { $write_all->($handle, $_[0], $entry->{temporary}) };
-+        },
-+    );
-+    for my $member (sort keys %$by_member) {
-+        my $entry = $by_member->{$member};
-+        my $handle = $handles->{$member};
++    for my $source (sort keys %$by_source) {
++        my $by_member = $by_source->{$source};
++        scan_archive(
++            $source,
++            sub {
++                my ($member) = @_;
++                my $write = $by_member->{ $member->{name} } or return undef;
++                return sub {
++                    $write_all->($write->{handle}, $_[0], $write->{entry}->{temporary});
++                };
++            },
++        );
++    }
++    for my $write (@$writes) {
++        my ($entry, $handle) = @$write{qw(entry handle)};
 +        my $desired = $entry->{desired};
 +        $handle->sync() or die "cannot sync $entry->{temporary}: $!\n";
 +        chown($desired->{uid}, $desired->{gid}, $handle)
@@ -2656,6 +2901,15 @@ index 00000000..11302771
 +        ],
 +        files => $records,
 +    };
++    my @program_names = sort keys %{ $validated->{programs} };
++    if (@program_names) {
++        $installed->{programs} = [];
++        for my $name (@program_names) {
++            my $program = $validated->{programs}->{$name};
++            push @{ $installed->{programs} },
++                { map { $_ => $program->{$_} } @$INSTALLED_PROGRAM_KEYS };
++        }
++    }
 +
 +    if (!@$files && !@$directories) {
 +        $write_file_atomic->(
@@ -2670,6 +2924,7 @@ index 00000000..11302771
 +        upid => $upid,
 +        archive_stage => $request->{archive_stage},
 +        bundle_stage => $request->{bundle_stage},
++        program_stages => $request->{program_stages},
 +        directories => $journal_copy->($directories),
 +        files => $journal_copy->($files),
 +    };
@@ -2696,17 +2951,88 @@ index 00000000..11302771
 +    return $installed;
 +};
 +
++# The function validates the program stages in the request and returns the archive and bundle
++# stage records of each program. It rejects repeated programs and repeated stages, including
++# stages in archive-stage and bundle-stage.
++my $check_program_stages = sub {
++    my ($policy, $request, $user) = @_;
++
++    my $target = $policy->{target};
++    my $stages = { map { $_ => 1 } @$request{qw(archive_stage bundle_stage)} };
++    my $records = {};
++    for my $reference (@{ $request->{program_stages} // [] }) {
++        my $name = $program_entry->($policy, $reference->{name})->{name};
++        die "parameter 'program-stages' lists the program $name more than once\n"
++            if $records->{$name};
++        for my $stage (@$reference{qw(archive_stage bundle_stage)}) {
++            die "the request references the stage $stage more than once\n"
++                if $stages->{$stage}++;
++        }
++        $records->{$name} = {
++            archive => check_stage($target, $reference->{archive_stage}, $user, 'program', $name),
++            bundle =>
++                check_stage($target, $reference->{bundle_stage}, $user, 'program-bundle', $name),
++        };
++    }
++    return $records;
++};
++
++# The function verifies each complete program archive offline with the signer revision of its
++# manifest entry, and then checks the executable member. It does not write a target file.
++my $verify_programs = sub {
++    my ($policy, $validated, $stages) = @_;
++
++    for my $name (sort keys %{ $validated->{programs} }) {
++        my $program = $validated->{programs}->{$name};
++        my $archive_path = $stages->{$name}->{archive}->{data_path};
++        verify_attestation(
++            { %{ $policy->{programs}->{$name} }, signer_digest => $program->{signer_revision} },
++            $program,
++            $archive_path,
++            $stages->{$name}->{bundle}->{data_path},
++        );
++        print "gh attestation verify accepted $program->{asset} with SHA-256"
++            . " $program->{sha256}\n";
++        check_program_archive($program, $archive_path);
++    }
++};
++
 +# The function restores an incomplete journal, validates an archive that verify_attestation
-+# accepted, and installs its files. The caller acquires the target lock before calling it.
++# accepted, verifies each program archive, and installs the files and programs. It deletes the
++# program stages after a successful install. The caller acquires the target lock before calling
++# it.
 +sub install_verified_archive {
 +    my ($policy, $request, $archive_path, $upid, $user) = @_;
 +
 +    check_node($policy);
 +    $ensure_target_dir->($policy->{target});
 +    recover($policy->{target});
++    my $stages = $check_program_stages->($policy, $request, $user);
 +    my $validated = validate_archive($policy, $request, $archive_path);
-+    return $apply_archive->($policy, $request, $archive_path, $validated, $upid, $user);
++    $verify_programs->($policy, $validated, $stages);
++    my $installed = $apply_archive->($policy, $request, $archive_path, $validated, $upid, $user);
++    for my $name (sort keys %$stages) {
++        $remove_stage->($stages->{$name}->{archive});
++        $remove_stage->($stages->{$name}->{bundle});
++    }
++    return $installed;
 +}
++
++my $parse_program_stages = sub {
++    my ($value) = @_;
++
++    return [] if !defined($value);
++    my @entries = split(m/,/, $value, -1);
++    die "parameter 'program-stages' is empty\n" if !@entries;
++    my $references = [];
++    for my $entry (@entries) {
++        die "entry '$entry' of parameter 'program-stages' does not match the form"
++            . " `<name>=<archive-stage>:<bundle-stage>`\n"
++            if $entry !~ m/\A($PROGRAM_NAME_RE)=($STAGE_RE):($STAGE_RE)\z/;
++        push @$references, { name => $1, archive_stage => $2, bundle_stage => $3 };
++    }
++    return $references;
++};
 +
 +# The function checks the install parameters before the API starts a worker.
 +sub check_install_request {
@@ -2714,7 +3040,6 @@ index 00000000..11302771
 +
 +    my $policy = load_policy($target);
 +    check_node($policy);
-+    die "the trusted root $TRUSTED_ROOT_FILE does not exist\n" if !-e $TRUSTED_ROOT_FILE;
 +    my $request = {
 +        release_tag => $untaint->($param->{'release-tag'}, $NAME_RE, 'release-tag'),
 +        asset => $untaint->($param->{asset}, $NAME_RE, 'asset'),
@@ -2723,14 +3048,18 @@ index 00000000..11302771
 +            $untaint->($param->{'source-revision'}, $REVISION_RE, 'source-revision'),
 +        archive_stage => $untaint->($param->{'archive-stage'}, $STAGE_RE, 'archive-stage'),
 +        bundle_stage => $untaint->($param->{'bundle-stage'}, $STAGE_RE, 'bundle-stage'),
++        program_stages => $parse_program_stages->($param->{'program-stages'}),
 +    };
 +    check_stage($policy->{target}, $request->{archive_stage}, $user, 'archive');
 +    check_stage($policy->{target}, $request->{bundle_stage}, $user, 'bundle');
++    $check_program_stages->($policy, $request, $user);
 +    return $request;
 +}
 +
-+# The function runs one install in a task worker. The worker verifies the staged archive with
-+# gh, validates and installs it, and deletes the two stages.
++# The function runs one install in a task worker. The worker first restores an incomplete
++# journal without running gh or using the network. It then verifies the staged archive with gh,
++# verifies each program archive, installs the files and programs, and deletes the request stages
++# after a successful install.
 +sub install {
 +    my ($target, $request, $upid, $user) = @_;
 +
@@ -2739,18 +3068,24 @@ index 00000000..11302771
 +    return with_target_lock(
 +        $policy->{target},
 +        sub {
++            $ensure_target_dir->($policy->{target});
++            recover($policy->{target});
 +            my $archive =
 +                check_stage($policy->{target}, $request->{archive_stage}, $user, 'archive');
 +            my $bundle =
 +                check_stage($policy->{target}, $request->{bundle_stage}, $user, 'bundle');
-+            verify_attestation($policy, $request, $archive->{data_path}, $bundle->{data_path});
++            $check_program_stages->($policy, $request, $user);
++            verify_attestation(
++                $policy->{configuration}, $request, $archive->{data_path}, $bundle->{data_path},
++            );
 +            print "gh attestation verify accepted $request->{asset} with SHA-256"
 +                . " $request->{sha256}\n";
 +            my $installed = install_verified_archive(
 +                $policy, $request, $archive->{data_path}, $upid, $user,
 +            );
-+            $remove_stage->($archive);
-+            $remove_stage->($bundle);
++            for my $record ($archive, $bundle) {
++                $remove_stage->($record);
++            }
 +            return $installed;
 +        },
 +    );
@@ -3092,6 +3427,7 @@ index 00000000..11302771
 +
 +    my $installed_fields = undef;
 +    $installed_fields = { map { $_ => $installed->{$_} } @$INSTALLED_KEYS } if $installed;
++    $installed_fields->{programs} = $installed->{programs} if $installed && $installed->{programs};
 +    return {
 +        workspace => $policy->{workspace},
 +        node => $policy->{node},
@@ -3490,18 +3826,20 @@ index 00000000..f4962a65
 +1;
 diff --git a/test/HostArtifacts_attestation_test.pl b/test/HostArtifacts_attestation_test.pl
 new file mode 100755
-index 00000000..64dcdc1f
+index 00000000..9f9ab0b8
 --- /dev/null
 +++ b/test/HostArtifacts_attestation_test.pl
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,916 @@
 +#!/usr/bin/perl -T
 +
-+# The test runs the installed /usr/bin/gh with the host artifact module against a real attested
-+# release asset. HOST_ARTIFACT_FIXTURE_DIR must contain configsctl_linux_amd64.tar.gz from the
-+# configsctl release 202610300043-29-7976a64, its bundle from gh attestation download as
-+# configsctl_linux_amd64.tar.gz.sigstore.jsonl, and trusted_root.jsonl from
++# The test runs the installed /usr/bin/gh with the host artifact module against real attested
++# release assets. HOST_ARTIFACT_FIXTURE_DIR must contain configsctl_linux_amd64.tar.gz from the
++# configsctl release 202610300043-29-7976a64, opnsensectl_linux_amd64.tar.gz from the opnsensectl
++# release 202609190337-7-7db20fb, and mwan_linux_amd64.tar.gz from the mwan release
++# 202610291257-ff-c09e62f. Each archive needs its bundle from gh attestation download as
++# <asset>.sigstore.jsonl, and the directory needs trusted_root.jsonl from
 +# gh attestation trusted-root. The test writes below /etc/pve-overlay, /var/lib/pve-overlay,
-+# and /srv and must run as root in a disposable container.
++# and /srv and must run as root in a disposable container without network access.
 +
 +use strict;
 +use warnings;
@@ -3510,6 +3848,9 @@ index 00000000..64dcdc1f
 +
 +use Digest::SHA;
 +use File::Path qw(make_path remove_tree);
++use MIME::Base64 qw(encode_base64);
++use POSIX qw();
++use Time::HiRes qw();
 +
 +use PVE::HostArtifacts;
 +use PVE::RPCEnvironment;
@@ -3529,6 +3870,44 @@ index 00000000..64dcdc1f
 +my $WRONG_REF = 'refs/heads/other';
 +my $WORK = '/srv/host-artifacts-attestation-work';
 +my $TOKEN = 'deploy@pve!install';
++my $STATE_DIR = '/var/lib/pve-overlay/host-artifacts';
++my $CHUNK_BYTES = 96 * 1024;
++my $PROGRAM_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
++my $PROGRAM_MAX_BUNDLE_BYTES = 1024 * 1024;
++my $INTERRUPT_FILE_COUNT = 300;
++my $INTERRUPT_ATTEMPTS = 5;
++my $INTERRUPT_TIMEOUT_SECONDS = 120;
++my $POLL_SECONDS = 0.0005;
++my $NETWORK_DEVICE_DIR = '/sys/class/net';
++my $DEVICE_UP_FLAG = 0x1;
++my $GH_REJECTS = qr/gh attestation verify exited with code [1-9]/;
++my $WANCONFIG_ASSET = 'wanconfig-stack_linux_amd64.tar.gz';
++my $WANCONFIG_SHA256 = '60bf467c9601f612785e2d6fb6f973258fd94af05311e89df87deacf72e1b0c8';
++my $INSTALLED_PROGRAM_FIELDS =
++    [qw(repository release_tag asset sha256 source_revision signer_revision)];
++my $PROGRAMS = {
++    mwan => {
++        repository => 'agoodkind/mwan',
++        release_tag => '202610291257-ff-c09e62f',
++        asset => 'mwan_linux_amd64.tar.gz',
++        sha256 => '46f00098244c808dbf5bad67890632b36deda47fa6c5a1f463c75fb4f436b94d',
++        source_revision => 'c09e62f7e0d61526c91183734bf28c6934accded',
++        signer_revision => '4e9b31f5b944594bb74e316aefa49093b5abd865',
++        member => 'mwan',
++        member_sha256 => 'bde87a6f73fd6ff6e91fafb4793a639c96bc993ece132569079fd85637bcf279',
++    },
++    opnsensectl => {
++        repository => 'agoodkind/opnsensectl',
++        release_tag => '202609190337-7-7db20fb',
++        asset => 'opnsensectl_linux_amd64.tar.gz',
++        sha256 => '29e65cb0cc7b7924478416ab98d7c22e8d3e1679e7cbcfdbff42323fde874399',
++        source_revision => '7db20fb56fa01fa41bbb9ebeb03f29c281bce24a',
++        signer_revision => '6f29e0969c7c302aee9c1a23b3424c91f8c7796d',
++        member => 'opnsensectl',
++        member_sha256 => '19153b0b2026c69df0c2f7c9b0268dcdb3c85c7313544ba993e7587fb048322e',
++    },
++};
++my @PROGRAM_NAMES = sort keys %$PROGRAMS;
 +
 +my $fixture_dir = $ENV{HOST_ARTIFACT_FIXTURE_DIR};
 +die "set HOST_ARTIFACT_FIXTURE_DIR to the directory with the attested configsctl fixture\n"
@@ -3539,6 +3918,37 @@ index 00000000..64dcdc1f
 +HostArtifactsTest::require_disposable_root();
 +my $check = \&HostArtifactsTest::check;
 +my $check_error = \&HostArtifactsTest::check_error;
++my $check_match = \&HostArtifactsTest::check_match;
++my $json = HostArtifactsTest::json();
++
++# The rollback and the new install count as offline evidence only when every device other than
++# lo is down and does not have a route.
++sub require_no_network {
++    my @active;
++    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
++        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
++        next if $device eq 'lo' || !-e $flags_path;
++        my $flags = HostArtifactsTest::read_file($flags_path);
++        chomp($flags);
++        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
++    }
++    die "this test needs a container without network access, and these devices are up:"
++        . " @active\n"
++        if @active;
++
++    my @routes = split(m/\n/, HostArtifactsTest::read_file('/proc/net/route'));
++    shift @routes;
++    my @devices = map { (split(' ', $_))[0] } @routes;
++    if (-e '/proc/net/ipv6_route') {
++        my @routes_v6 = split(m/\n/, HostArtifactsTest::read_file('/proc/net/ipv6_route'));
++        push @devices, map { (split(' ', $_))[-1] } @routes_v6;
++    }
++    my @routed = grep { $_ ne 'lo' } @devices;
++    die "this test needs a container without network access, and these devices have routes:"
++        . " @routed\n"
++        if @routed;
++}
++require_no_network();
 +
 +my $rpcenv = PVE::RPCEnvironment->init('priv');
 +$rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
@@ -3582,7 +3992,8 @@ index 00000000..64dcdc1f
 +};
 +
 +my $policy = fixture_policy('attestation/fixture');
-+eval { PVE::HostArtifacts::verify_attestation($policy, $request, $archive, $bundle) };
++my $configuration = $policy->{configuration};
++eval { PVE::HostArtifacts::verify_attestation($configuration, $request, $archive, $bundle) };
 +$check->('gh accepts the authentic archive with the policy identity', !$@, $@);
 +
 +my $appended = "$WORK/appended.tar.gz";
@@ -3591,13 +4002,13 @@ index 00000000..64dcdc1f
 +    'gh rejects the archive with one appended byte',
 +    sub {
 +        PVE::HostArtifacts::verify_attestation(
-+            $policy,
++            $configuration,
 +            { %$request, sha256 => Digest::SHA::sha256_hex($archive_bytes . "\0") },
 +            $appended,
 +            $bundle,
 +        );
 +    },
-+    qr/gh attestation verify exited with code [1-9]/,
++    $GH_REJECTS,
 +);
 +
 +my $wrong_workflow_policy =
@@ -3606,26 +4017,31 @@ index 00000000..64dcdc1f
 +    'gh rejects another workflow identity',
 +    sub {
 +        PVE::HostArtifacts::verify_attestation(
-+            $wrong_workflow_policy, $request, $archive, $bundle,
++            $wrong_workflow_policy->{configuration}, $request, $archive, $bundle,
 +        );
 +    },
-+    qr/gh attestation verify exited with code [1-9]/,
++    $GH_REJECTS,
 +);
 +
 +my $wrong_ref_policy = fixture_policy('attestation/wrong-ref', source_ref => $WRONG_REF);
 +$check_error->(
 +    'gh rejects another source ref',
 +    sub {
-+        PVE::HostArtifacts::verify_attestation($wrong_ref_policy, $request, $archive, $bundle);
++        PVE::HostArtifacts::verify_attestation(
++            $wrong_ref_policy->{configuration}, $request, $archive, $bundle,
++        );
 +    },
-+    qr/gh attestation verify exited with code [1-9]/,
++    $GH_REJECTS,
 +);
 +
 +$check_error->(
 +    'the subject check rejects another asset name',
 +    sub {
 +        PVE::HostArtifacts::verify_attestation(
-+            $policy, { %$request, asset => 'configsctl_linux_arm64.tar.gz' }, $archive, $bundle,
++            $configuration,
++            { %$request, asset => 'configsctl_linux_arm64.tar.gz' },
++            $archive,
++            $bundle,
 +        );
 +    },
 +    qr/does not have the subject configsctl_linux_arm64\.tar\.gz/,
@@ -3672,16 +4088,670 @@ index 00000000..64dcdc1f
 +);
 +print "the install task ended with: $status\n";
 +
++# The tests install the retained opnsensectl and mwan archives. The fixture directory does not
++# contain an attested schema 2 configuration archive. The tests call install_verified_archive,
++# which runs gh for every program archive.
++
++my $program_bytes = {};
++my $bundle_bytes = {};
++for my $name (@PROGRAM_NAMES) {
++    my $asset = $PROGRAMS->{$name}->{asset};
++    $program_bytes->{$name} = HostArtifactsTest::read_file("$fixture_dir/$asset");
++    $bundle_bytes->{$name} = HostArtifactsTest::read_file("$fixture_dir/$asset.sigstore.jsonl");
++    $check->(
++        "the $name fixture has the release SHA-256",
++        Digest::SHA::sha256_hex($program_bytes->{$name}) eq $PROGRAMS->{$name}->{sha256},
++    );
++}
++
++my $program_dir = "$WORK/bin";
++my $file_dir = "$WORK/etc";
++make_path($program_dir, $file_dir, { mode => 0755 });
++my $file_paths = [];
++for my $index (1 .. $INTERRUPT_FILE_COUNT) {
++    push @$file_paths, sprintf('%s/file-%04d.conf', $file_dir, $index);
++}
++my $program_paths = [map { "$program_dir/$_" } @PROGRAM_NAMES];
++
++sub program_entry {
++    my ($name) = @_;
++
++    return {
++        name => $name,
++        repository => $PROGRAMS->{$name}->{repository},
++        workflow_uri => $FIXTURE_WORKFLOW,
++        source_ref => $FIXTURE_REF,
++        path => "$program_dir/$name",
++        mode => '0755',
++        owner => 'root',
++        group => 'root',
++        max_archive_bytes => $PROGRAM_MAX_ARCHIVE_BYTES,
++        max_bundle_bytes => $PROGRAM_MAX_BUNDLE_BYTES,
++    };
++}
++
++my $program_document = HostArtifactsTest::base_policy(
++    'attestation/programs',
++    [map { { path => $_, mode => '0644', owner => 'root', group => 'root' } } @$file_paths],
++);
++$program_document->{programs} = [map { program_entry($_) } @PROGRAM_NAMES];
++my $program_target = HostArtifactsTest::write_policy($program_document);
++my $program_policy = PVE::HostArtifacts::load_policy($program_target);
++my $journal_path = "$STATE_DIR/$program_target/journal.json";
++
++# The function returns the selected policy with one changed program entry and restores the valid
++# policy file.
++sub policy_with {
++    my ($name, %override) = @_;
++
++    my $document = $json->decode($json->encode($program_document));
++    my ($entry) = grep { $_->{name} eq $name } @{ $document->{programs} };
++    %$entry = (%$entry, %override);
++    HostArtifactsTest::write_policy($document);
++    my $changed = PVE::HostArtifacts::load_policy($program_target);
++    HostArtifactsTest::write_policy($program_document);
++    return $changed;
++}
++
++sub program_identity {
++    my ($name, %override) = @_;
++
++    return {
++        %{ $program_policy->{programs}->{$name} },
++        signer_digest => $PROGRAMS->{$name}->{signer_revision},
++        %override,
++    };
++}
++
++sub verify_program {
++    my ($identity, $program_request, $name) = @_;
++
++    my $asset = $PROGRAMS->{$name}->{asset};
++    PVE::HostArtifacts::verify_attestation(
++        $identity, $program_request, "$fixture_dir/$asset", "$fixture_dir/$asset.sigstore.jsonl",
++    );
++}
++
++for my $name (@PROGRAM_NAMES) {
++    eval { verify_program(program_identity($name), $PROGRAMS->{$name}, $name) };
++    $check->("gh accepts the $name archive with its own signer revision", !$@, $@);
++}
++$check_error->(
++    'gh rejects the opnsensectl archive with the signer revision of mwan',
++    sub {
++        my $identity = program_identity(
++            'opnsensectl', signer_digest => $PROGRAMS->{mwan}->{signer_revision},
++        );
++        verify_program($identity, $PROGRAMS->{opnsensectl}, 'opnsensectl');
++    },
++    $GH_REJECTS,
++);
++$check_error->(
++    'gh rejects the mwan archive with the signer revision of opnsensectl',
++    sub {
++        my $identity = program_identity(
++            'mwan', signer_digest => $PROGRAMS->{opnsensectl}->{signer_revision},
++        );
++        verify_program($identity, $PROGRAMS->{mwan}, 'mwan');
++    },
++    $GH_REJECTS,
++);
++$check_error->(
++    'the subject check rejects the digest of the second subject under the mwan asset name',
++    sub {
++        my $changed_request = { %{ $PROGRAMS->{mwan} }, sha256 => $WANCONFIG_SHA256 };
++        verify_program(program_identity('mwan'), $changed_request, 'mwan');
++    },
++    qr/does not have the subject mwan_linux_amd64\.tar\.gz/,
++);
++$check_error->(
++    'the subject check rejects the mwan digest under the asset name of the second subject',
++    sub {
++        my $changed_request = { %{ $PROGRAMS->{mwan} }, asset => $WANCONFIG_ASSET };
++        verify_program(program_identity('mwan'), $changed_request, 'mwan');
++    },
++    qr/does not have the subject \Q$WANCONFIG_ASSET\E/,
++);
++
++# The unrelated target has a committed install and a secret record. The stopped target keeps its
++# journal. The tests compare both targets after each step.
++
++my $unrelated_dir = "$WORK/unrelated";
++make_path($unrelated_dir, { mode => 0755 });
++my $unrelated_file = "$unrelated_dir/u.conf";
++my $unrelated_secret = "$unrelated_dir/secret.env";
++my $unrelated_document = HostArtifactsTest::base_policy(
++    'attestation/unrelated',
++    [{ path => $unrelated_file, mode => '0644', owner => 'root', group => 'root' }],
++);
++$unrelated_document->{secret_fields} = [
++    {
++        name => 'UNRELATED_TOKEN',
++        storage_path => $unrelated_secret,
++        mode => '0600',
++        owner => 'root',
++        group => 'root',
++        pattern => '[a-z]+',
++        min_length => 1,
++        max_length => 64,
++        consumer_units => [],
++    },
++];
++my $unrelated_target = HostArtifactsTest::write_policy($unrelated_document);
++my $unrelated_policy = PVE::HostArtifacts::load_policy($unrelated_target);
++my ($unrelated_manifest, $unrelated_members) = HostArtifactsTest::artifact(
++    $unrelated_document, { $unrelated_file => { content => "u\n" } },
++);
++my $unrelated_archive = "$WORK/unrelated.tar.gz";
++my $unrelated_manifest_member =
++    { name => 'manifest.json', content => $json->encode($unrelated_manifest) };
++HostArtifactsTest::write_archive(
++    $unrelated_archive, [$unrelated_manifest_member, @$unrelated_members],
++);
++PVE::HostArtifacts::with_target_lock(
++    $unrelated_target,
++    sub {
++        PVE::HostArtifacts::install_verified_archive(
++            $unrelated_policy,
++            HostArtifactsTest::request($unrelated_archive),
++            $unrelated_archive,
++            'UPID:attestation:unrelated',
++            $TOKEN,
++        );
++    },
++);
++PVE::HostArtifacts::set_secret(
++    $unrelated_target, 'UNRELATED_TOKEN', 'unrelated', 1, 'UPID:attestation:secret',
++);
++my ($stopped_target, $stopped_paths) =
++    HostArtifactsTest::interrupted_target('attestation/stopped', "$WORK/stopped");
++
++sub unrelated_state {
++    return $json->encode([
++        HostArtifactsTest::target_state(
++            $unrelated_target, $unrelated_dir, $unrelated_file, $unrelated_secret,
++        ),
++        HostArtifactsTest::target_state($stopped_target, @$stopped_paths),
++    ]);
++}
++my $unrelated_before = unrelated_state();
++
++sub check_unrelated {
++    my ($label) = @_;
++
++    $check->(
++        "the files, records, journals, and lock files of the unrelated targets stay unchanged"
++            . " after $label",
++        unrelated_state() eq $unrelated_before,
++    );
++}
++
++sub directory_names {
++    my ($dir) = @_;
++
++    opendir(my $handle, $dir) or die "cannot read $dir: $!\n";
++    my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($handle);
++    closedir($handle);
++    return \@names;
++}
++
++# The state includes each target file, every name in the two directories, and the installed
++# record, secret record, journal, and lock file of the selected target.
++sub program_state {
++    return $json->encode([
++        HostArtifactsTest::target_state($program_target, @$program_paths, @$file_paths),
++        directory_names($program_dir),
++        directory_names($file_dir),
++    ]);
++}
++
++sub stage_program {
++    my ($kind, $name, $content) = @_;
++
++    my $stage;
++    my $offset = 0;
++    while (1) {
++        my $chunk = substr($content, $offset, $CHUNK_BYTES);
++        my $params = {
++            kind => $kind,
++            program => $name,
++            offset => $offset,
++            data => encode_base64($chunk, ''),
++        };
++        $params->{stage} = $stage if defined($stage);
++        my $response = HostArtifactsTest::api_request(
++            $rpcenv, $TOKEN, 'POST', "$program_target/stage", $params,
++        );
++        die "staging $name failed with status $response->{status}: "
++            . ($response->{message} // '') . "\n"
++            if $response->{status} != 200;
++        $stage = $response->{data}->{stage};
++        $offset += length($chunk);
++        last if $offset >= length($content);
++    }
++    return $stage;
++}
++
++sub stage_programs {
++    my $references = [];
++    for my $name (@PROGRAM_NAMES) {
++        push @$references, {
++            name => $name,
++            archive_stage => stage_program('program', $name, $program_bytes->{$name}),
++            bundle_stage => stage_program('program-bundle', $name, $bundle_bytes->{$name}),
++        };
++    }
++    return $references;
++}
++
++sub manifest_program {
++    my ($name) = @_;
++
++    return {
++        %{ $PROGRAMS->{$name} },
++        name => $name,
++        path => "$program_dir/$name",
++        mode => '0755',
++        owner => 'root',
++        group => 'root',
++    };
++}
++
++sub change_program {
++    my ($name, %override) = @_;
++
++    return sub {
++        my ($manifest) = @_;
++        my ($program) = grep { $_->{name} eq $name } @{ $manifest->{programs} };
++        %$program = (%$program, %override);
++    };
++}
++
++# The function writes a schema 2 archive with one file for each path in $file_paths and manifest
++# entries for the two retained programs. Each file starts with $prefix.
++sub configuration_archive {
++    my ($name, $prefix, $change) = @_;
++
++    my ($manifest, $members) = HostArtifactsTest::artifact(
++        $program_document, { map { $_ => { content => "$prefix $_\n" } } @$file_paths },
++    );
++    $manifest->{schema_version} = 2;
++    $manifest->{programs} = [map { manifest_program($_) } @PROGRAM_NAMES];
++    $change->($manifest) if $change;
++    my $path = "$WORK/$name.tar.gz";
++    HostArtifactsTest::write_archive(
++        $path, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
++    );
++    return $path;
++}
++
++sub install_programs {
++    my ($selected_policy, $archive_path, $references) = @_;
++
++    my $install_request = HostArtifactsTest::request($archive_path, program_stages => $references);
++    PVE::HostArtifacts::with_target_lock(
++        $selected_policy->{target},
++        sub {
++            PVE::HostArtifacts::install_verified_archive(
++                $selected_policy, $install_request, $archive_path, "UPID:attestation:$$", $TOKEN,
++            );
++        },
++    );
++}
++
++# The function runs an install in a child process and returns its exit code and output.
++sub logged_install {
++    my ($archive_path, $references) = @_;
++
++    my $log_path = "$WORK/install.log";
++    my $pid = fork() // die "cannot fork: $!\n";
++    if (!$pid) {
++        open(STDOUT, '>', $log_path) or POSIX::_exit(2);
++        $| = 1;
++        eval { install_programs($program_policy, $archive_path, $references) };
++        my $error = $@;
++        print "the install failed: $error" if $error;
++        POSIX::_exit($error ? 1 : 0);
++    }
++    waitpid($pid, 0);
++    return ($? >> 8, HostArtifactsTest::read_file($log_path));
++}
++
++sub check_verified_before_write {
++    my ($label, $log) = @_;
++
++    my $first_write = index($log, "\nwrote ");
++    $check->("$label writes a file", $first_write >= 0, $log);
++    for my $name (@PROGRAM_NAMES) {
++        my ($asset, $sha256) = @{ $PROGRAMS->{$name} }{qw(asset sha256)};
++        my $accepted = index($log, "gh attestation verify accepted $asset with SHA-256 $sha256\n");
++        $check->(
++            "$label verifies the $name archive with gh before it writes a file",
++            $accepted >= 0 && $accepted < $first_write,
++            $log,
++        );
++    }
++}
++
++sub check_stages_removed {
++    my ($label, $references) = @_;
++
++    for my $reference (@$references) {
++        for my $stage (@$reference{qw(archive_stage bundle_stage)}) {
++            my $stage_path = "$STATE_DIR/$program_target/stages/$stage";
++            $check->(
++                "$label removes the stage $stage of the program $reference->{name}",
++                !-e $stage_path && !-e "$stage_path.json",
++            );
++        }
++    }
++}
++
++sub check_installed_programs {
++    my ($label) = @_;
++
++    for my $name (@PROGRAM_NAMES) {
++        my $path = "$program_dir/$name";
++        my @stat = lstat($path);
++        $check->(
++            "$label installs the executable member of $name with the policy metadata",
++            Digest::SHA->new(256)->addfile($path)->hexdigest()
++                eq $PROGRAMS->{$name}->{member_sha256}
++                && sprintf('%04o', $stat[2] & 07777) eq '0755'
++                && $stat[4] == 0
++                && $stat[5] == 0,
++        );
++    }
++    $check->("$label does not install README.md", !-e "$program_dir/README.md");
++
++    my $response =
++        HostArtifactsTest::api_request($rpcenv, $TOKEN, 'GET', $program_target, {});
++    $check->("GET succeeds after $label", $response->{status} == 200, $response->{message});
++    my $state = $response->{data};
++    $check->("GET reports the committed state after $label", $state->{state} eq 'committed');
++    $check->(
++        "GET reports that every file matches after $label",
++        !grep { !$_->{matches} } @{ $state->{files} },
++    );
++    my $expected = [];
++    for my $name (@PROGRAM_NAMES) {
++        my $fields = { map { $_ => $PROGRAMS->{$name}->{$_} } @$INSTALLED_PROGRAM_FIELDS };
++        push @$expected, { %$fields, name => $name };
++    }
++    $check->(
++        "GET lists the installed programs after $label",
++        $json->encode($state->{installed}->{programs}) eq $json->encode($expected),
++    );
++}
++
++sub write_previous_programs {
++    for my $path (@$program_paths) {
++        HostArtifactsTest::write_file($path, "previous $path\n", 0755);
++    }
++}
++
++sub stop_during_replacement {
++    my ($archive_path, $references) = @_;
++
++    my $first_path = $program_paths->[0];
++    my $first_inode = (lstat($first_path))[1];
++    my $pid = fork() // die "cannot fork: $!\n";
++    if (!$pid) {
++        open(STDOUT, '>', '/dev/null') or POSIX::_exit(2);
++        eval { install_programs($program_policy, $archive_path, $references) };
++        POSIX::_exit($@ ? 1 : 0);
++    }
++    my $deadline = Time::HiRes::time() + $INTERRUPT_TIMEOUT_SECONDS;
++    while (Time::HiRes::time() < $deadline) {
++        my $inode = (lstat($first_path))[1] // $first_inode;
++        last if $inode != $first_inode;
++        last if waitpid($pid, POSIX::WNOHANG()) == $pid;
++        Time::HiRes::sleep($POLL_SECONDS);
++    }
++    kill('KILL', $pid);
++    waitpid($pid, 0);
++}
++
++write_previous_programs();
++my $program_stages = stage_programs();
++my $valid_archive = configuration_archive('programs-one', 'one');
++
++sub check_rejected {
++    my ($label, $selected_policy, $archive_path, $references, $pattern) = @_;
++
++    my $before = program_state();
++    $check_error->(
++        $label, sub { install_programs($selected_policy, $archive_path, $references) }, $pattern,
++    );
++    $check->("$label does not write a target file", program_state() eq $before);
++    check_unrelated($label);
++}
++
++check_rejected(
++    'another program repository',
++    policy_with('opnsensectl', repository => 'agoodkind/mwan'),
++    configuration_archive(
++        'wrong-repository', 'one', change_program('opnsensectl', repository => 'agoodkind/mwan'),
++    ),
++    $program_stages,
++    $GH_REJECTS,
++);
++check_rejected(
++    'another program workflow',
++    policy_with('mwan', workflow_uri => $WRONG_WORKFLOW),
++    $valid_archive,
++    $program_stages,
++    $GH_REJECTS,
++);
++check_rejected(
++    'another program source revision',
++    $program_policy,
++    configuration_archive(
++        'wrong-source', 'one', change_program('mwan', source_revision => 'b' x 40),
++    ),
++    $program_stages,
++    $GH_REJECTS,
++);
++check_rejected(
++    'another program signer revision',
++    $program_policy,
++    configuration_archive(
++        'wrong-signer',
++        'one',
++        change_program(
++            'opnsensectl', signer_revision => $PROGRAMS->{mwan}->{signer_revision},
++        ),
++    ),
++    $program_stages,
++    $GH_REJECTS,
++);
++
++my $changed_bytes = $program_bytes->{opnsensectl} . "\0";
++my $changed_stage = stage_program('program', 'opnsensectl', $changed_bytes);
++my $changed_stages = [
++    $program_stages->[0],
++    { %{ $program_stages->[1] }, archive_stage => $changed_stage },
++];
++check_rejected(
++    'changed program archive bytes',
++    $program_policy,
++    configuration_archive(
++        'wrong-bytes',
++        'one',
++        change_program('opnsensectl', sha256 => Digest::SHA::sha256_hex($changed_bytes)),
++    ),
++    $changed_stages,
++    $GH_REJECTS,
++);
++check_rejected(
++    'a manifest SHA-256 that differs from the staged archive SHA-256',
++    $program_policy,
++    configuration_archive(
++        'wrong-archive', 'one', change_program('opnsensectl', sha256 => 'c' x 64),
++    ),
++    $program_stages,
++    qr/does not have the subject opnsensectl_linux_amd64\.tar\.gz/,
++);
++check_rejected(
++    'another member SHA-256',
++    $program_policy,
++    configuration_archive(
++        'wrong-member', 'one', change_program('opnsensectl', member_sha256 => 'c' x 64),
++    ),
++    $program_stages,
++    qr/member 'opnsensectl' of the program opnsensectl has SHA-256 [0-9a-f]{64}/,
++);
++check_rejected(
++    'an absent member',
++    $program_policy,
++    configuration_archive(
++        'absent-member', 'one', change_program('opnsensectl', member => 'missing'),
++    ),
++    $program_stages,
++    qr/does not contain the member 'missing'/,
++);
++check_rejected(
++    'another program destination',
++    $program_policy,
++    configuration_archive(
++        'wrong-destination', 'one', change_program('opnsensectl', path => "$program_dir/other"),
++    ),
++    $program_stages,
++    qr/program opnsensectl does not match the path, mode, owner, and group in the policy/,
++);
++check_rejected(
++    'a program destination that equals a target file path',
++    $program_policy,
++    configuration_archive(
++        'collision', 'one', change_program('opnsensectl', path => $file_paths->[0]),
++    ),
++    $program_stages,
++    qr/matches a file path or a secret storage path of this target/,
++);
++
++my ($install_exit_code, $install_log) = logged_install($valid_archive, $program_stages);
++$check->('the install of both programs succeeds', $install_exit_code == 0, $install_log);
++check_verified_before_write('the install', $install_log);
++check_stages_removed('the install', $program_stages);
++check_installed_programs('the install');
++check_unrelated('the install of both programs');
++
++# The test stops an install during replacement. The first program has already changed.
++
++my $second_archive = configuration_archive('programs-two', 'two');
++my $interrupted_stages;
++my $before_interrupt;
++my $first_program_sha256;
++my $interrupted = 0;
++for my $attempt (1 .. $INTERRUPT_ATTEMPTS) {
++    write_previous_programs();
++    for my $path (@$file_paths) {
++        HostArtifactsTest::write_file($path, "one $path\n");
++    }
++    $before_interrupt = program_state();
++    $first_program_sha256 = Digest::SHA->new(256)->addfile($program_paths->[0])->hexdigest();
++    $interrupted_stages = stage_programs();
++    stop_during_replacement($second_archive, $interrupted_stages);
++    my $phase = '';
++    if (-e $journal_path) {
++        $phase = $json->decode(HostArtifactsTest::read_file($journal_path))->{phase};
++    }
++    if ($phase eq 'replacing') {
++        print "OK: attempt $attempt stopped the install during replacement\n";
++        $interrupted = 1;
++        last;
++    }
++    print "attempt $attempt did not stop the install during replacement\n";
++    PVE::HostArtifacts::with_target_lock(
++        $program_target, sub { PVE::HostArtifacts::recover($program_target) },
++    );
++}
++$check->('the kill stopped the install during replacement', $interrupted);
++$check->(
++    'the stopped install replaced the first program file before the kill',
++    Digest::SHA->new(256)->addfile($program_paths->[0])->hexdigest() ne $first_program_sha256,
++);
++$check->(
++    'the journal lists the program stages of the stopped install',
++    $json->encode($json->decode(HostArtifactsTest::read_file($journal_path))->{program_stages})
++        eq $json->encode($interrupted_stages),
++);
++check_unrelated('the stopped install');
++
++# The next task restores the journal backups, and gh then exits with failure because the mwan
++# bundle does not attest the configuration archive. This run provides only rollback evidence.
++
++my $second_bytes = HostArtifactsTest::read_file($second_archive);
++my $rollback_response = HostArtifactsTest::api_request(
++    $rpcenv,
++    $TOKEN,
++    'POST',
++    $program_target,
++    {
++        'release-tag' => 'hostconfig-test-202610300000-1-aaaaaaa',
++        asset => 'hostconfig_test.tar.gz',
++        sha256 => Digest::SHA::sha256_hex($second_bytes),
++        'source-revision' => 'a' x 40,
++        'archive-stage' => HostArtifactsTest::stage_file(
++            $rpcenv, $TOKEN, $program_target, 'archive', $second_bytes,
++        ),
++        'bundle-stage' => HostArtifactsTest::stage_file(
++            $rpcenv, $TOKEN, $program_target, 'bundle', $bundle_bytes->{mwan},
++        ),
++        'program-stages' => join(
++            ',',
++            map { "$_->{name}=$_->{archive_stage}:$_->{bundle_stage}" } @$interrupted_stages,
++        ),
++    },
++);
++$check->(
++    'the task after the kill starts',
++    $rollback_response->{status} == 200,
++    $rollback_response->{message},
++);
++my (undef, $rollback_log) = HostArtifactsTest::wait_for_task($rollback_response->{data});
++$check_match->('gh exits with failure in the rollback task', $rollback_log, $GH_REJECTS);
++$check_match->(
++    'the rollback task restores the journal backups before gh runs',
++    $rollback_log,
++    qr/restoring the files of the interrupted transaction/,
++);
++$check->(
++    'gh does not accept an archive in the rollback task',
++    $rollback_log !~ m/gh attestation verify accepted/,
++    $rollback_log,
++);
++$check->(
++    'the rollback restores the content, metadata, and names of every target file',
++    program_state() eq $before_interrupt,
++);
++$check->('the rollback deletes the journal', !-e $journal_path);
++check_unrelated('the rollback');
++print "the rollback task ended with a gh failure, and it counts only as rollback evidence\n";
++
++# A new install verifies every retained program archive before it writes a file.
++
++my ($new_exit_code, $new_log) = logged_install($second_archive, $interrupted_stages);
++$check->('the new install after the rollback succeeds', $new_exit_code == 0, $new_log);
++check_verified_before_write('the new install', $new_log);
++check_stages_removed('the new install', $interrupted_stages);
++check_installed_programs('the new install');
++$check->(
++    'the new install writes the second configuration',
++    !grep { HostArtifactsTest::read_file($_) ne "two $_\n" } @$file_paths,
++);
++check_unrelated('the new install');
++
 +remove_tree($WORK);
 +print "all tests passed\n";
 +
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..b6509665
+index 00000000..685f6486
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1451 @@
+@@ -0,0 +1,2104 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -3918,6 +4988,42 @@ index 00000000..b6509665
 +
 +    return scalar(grep { -e $_ && HostArtifactsTest::read_file($_) =~ m/\A\Q$prefix\E / }
 +        @$paths);
++}
++
++sub program_entry {
++    my ($name, %override) = @_;
++
++    return {
++        name => $name,
++        repository => 'agoodkind/example',
++        workflow_uri => 'https://github.com/agoodkind/example/.github/workflows/release.yml'
++            . '@refs/heads/main',
++        source_ref => 'refs/heads/main',
++        path => "$ROOT/programs/$name",
++        mode => '0755',
++        owner => 'root',
++        group => 'root',
++        max_archive_bytes => 100,
++        max_bundle_bytes => 50,
++        %override,
++    };
++}
++
++sub program_stage_request {
++    my ($user, $target, $kind, $program, $content) = @_;
++
++    my $params = { kind => $kind, offset => 0, data => encode_base64($content, '') };
++    $params->{program} = $program if defined($program);
++    return HostArtifactsTest::api_request($rpcenv, $user, 'POST', "$target/stage", $params);
++}
++
++sub stage_program {
++    my ($user, $target, $kind, $program, $content) = @_;
++
++    my $response = program_stage_request($user, $target, $kind, $program, $content);
++    die "staging failed with status $response->{status}: " . ($response->{message} // '') . "\n"
++        if $response->{status} != 200;
++    return $response->{data}->{stage};
 +}
 +
 +# Workspace selectors and target identity.
@@ -4542,9 +5648,9 @@ index 00000000..b6509665
 +my $task_upid = $install_response->{data};
 +my ($task_status) = HostArtifactsTest::wait_for_task($task_upid);
 +$check_match->(
-+    'the task fails when gh rejects the bundle',
++    'the task fails when gh exits with code 1',
 +    $task_status,
-+    qr/gh attestation verify exited with code [1-9]/,
++    qr/gh attestation verify exited with code 1:/,
 +);
 +$check_match->('the task records the request user', $task_upid, qr/:deploy\@pve!install:\z/);
 +$check->(
@@ -4621,20 +5727,36 @@ index 00000000..b6509665
 +
 +# Stage expiry deletes an old stage and keeps an old stage that the journal lists.
 +
++$many_document->{programs} = [program_entry('tool')];
++HostArtifactsTest::write_policy($many_document);
 +my $unlisted_stage =
 +    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'bundle', "old bundle\n");
 +my $listed_stage =
 +    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'archive', "old archive\n");
-+for my $stage ($unlisted_stage, $listed_stage) {
++my $unlisted_program_stage = stage_program($TOKEN, $many_target, 'program', 'tool', "old\n");
++my $listed_program_stage = stage_program($TOKEN, $many_target, 'program', 'tool', "kept\n");
++my $listed_program_bundle =
++    stage_program($TOKEN, $many_target, 'program-bundle', 'tool', "kept\n");
++for my $stage (
++    $unlisted_stage, $listed_stage, $unlisted_program_stage, $listed_program_stage,
++    $listed_program_bundle,
++) {
 +    my $record_path = stage_record_path($many_target, $stage);
 +    my $record = $json->decode(HostArtifactsTest::read_file($record_path));
 +    $record->{created} -= $OLD_STAGE_SECONDS;
 +    HostArtifactsTest::write_file($record_path, $json->encode($record), 0600);
 +}
-+interrupt_install(
-+    $many_policy, $many_archive_two, \@many_paths, archive_stage => $listed_stage,
-+);
++interrupt_install($many_policy, $many_archive_two, \@many_paths, archive_stage => $listed_stage);
 +$check->('the second interruption left a journal', -e $many_journal);
++my $journal_with_programs = $json->decode(HostArtifactsTest::read_file($many_journal));
++$journal_with_programs->{program_stages} = [
++    {
++        name => 'tool',
++        archive_stage => $listed_program_stage,
++        bundle_stage => $listed_program_bundle,
++    },
++];
++HostArtifactsTest::write_file($many_journal, $json->encode($journal_with_programs), 0600);
 +my $new_stage =
 +    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'bundle', "new bundle\n");
 +$check->(
@@ -4646,6 +5768,16 @@ index 00000000..b6509665
 +    -e stage_record_path($many_target, $listed_stage),
 +);
 +$check->('a stage call keeps a new stage', -e stage_record_path($many_target, $new_stage));
++$check->(
++    'a stage call deletes an old program stage that the journal does not list',
++    !-e stage_record_path($many_target, $unlisted_program_stage),
++);
++$check->(
++    'a stage call keeps the old program stages that the journal lists',
++    -e stage_record_path($many_target, $listed_program_stage)
++        && -e stage_record_path($many_target, $listed_program_bundle),
++);
++$check_unrelated->('stage expiry runs');
 +
 +# The next install restores the interrupted transaction, then commits.
 +my $resumed_upid = install_archive($many_policy, $many_archive_two);
@@ -4878,6 +6010,597 @@ index 00000000..b6509665
 +    $stage_chunk->('bundle', 0, 'b' x 51)->{message},
 +    qr/bundle is larger than 50 bytes/,
 +);
++
++# The tests check validation of program entries in a policy.
++
++my $reserved_dir = "$ROOT/programs/reserved";
++my $reserved_file = "$ROOT/programs/reserved.conf";
++my $reserved_secret = "$ROOT/programs/reserved.env";
++my $program_policy_document = HostArtifactsTest::base_policy(
++    'suburban/program-policy',
++    file_entries([$reserved_file]),
++    [{ path => $reserved_dir, mode => '0755', owner => 'root', group => 'root' }],
++);
++$program_policy_document->{secret_fields} = [
++    {
++        name => 'PROGRAM_TOKEN',
++        storage_path => $reserved_secret,
++        mode => '0600',
++        owner => 'root',
++        group => 'root',
++        pattern => '[a-z]+',
++        min_length => 1,
++        max_length => 64,
++        consumer_units => [],
++    },
++];
++my $without_repository = program_entry('tool');
++delete $without_repository->{repository};
++my $program_policy_cases = [
++    ['a program has an unknown field', [program_entry('tool', extra => 1)], qr/unknown field/],
++    ['a program lacks a repository', [$without_repository], qr/'repository' is missing/],
++    ['a program name is invalid', [program_entry('Tool')], qr/field 'name'/],
++    [
++        'a program repository is invalid',
++        [program_entry('tool', repository => 'no-owner')],
++        qr/field 'repository'/,
++    ],
++    [
++        'a program path is relative',
++        [program_entry('tool', path => 'usr/bin/tool')],
++        qr/must be an absolute path/,
++    ],
++    ['a program mode is invalid', [program_entry('tool', mode => '755')], qr/field 'mode'/],
++    ['a program owner is invalid', [program_entry('tool', owner => 'Root')], qr/field 'owner'/],
++    ['a program group is invalid', [program_entry('tool', group => 'Root')], qr/field 'group'/],
++    [
++        'a program archive limit is zero',
++        [program_entry('tool', max_archive_bytes => 0)],
++        qr/'max_archive_bytes' is not a positive integer/,
++    ],
++    [
++        'a program bundle limit is zero',
++        [program_entry('tool', max_bundle_bytes => 0)],
++        qr/'max_bundle_bytes' is not a positive integer/,
++    ],
++    [
++        'a program name appears more than once',
++        [program_entry('tool'), program_entry('tool', path => "$ROOT/programs/other")],
++        qr/lists the program tool more than once/,
++    ],
++    [
++        'a program path appears more than once',
++        [program_entry('tool'), program_entry('helper', path => "$ROOT/programs/tool")],
++        qr/lists the path .* more than once/,
++    ],
++    [
++        'a program path equals a policy file',
++        [program_entry('tool', path => $reserved_file)],
++        qr/is also a policy file/,
++    ],
++    [
++        'a program path equals a policy directory',
++        [program_entry('tool', path => $reserved_dir)],
++        qr/is also a policy file/,
++    ],
++    [
++        'a program path equals a secret storage path',
++        [program_entry('tool', path => $reserved_secret)],
++        qr/is also a policy file/,
++    ],
++];
++for my $case (@$program_policy_cases) {
++    my ($label, $programs, $pattern) = @$case;
++    my $case_target =
++        HostArtifactsTest::write_policy({ %$program_policy_document, programs => $programs });
++    $check_error->(
++        "policy loading rejects a policy when $label",
++        sub { PVE::HostArtifacts::load_policy($case_target) },
++        $pattern,
++    );
++}
++
++# The tests check program stages and the program-stages install parameter.
++
++my $program_document = HostArtifactsTest::base_policy('suburban/program', []);
++$program_document->{programs} = [program_entry('tool'), program_entry('helper')];
++my $program_target = HostArtifactsTest::write_policy($program_document);
++my $other_program_document = HostArtifactsTest::base_policy('suburban/program-other', []);
++$other_program_document->{programs} = [program_entry('tool')];
++my $other_program_target = HostArtifactsTest::write_policy($other_program_document);
++
++$check_match->(
++    'a program stage requires the program parameter',
++    program_stage_request($TOKEN, $program_target, 'program', undef, 'a')->{message},
++    qr/the kind program requires parameter 'program'/,
++);
++$check_match->(
++    'a program-bundle stage requires the program parameter',
++    program_stage_request($TOKEN, $program_target, 'program-bundle', undef, 'a')->{message},
++    qr/the kind program-bundle requires parameter 'program'/,
++);
++for my $kind ('archive', 'bundle') {
++    $check_match->(
++        "a stage of kind $kind rejects the program parameter",
++        program_stage_request($TOKEN, $program_target, $kind, 'tool', 'a')->{message},
++        qr/the kind $kind rejects parameter 'program'/,
++    );
++}
++$check_match->(
++    'staging rejects a program outside the selected policy',
++    program_stage_request($TOKEN, $program_target, 'program', 'missing', 'a')->{message},
++    qr/does not list the program missing/,
++);
++$check_match->(
++    'staging rejects a program that only another target policy lists',
++    program_stage_request($TOKEN, $other_program_target, 'program', 'helper', 'a')->{message},
++    qr/does not list the program helper/,
++);
++$check_unrelated->('staging rejects invalid program requests');
++
++$check->(
++    'a program stage at the size limit in its policy entry succeeds',
++    program_stage_request($TOKEN, $program_target, 'program', 'tool', 'a' x 100)->{status} == 200,
++);
++$check_match->(
++    'a program chunk above the size limit in its policy entry fails',
++    program_stage_request($TOKEN, $program_target, 'program', 'tool', 'a' x 101)->{message},
++    qr/program is larger than 100 bytes/,
++);
++my $partial_program = stage_program($TOKEN, $program_target, 'program', 'tool', 'a' x 60);
++my $program_chunk = sub {
++    my ($program) = @_;
++
++    return HostArtifactsTest::api_request(
++        $rpcenv, $TOKEN, 'POST', "$program_target/stage",
++        {
++            kind => 'program',
++            offset => 60,
++            data => encode_base64('a' x 41, ''),
++            stage => $partial_program,
++            program => $program,
++        },
++    );
++};
++$check_match->(
++    'a later chunk that would exceed the program stage size limit fails',
++    $program_chunk->('tool')->{message},
++    qr/program is larger than 100 bytes/,
++);
++$check_match->(
++    'a later chunk for another program fails',
++    $program_chunk->('helper')->{message},
++    qr/belongs to another program/,
++);
++$check->(
++    'a program-bundle stage at the size limit in its policy entry succeeds',
++    program_stage_request($TOKEN, $program_target, 'program-bundle', 'tool', 'b' x 50)->{status}
++        == 200,
++);
++$check_match->(
++    'a program-bundle chunk above the size limit in its policy entry fails',
++    program_stage_request($TOKEN, $program_target, 'program-bundle', 'tool', 'b' x 51)->{message},
++    qr/program-bundle is larger than 50 bytes/,
++);
++$check->(
++    'an archive stage uses the size limit in the policy configuration',
++    program_stage_request($TOKEN, $program_target, 'archive', undef, 'a' x 101)->{status} == 200,
++);
++$check_unrelated->('staging enforces the program stage size limits');
++
++my $tool_archive = stage_program($TOKEN, $program_target, 'program', 'tool', 'tool');
++my $tool_bundle = stage_program($TOKEN, $program_target, 'program-bundle', 'tool', 'bundle');
++my $helper_archive = stage_program($TOKEN, $program_target, 'program', 'helper', 'helper');
++my $helper_bundle = stage_program($TOKEN, $program_target, 'program-bundle', 'helper', 'bundle');
++my $tool_record =
++    $json->decode(HostArtifactsTest::read_file(stage_record_path($program_target, $tool_archive)));
++$check->(
++    'a program stage records the target, actor, kind, and program',
++    $tool_record->{target} eq $program_target
++        && $tool_record->{user} eq $TOKEN
++        && $tool_record->{kind} eq 'program'
++        && $tool_record->{program} eq 'tool',
++);
++
++my $config_archive =
++    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'archive', 'archive');
++my $config_bundle =
++    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'bundle', 'bundle');
++my $spare_archive =
++    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'archive', 'spare');
++my $other_archive = stage_program($TOKEN, $other_program_target, 'program', 'tool', 'other');
++my $other_bundle = stage_program($TOKEN, $other_program_target, 'program-bundle', 'tool', 'other');
++my $actor_archive = stage_program('deploy@pve', $program_target, 'program', 'tool', 'actor');
++my $actor_bundle = stage_program('deploy@pve', $program_target, 'program-bundle', 'tool', 'actor');
++
++my $program_params = sub {
++    my ($program_stages) = @_;
++
++    return {
++        %$install_params_without_stages,
++        'archive-stage' => $config_archive,
++        'bundle-stage' => $config_bundle,
++        'program-stages' => $program_stages,
++    };
++};
++my $program_install = sub {
++    my ($program_stages) = @_;
++
++    return HostArtifactsTest::api_request(
++        $rpcenv, $TOKEN, 'POST', $program_target, $program_params->($program_stages),
++    );
++};
++my $check_program_request = sub {
++    my ($label, $program_stages, $pattern) = @_;
++
++    my $response = $program_install->($program_stages);
++    $check->("the request does not start a task when $label", $response->{status} != 200);
++    $check_match->(
++        "the request fails with the expected error when $label",
++        $response->{message},
++        $pattern,
++    );
++    $check_unrelated->($label);
++};
++
++$check->(
++    'a program-stages value in the wrong form does not start a task',
++    $program_install->('tool')->{status} == 400,
++);
++$check_program_request->(
++    'the program is unknown', "missing=$tool_archive:$tool_bundle",
++    qr/does not list the program missing/,
++);
++$check_program_request->(
++    'a stage belongs to another target', "tool=$other_archive:$other_bundle",
++    qr/stage \Q$other_archive\E does not exist for this target/,
++);
++$check_program_request->(
++    'a stage belongs to another actor', "tool=$actor_archive:$actor_bundle",
++    qr/stage \Q$actor_archive\E belongs to another user/,
++);
++$check_program_request->(
++    'the request swaps program stages', "tool=$tool_bundle:$tool_archive",
++    qr/has the kind program-bundle, not program/,
++);
++$check_program_request->(
++    'the request uses an archive stage in place of a program stage',
++    "tool=$spare_archive:$tool_bundle",
++    qr/has the kind archive, not program/,
++);
++$check_program_request->(
++    'a stage belongs to another program', "helper=$tool_archive:$tool_bundle",
++    qr/stage \Q$tool_archive\E belongs to another program/,
++);
++$check_program_request->(
++    'the request repeats a program',
++    "tool=$tool_archive:$tool_bundle,tool=$tool_archive:$tool_bundle",
++    qr/lists the program tool more than once/,
++);
++$check_program_request->(
++    'the request repeats a stage',
++    "tool=$tool_archive:$tool_bundle,helper=$tool_archive:$helper_bundle",
++    qr/references the stage \Q$tool_archive\E more than once/,
++);
++$check_program_request->(
++    'the request also uses the configuration archive stage as a program stage',
++    "tool=$config_archive:$tool_bundle",
++    qr/references the stage \Q$config_archive\E more than once/,
++);
++
++# The tests copy stages from another target into the selected target. Each copied stage record
++# retains the original target.
++my @copied_stage_paths;
++for my $stage ($other_archive, $other_bundle) {
++    for my $suffix ('', '.json') {
++        my $source = "$STATE_DIR/$other_program_target/stages/$stage$suffix";
++        my $copy = "$STATE_DIR/$program_target/stages/$stage$suffix";
++        HostArtifactsTest::write_file($copy, HostArtifactsTest::read_file($source), 0600);
++        push @copied_stage_paths, $copy;
++    }
++}
++$check_program_request->(
++    'a copied stage records another target', "tool=$other_archive:$other_bundle",
++    qr/the stage record .* is not valid/,
++);
++for my $path (@copied_stage_paths) {
++    unlink($path) or die "cannot delete $path: $!\n";
++}
++
++my $valid_program_stages =
++    "tool=$tool_archive:$tool_bundle,helper=$helper_archive:$helper_bundle";
++my $checked_request = PVE::HostArtifacts::check_install_request(
++    $program_target, $TOKEN, $program_params->($valid_program_stages),
++);
++$check->(
++    'check_install_request returns the parsed program stage references',
++    $json->encode($checked_request->{program_stages}) eq $json->encode([
++        { name => 'tool', archive_stage => $tool_archive, bundle_stage => $tool_bundle },
++        { name => 'helper', archive_stage => $helper_archive, bundle_stage => $helper_bundle },
++    ]),
++);
++my $unreferenced_request = PVE::HostArtifacts::check_install_request(
++    $program_target, $TOKEN, $program_params->(undef),
++);
++$check->(
++    'check_install_request returns an empty program stage list when the request omits'
++        . ' program-stages',
++    !@{ $unreferenced_request->{program_stages} },
++);
++
++my $program_task = $program_install->($valid_program_stages);
++$check->('a valid program request starts a task', $program_task->{status} == 200);
++my ($program_task_status) = HostArtifactsTest::wait_for_task($program_task->{data});
++$check_match->(
++    'a program request task fails when gh exits with code 1',
++    $program_task_status,
++    qr/gh attestation verify exited with code 1:/,
++);
++$check->(
++    'the failed program task does not write an installed record or a journal',
++    !-e "$STATE_DIR/$program_target/installed.json"
++        && !-e "$STATE_DIR/$program_target/journal.json",
++);
++$check->(
++    'the failed program task keeps the program stages',
++    !grep { !-e stage_record_path($program_target, $_) }
++        ($tool_archive, $tool_bundle, $helper_archive, $helper_bundle),
++);
++$check_unrelated->('the program task fails');
++
++# The tests check schema 2 manifests and program archives without gh. The attestation test runs
++# the install with the attested program archives.
++
++my $schema_two_dir = "$ROOT/schema-two";
++make_path($schema_two_dir, { mode => 0755 });
++my $schema_two_file = "$schema_two_dir/s.conf";
++my $schema_two_secret = "$schema_two_dir/secret.env";
++my $schema_two_document =
++    HostArtifactsTest::base_policy('suburban/schema-two', file_entries([$schema_two_file]));
++$schema_two_document->{programs} = [program_entry('tool')];
++$schema_two_document->{secret_fields} = [
++    {
++        name => 'SCHEMA_TOKEN',
++        storage_path => $schema_two_secret,
++        mode => '0600',
++        owner => 'root',
++        group => 'root',
++        pattern => '[a-z]+',
++        min_length => 1,
++        max_length => 64,
++        consumer_units => [],
++    },
++];
++my $schema_two_target = HostArtifactsTest::write_policy($schema_two_document);
++my $schema_two_policy = PVE::HostArtifacts::load_policy($schema_two_target);
++my $tool_bytes = "tool executable\n";
++my $tool_sha256 = Digest::SHA::sha256_hex($tool_bytes);
++my $tool_references = [{ name => 'tool', archive_stage => '2' x 32, bundle_stage => '3' x 32 }];
++
++sub manifest_program {
++    my (%override) = @_;
++
++    return {
++        name => 'tool',
++        repository => 'agoodkind/example',
++        release_tag => '202610300000-1-bbbbbbb',
++        asset => 'tool_linux_amd64.tar.gz',
++        sha256 => 'c' x 64,
++        source_revision => 'd' x 40,
++        signer_revision => 'e' x 40,
++        member => 'tool',
++        member_sha256 => $tool_sha256,
++        path => "$ROOT/programs/tool",
++        mode => '0755',
++        owner => 'root',
++        group => 'root',
++        %override,
++    };
++}
++
++my $schema_two_archive = sub {
++    my ($change) = @_;
++
++    my ($manifest, $members) = HostArtifactsTest::artifact(
++        $schema_two_document, { $schema_two_file => { content => "s\n" } },
++    );
++    $manifest->{schema_version} = 2;
++    $manifest->{programs} = [manifest_program()];
++    $change->($manifest) if $change;
++    return write_artifact('schema-two', $manifest, $members);
++};
++my $validate_schema_two = sub {
++    my ($archive_path, $references) = @_;
++
++    my $request = HostArtifactsTest::request($archive_path, program_stages => $references);
++    return PVE::HostArtifacts::validate_archive($schema_two_policy, $request, $archive_path);
++};
++
++my $tool_program =
++    $validate_schema_two->($schema_two_archive->(), $tool_references)->{programs}->{tool};
++$check->(
++    'validate_archive returns the executable file entry of a schema 2 program',
++    $tool_program->{file}->{path} eq "$ROOT/programs/tool"
++        && $tool_program->{file}->{member} eq 'tool'
++        && $tool_program->{file}->{sha256} eq $tool_sha256,
++);
++
++my $replace_program = sub {
++    my (%override) = @_;
++
++    return sub { $_[0]->{programs} = [manifest_program(%override)] };
++};
++my $schema_two_cases = [
++    [
++        'the request does not have a stage for a manifest program',
++        undef,
++        [],
++        qr/the manifest lists the program tool, and the request does not have a stage for it/,
++    ],
++    [
++        'the request has a stage for a program and the manifest has schema 1',
++        sub {
++            $_[0]->{schema_version} = 1;
++            delete $_[0]->{programs};
++        },
++        $tool_references,
++        qr/the request has a stage for the program tool, and the manifest does not list it/,
++    ],
++    [
++        'the request has a stage for a program that the manifest does not list',
++        sub { $_[0]->{programs} = [] },
++        $tool_references,
++        qr/the request has a stage for the program tool, and the manifest does not list it/,
++    ],
++    [
++        'the policy does not list a manifest program',
++        $replace_program->(name => 'other'),
++        [{ %{ $tool_references->[0] }, name => 'other' }],
++        qr/does not list the program other/,
++    ],
++    [
++        'a program repository differs from its policy entry',
++        $replace_program->(repository => 'agoodkind/other'),
++        $tool_references,
++        qr/manifest repository of the program tool is 'agoodkind\/other'/,
++    ],
++    [
++        'a program path differs from its policy entry',
++        $replace_program->(path => "$ROOT/programs/other"),
++        $tool_references,
++        qr/program tool does not match the path, mode, owner, and group in the policy/,
++    ],
++    [
++        'a program mode differs from its policy entry',
++        $replace_program->(mode => '0700'),
++        $tool_references,
++        qr/program tool does not match the path, mode, owner, and group in the policy/,
++    ],
++    [
++        'a program owner differs from its policy entry',
++        $replace_program->(owner => 'daemon'),
++        $tool_references,
++        qr/program tool does not match the path, mode, owner, and group in the policy/,
++    ],
++    [
++        'a program group differs from its policy entry',
++        $replace_program->(group => 'daemon'),
++        $tool_references,
++        qr/program tool does not match the path, mode, owner, and group in the policy/,
++    ],
++    [
++        'a program path equals a target file path',
++        $replace_program->(path => $schema_two_file),
++        $tool_references,
++        qr/matches a file path or a secret storage path of this target/,
++    ],
++    [
++        'a program path equals a secret storage path of the target',
++        $replace_program->(path => $schema_two_secret),
++        $tool_references,
++        qr/matches a file path or a secret storage path of this target/,
++    ],
++    [
++        'the manifest repeats a program',
++        sub { push @{ $_[0]->{programs} }, manifest_program() },
++        $tool_references,
++        qr/lists the program tool more than once/,
++    ],
++    [
++        'a program has an unknown field',
++        $replace_program->(extra => 1),
++        $tool_references,
++        qr/unknown field 'extra'/,
++    ],
++    [
++        'a program lacks a field',
++        sub { delete $_[0]->{programs}->[0]->{signer_revision} },
++        $tool_references,
++        qr/'signer_revision' is missing/,
++    ],
++    [
++        'a program member has a parent component',
++        $replace_program->(member => '../tool'),
++        $tool_references,
++        qr/has an empty, '\.', or '\.\.' component/,
++    ],
++    [
++        'the programs field is not a list',
++        sub { $_[0]->{programs} = {} },
++        $tool_references,
++        qr/the manifest programs field is not a JSON array/,
++    ],
++    [
++        'a schema 2 manifest lacks the programs field',
++        sub { delete $_[0]->{programs} },
++        $tool_references,
++        qr/the manifest programs field is not a JSON array/,
++    ],
++    [
++        'the manifest has an unknown schema',
++        sub {
++            $_[0]->{schema_version} = 3;
++            delete $_[0]->{programs};
++        },
++        $tool_references,
++        qr/the manifest schema_version is neither 1 nor 2/,
++    ],
++];
++for my $case (@$schema_two_cases) {
++    my ($label, $change, $references, $pattern) = @$case;
++    my $case_archive = $schema_two_archive->($change);
++    $check_error->(
++        "validate_archive rejects the manifest when $label",
++        sub { $validate_schema_two->($case_archive, $references) },
++        $pattern,
++    );
++}
++$check_unrelated->('validate_archive rejects invalid schema 2 manifests');
++
++my $tool_member = { name => 'tool', content => $tool_bytes, mode => 0755 };
++my $readme_member = { name => 'README.md', content => "readme text\n" };
++my $tool_archive_file = sub {
++    my ($name, $members) = @_;
++
++    my $path = "$WORK/$name.tar.gz";
++    HostArtifactsTest::write_archive($path, $members);
++    return $path;
++};
++my $valid_tool_archive = $tool_archive_file->('tool-valid', [$tool_member, $readme_member]);
++PVE::HostArtifacts::check_program_archive($tool_program, $valid_tool_archive);
++$check->(
++    'check_program_archive selects the executable member when the archive also contains README.md',
++    $tool_program->{file}->{size} == length($tool_bytes)
++        && $tool_program->{file}->{archive_path} eq $valid_tool_archive,
++);
++my $tool_archive_cases = [
++    ['an absent member', [$readme_member], qr/does not contain the member 'tool'/],
++    [
++        'a duplicated member',
++        [$tool_member, $tool_member],
++        qr/lists the member 'tool' more than once/,
++    ],
++    [
++        'a link member',
++        [{ name => 'tool', type => '2', linkname => '/etc/shadow' }],
++        qr/member 'tool' is not a regular file/,
++    ],
++    [
++        'changed member bytes',
++        [{ %$tool_member, content => "changed\n" }],
++        qr/member 'tool' of the program tool has SHA-256 [0-9a-f]{64}, and the manifest lists/,
++    ],
++];
++for my $case (@$tool_archive_cases) {
++    my ($label, $members, $pattern) = @$case;
++    my $case_archive = $tool_archive_file->('tool-case', $members);
++    $check_error->(
++        "check_program_archive rejects $label",
++        sub { PVE::HostArtifacts::check_program_archive($tool_program, $case_archive) },
++        $pattern,
++    );
++}
++$check_unrelated->('check_program_archive rejects invalid program archives');
 +
 +# The tests check installs of one target under the target lock.
 +
