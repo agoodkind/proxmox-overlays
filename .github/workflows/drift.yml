@@ -6,9 +6,11 @@ name: drift
 # test-host-artifacts-attestation against the patched pve-manager source in a
 # disposable container. It then removes its own container.
 #
-# The Proxmox packages are installed in a container image in GHCR. The image
-# tag includes a hash of the Proxmox package index, and the job builds a new
-# image only when Proxmox publishes a package.
+# The workflow installs the Proxmox packages in a container image in GHCR. The
+# image tag is <component>-<hash of the Proxmox package index>-<hash of
+# image/Dockerfile>. The workflow builds a new image when Proxmox publishes a
+# package or when image/Dockerfile changes. Otherwise, the workflow pulls the
+# existing image from GHCR.
 
 on:
   pull_request:
@@ -95,7 +97,8 @@ jobs:
         env:
           TAG: ${{ steps.index.outputs.tag }}
         run: |
-          # The command uses --cidfile instead of --name because Docker writes the container ID even when the container fails to start.
+          # The command uses --cidfile instead of --name because Docker writes the
+          # container ID even when the container fails to start.
           docker run --detach --cidfile "$RUNNER_TEMP/host-api-test.cid" \
             --privileged --cgroupns=host --network none \
             --env HOST_ARTIFACT_FIXTURE_DIR=/fixture \
@@ -116,7 +119,13 @@ jobs:
         if: failure() && steps.boot.outcome != 'skipped'
         continue-on-error: true
         run: |
-          id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
+          set +e
+          cid_file="$RUNNER_TEMP/host-api-test.cid"
+          if [ ! -s "$cid_file" ]; then
+            echo "The job did not create a container."
+            exit 0
+          fi
+          id="$(cat "$cid_file")"
           docker logs "$id"
           docker exec "$id" systemctl --failed
           docker exec "$id" journalctl --no-pager
