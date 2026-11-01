@@ -2,10 +2,15 @@ name: drift
 
 # Applies the patches to the newest published Proxmox VE packages and loads
 # the patched modules. A failure means a patch no longer fits a release.
+# The job also runs test-host-artifacts, test-host-secrets, and
+# test-host-artifacts-attestation against the patched pve-manager source in a
+# disposable container. It then removes its own container.
 #
-# The Proxmox packages are installed in a container image in GHCR. The image
-# tag includes a hash of the Proxmox package index, and the job builds a new
-# image only when Proxmox publishes a package.
+# The workflow installs the Proxmox packages in a container image in GHCR. The
+# image tag is <component>-<hash of the Proxmox package index>-<hash of
+# image/Dockerfile>. The workflow builds a new image when Proxmox publishes a
+# package or when image/Dockerfile changes. Otherwise, the workflow pulls the
+# existing image from GHCR.
 
 on:
   pull_request:
@@ -31,6 +36,7 @@ jobs:
     env:
       PVE_COMPONENT: ${{ matrix.component }}
       IMAGE: ghcr.io/${{ github.repository }}/pve
+      PVE_MANAGER_BASE: 58350116c198b838dfb50739e886bc92bcc751c3
     steps:
       - uses: actions/checkout@v4
       - name: Hash the Proxmox package index
@@ -38,7 +44,8 @@ jobs:
         run: |
           index_url="http://download.proxmox.com/debian/pve/dists/trixie/$PVE_COMPONENT/binary-amd64/Packages.gz"
           index_hash="$(curl --fail --silent --show-error --location "$index_url" | sha256sum | cut -c1-16)"
-          echo "tag=$PVE_COMPONENT-$index_hash" >> "$GITHUB_OUTPUT"
+          image_hash="$(sha256sum image/Dockerfile | cut -c1-16)"
+          echo "tag=$PVE_COMPONENT-$index_hash-$image_hash" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -62,3 +69,78 @@ jobs:
         env:
           TAG: ${{ steps.index.outputs.tag }}
         run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" /overlay/pve-overlay verify --no-system
+      - name: Check out pve-manager source at the upstream base commit
+        uses: actions/checkout@v4
+        with:
+          repository: agoodkind/pve-manager
+          ref: ${{ env.PVE_MANAGER_BASE }}
+          path: pve-manager
+      - name: Apply patches/pve-manager.patch to pve-manager source
+        run: git -C pve-manager apply "$PWD/patches/pve-manager.patch"
+      - name: Download the attested host test fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture"
+          cd "$RUNNER_TEMP/fixture"
+          fetch() {
+            gh release download "$2" --repo "$1" --pattern "$3"
+            gh attestation download "$3" --repo "$1"
+            mv "sha256:$(sha256sum "$3" | cut -d ' ' -f 1).jsonl" "$3.sigstore.jsonl"
+          }
+          fetch agoodkind/configsctl 202610300043-29-7976a64 configsctl_linux_amd64.tar.gz
+          fetch agoodkind/opnsensectl 202609190337-7-7db20fb opnsensectl_linux_amd64.tar.gz
+          fetch agoodkind/mwan 202610291257-ff-c09e62f mwan_linux_amd64.tar.gz
+          gh attestation trusted-root > trusted_root.jsonl
+      - name: Start systemd in the disposable test container
+        id: boot
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: |
+          # The command uses --cidfile instead of --name because Docker writes the
+          # container ID even when the container fails to start.
+          docker run --detach --cidfile "$RUNNER_TEMP/host-api-test.cid" \
+            --privileged --cgroupns=host --network none \
+            --env HOST_ARTIFACT_FIXTURE_DIR=/fixture \
+            --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --volume "$PWD:/overlay:ro" \
+            --volume "$PWD/pve-manager:/src/pve-manager" \
+            --volume "$RUNNER_TEMP/fixture:/fixture:ro" \
+            "$IMAGE:$TAG" /lib/systemd/systemd
+          id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
+          timeout 120 sh -c "until docker exec $id test -d /run/systemd/system; do sleep 1; done"
+      - name: Run the pve-manager host API tests
+        run: |
+          id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
+          docker exec "$id" /overlay/pve-overlay apply --no-system
+          docker exec "$id" make -k -C /src/pve-manager/test \
+            test-host-artifacts test-host-secrets test-host-artifacts-attestation
+      - name: Print container diagnostics after a failure
+        if: failure() && steps.boot.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          set +e
+          cid_file="$RUNNER_TEMP/host-api-test.cid"
+          if [ ! -s "$cid_file" ]; then
+            echo "The job did not create a container."
+            exit 0
+          fi
+          id="$(cat "$cid_file")"
+          docker logs "$id"
+          docker exec "$id" systemctl --failed
+          docker exec "$id" journalctl --no-pager
+      - name: Remove the test container and verify its removal
+        if: always() && steps.boot.outcome != 'skipped'
+        run: |
+          cid_file="$RUNNER_TEMP/host-api-test.cid"
+          if [ ! -s "$cid_file" ]; then
+            echo "The job did not create a container."
+            exit 0
+          fi
+          id="$(cat "$cid_file")"
+          docker rm --force "$id"
+          remaining="$(docker ps --all --quiet --no-trunc --filter "id=$id")"
+          if [ -n "$remaining" ]; then
+            echo "Container $id still exists after removal."
+            exit 1
+          fi

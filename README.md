@@ -59,8 +59,8 @@ Both grants are required. The token cannot change another option or another gues
 
 ## Drift check
 
-The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. A failed run means a patch needs a rebase in its fork.
+The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. A failed run means a patch needs a rebase in its fork. The job also runs `test-host-artifacts`, `test-host-secrets`, and `test-host-artifacts-attestation` against the pve-manager source rebuilt from `patches/pve-manager.patch` in a disposable container, then removes that container.
 
-The packages are installed in a container image in GHCR, built from `image/Dockerfile`. The image tag includes a hash of the Proxmox package index. The workflow builds a new image only when Proxmox publishes a package.
+The workflow installs the packages in a container image in GHCR and builds the image from `image/Dockerfile`. The image tag is `<component>-<hash of the Proxmox package index>-<hash of image/Dockerfile>`. The workflow builds a new image when Proxmox publishes a package or when `image/Dockerfile` changes. Otherwise, the workflow pulls the existing image from GHCR.
 
 To update a patch, run `git diff <upstream base commit> HEAD --output=<patch file>` on the `overlays` branch of the fork.
