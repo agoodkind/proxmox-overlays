@@ -1093,10 +1093,10 @@ index 2ca3244d..0cceaeea 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..1d5252d9
+index 00000000..35f2363c
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2012 @@
+@@ -0,0 +1,2009 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -1397,8 +1397,7 @@ index 00000000..1d5252d9
 +    }
 +};
 +
-+# The function validates the secret fields of a policy. Each field has its own storage file
-+# outside the policy files and directories. The function anchors the pattern at both ends.
++# Artifact installation and secret rotation use different storage paths.
 +my $check_secret_fields = sub {
 +    my ($list, $label, $files, $directories) = @_;
 +
@@ -1612,8 +1611,6 @@ index 00000000..1d5252d9
 +    }
 +};
 +
-+# The function writes a temporary file in the same directory, syncs it, and renames it to
-+# the destination. The function then syncs the directory.
 +my $write_file_atomic = sub {
 +    my ($path, $content, $mode) = @_;
 +
@@ -3123,10 +3120,10 @@ index efcb250d..73cf7879 100644
  	PullMetric.pm		\
 diff --git a/test/HostArtifactsTest.pm b/test/HostArtifactsTest.pm
 new file mode 100644
-index 00000000..fae75a03
+index 00000000..f4962a65
 --- /dev/null
 +++ b/test/HostArtifactsTest.pm
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,364 @@
 +package HostArtifactsTest;
 +
 +use strict;
@@ -3376,7 +3373,6 @@ index 00000000..fae75a03
 +    return $stage;
 +}
 +
-+# The function waits until the task of the UPID exits and returns its status line and log.
 +sub wait_for_task {
 +    my ($upid) = @_;
 +
@@ -3398,9 +3394,6 @@ index 00000000..fae75a03
 +    print "OK: $label\n";
 +}
 +
-+# The function returns the content and metadata of the listed files and of the installed record,
-+# secret record, journal, and lock file of one target. A test compares the result before and
-+# after a request for another target.
 +sub target_state {
 +    my ($target, @paths) = @_;
 +
@@ -3685,10 +3678,10 @@ index 00000000..64dcdc1f
 +exit(0);
 diff --git a/test/HostArtifacts_test.pl b/test/HostArtifacts_test.pl
 new file mode 100755
-index 00000000..fcff0805
+index 00000000..b6509665
 --- /dev/null
 +++ b/test/HostArtifacts_test.pl
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,1451 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the host artifact module and API methods against the real file system. It writes
@@ -3890,7 +3883,6 @@ index 00000000..fcff0805
 +    return $error;
 +}
 +
-+# The function writes the policy of a new target and returns the policy document and loaded policy.
 +sub new_target {
 +    my ($workspace, $files, $directories, $parents) = @_;
 +
