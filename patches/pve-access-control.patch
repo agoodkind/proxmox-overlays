@@ -63,10 +63,10 @@ index 1e64786..b8fa21b 100644
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
  	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index 8879ab8..9c75b9e 100644
+index a4e1c36..3232890 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
-@@ -1049,6 +1049,113 @@ sub delete_pool_acl {
+@@ -1093,6 +1093,113 @@ sub delete_pool_acl {
      delete($usercfg->{acl_root}->{children}->{pool}->{children}->{$pool});
  }
  
@@ -180,7 +180,7 @@ index 8879ab8..9c75b9e 100644
  # we automatically create some predefined roles by splitting privs
  # into 3 groups (per category)
  # root: only root is allowed to do that
-@@ -1056,7 +1163,16 @@ sub delete_pool_acl {
+@@ -1100,7 +1207,16 @@ sub delete_pool_acl {
  # user: a normal user/customer can to that
  my $privgroups = {
      VM => {
@@ -198,7 +198,7 @@ index 8879ab8..9c75b9e 100644
          admin => [
              'VM.Config.Disk',
              'VM.Config.CPU',
-@@ -1092,6 +1208,29 @@ my $privgroups = {
+@@ -1136,6 +1252,29 @@ my $privgroups = {
              'Sys.Modify', # edit/change node settings
              'Sys.Incoming', # incoming storage/guest migrations
              'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
@@ -228,7 +228,7 @@ index 8879ab8..9c75b9e 100644
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1282,11 +1421,18 @@ sub check_path {
+@@ -1326,11 +1465,18 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -246,7 +246,7 @@ index 8879ab8..9c75b9e 100644
 +	|/hostnic/[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}
  	|/nodes
  	|/nodes/[[:alnum:]\.\-\_]+
- 	|/pool
+ 	|/nodes/[[:alnum:]\.\-\_]+/certificates
 diff --git a/src/test/Makefile b/src/test/Makefile
 index 53f2da7..3759b7f 100644
 --- a/src/test/Makefile
