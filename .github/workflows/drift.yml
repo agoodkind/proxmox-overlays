@@ -101,6 +101,7 @@ jobs:
           # container ID even when the container fails to start.
           docker run --detach --cidfile "$RUNNER_TEMP/host-api-test.cid" \
             --privileged --cgroupns=host --network none \
+            --hostname hypervisor --add-host hypervisor:192.0.2.1 \
             --env HOST_ARTIFACT_FIXTURE_DIR=/fixture \
             --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
             --volume "$PWD:/overlay:ro" \
@@ -109,10 +110,33 @@ jobs:
             "$IMAGE:$TAG" /lib/systemd/systemd
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           timeout 120 sh -c "until docker exec $id test -d /run/systemd/system; do sleep 1; done"
-      - name: Run the pve-manager host API tests
+      - name: Apply the overlay and require the local Proxmox API
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           docker exec "$id" /overlay/pve-overlay apply --no-system
+          if ! docker exec "$id" test -c /dev/fuse; then
+            echo "The test container does not expose /dev/fuse as a character device."
+            exit 1
+          fi
+          docker exec "$id" timeout 120 systemctl start pve-cluster
+          ready=false
+          for attempt in {1..30}; do
+            if docker exec "$id" timeout 5 mountpoint -q /etc/pve; then
+              if docker exec "$id" timeout 5 /usr/bin/pvesh get /version --output-format json; then
+                ready=true
+                break
+              fi
+            fi
+            echo "pve-cluster readiness attempt $attempt failed."
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            echo "pve-cluster did not mount /etc/pve and serve /version within 30 attempts."
+            exit 1
+          fi
+      - name: Run the pve-manager host API tests
+        run: |
+          id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           docker exec "$id" make -k -C /src/pve-manager/test \
             test-host-artifacts test-host-secrets test-host-artifacts-attestation
       - name: Print container diagnostics after a failure
@@ -128,6 +152,8 @@ jobs:
           id="$(cat "$cid_file")"
           docker logs "$id"
           docker exec "$id" systemctl --failed
+          docker exec "$id" systemctl status --no-pager --full pve-cluster
+          docker exec "$id" journalctl --unit pve-cluster --no-pager
           docker exec "$id" journalctl --no-pager
       - name: Remove the test container and verify its removal
         if: always() && steps.boot.outcome != 'skipped'
