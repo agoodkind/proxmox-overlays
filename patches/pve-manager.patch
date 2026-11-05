@@ -3462,12 +3462,125 @@ index efcb250d..73cf7879 100644
  	Jobs.pm			\
  	NodeConfig.pm		\
  	PullMetric.pm		\
+diff --git a/test/HostArtifactsInstalledSourceRunLog_test.pl b/test/HostArtifactsInstalledSourceRunLog_test.pl
+new file mode 100755
+index 00000000..06a3613e
+--- /dev/null
++++ b/test/HostArtifactsInstalledSourceRunLog_test.pl
+@@ -0,0 +1,107 @@
++#!/usr/bin/env perl
++
++use strict;
++use warnings;
++
++use Digest::SHA qw(sha256_hex);
++use File::Copy qw(copy);
++use File::Path qw(make_path);
++use File::Temp qw(tempdir tempfile);
++use FindBin;
++use IPC::Open3;
++use Test::More;
++
++use lib $FindBin::Bin;
++use HostArtifactsInstalledSourceTest;
++
++my ($configsctl, $tofu) = @ARGV;
++die "usage: $0 /absolute/path/to/configsctl /absolute/path/to/tofu\n"
++    unless @ARGV == 2 && $configsctl =~ m{\A/} && $tofu =~ m{\A/}
++    && -x $configsctl && -x $tofu;
++umask(0077);
++my $private = tempdir('installed-source-runlog-XXXXXXXX', TMPDIR => 1);
++make_path(map { "$private/$_" } qw(tmp bin data native workspaces/sample
++    ansible/inventory/group_vars/all home/.config/ansible));
++for my $pair (
++    ['installed-source-runlog/configsctl.yml', 'configsctl.yml'],
++    ['installed-source-runlog/main.tf', 'workspaces/sample/main.tf'],
++    ['installed-source-runlog/native.tf', 'native/main.tf'],
++    ['installed-source-seed.vault', 'ansible/inventory/group_vars/all/vault.yml'],
++    ['installed-source-seed.pass', 'home/.config/ansible/vault.pass'],
++) {
++    copy("$FindBin::Bin/$pair->[0]", "$private/$pair->[1]") or die "cannot copy fixture: $!\n";
++    chmod(0600, "$private/$pair->[1]") == 1 or die "cannot restrict fixture: $!\n";
++}
++symlink($tofu, "$private/bin/tofu") or die "cannot link the real OpenTofu executable: $!\n";
++chdir($private) or die "cannot enter the private fixture: $!\n";
++local %ENV = (HOME => "$private/home", PATH => "$private/bin:/usr/bin:/bin",
++    TMPDIR => "$private/tmp", TF_DATA_DIR => "$private/data", TF_IN_AUTOMATION => '1');
++my $token = HostArtifactsInstalledSourceTest::random_token();
++my $password;
++{
++    open(my $file, '<', "$private/home/.config/ansible/vault.pass") or die "cannot read seed: $!\n";
++    local $/;
++    $password = <$file>;
++    close($file) or die "cannot close seed: $!\n";
++    chomp($password);
++}
++my @credentials = ($password, $token);
++my $logs = {};
++
++sub invoke {
++    my ($input, $expected, @arguments) = @_;
++    my ($out) = tempfile(DIR => $private, UNLINK => 1);
++    my ($err) = tempfile(DIR => $private, UNLINK => 1);
++    my $pid = open3(my $writer, '>&' . fileno($out), '>&' . fileno($err), $configsctl, @arguments);
++    print {$writer} $input or die "cannot write command input: $!\n" if length($input);
++    close($writer) or die "cannot close command input: $!\n";
++    waitpid($pid, 0) == $pid or die "cannot wait for configsctl: $!\n";
++    my $status = $?;
++    my $output = '';
++    for my $file ($out, $err) {
++        seek($file, 0, 0) or die "cannot rewind command output: $!\n";
++        local $/;
++        $output .= (<$file> // '') . "\n";
++    }
++    for my $value (@credentials) {
++        die "command output exposed a fixture credential\n" if index($output, $value) >= 0;
++    }
++    die "configsctl stopped on a signal\n" if $status & 127;
++    is($status >> 8, $expected, "configsctl @arguments exits with $expected") or die $output;
++    my $new;
++    ($logs, $new) = HostArtifactsInstalledSourceTest::check_run_logs(
++        "$private/tmp", $logs, $output, \@credentials);
++    return ($output, $new);
++}
++
++invoke("vault_installed_source_token: '$token'\n", 0, 'set-secrets');
++my (undef, $init) = invoke('', 0, 'tofu', 'sample', 'init', '-input=false', '-no-color');
++ok(scalar(grep { m{/tofu-init-} } keys %$init), 'successful init retains its private diagnostic log');
++is(scalar(keys %$init), 3, 'init and native configuration retain three checked logs');
++$ENV{TF_VAR_expected_token_sha256} = sha256_hex("wrong-$token");
++my ($output, $plan) = invoke('', 1, 'tofu', 'sample', 'plan', '-input=false', '-no-color');
++my $diagnostic = 'The supplied token must match the expected SHA-256 digest.';
++ok(index($output, $diagnostic) < 0, 'the failed plan does not print its validation diagnostic');
++my @failed = grep { m{/tofu-plan-} && index($plan->{$_}, $diagnostic) >= 0 } keys %$plan;
++is(scalar(@failed), 1, 'the new failed plan log contains the validation diagnostic');
++HostArtifactsInstalledSourceTest::require_log_diagnostic($plan, 'plan', $diagnostic);
++eval { HostArtifactsInstalledSourceTest::require_log_diagnostic($init, 'plan', $diagnostic); };
++like($@, qr/the new plan logs did not report/, 'older logs cannot satisfy the failed plan diagnostic');
++is(scalar(keys %$plan), 4, 'the failed plan scans only its four new native logs');
++is(scalar(keys %$logs), 7, 'both invocations preserve all seven diagnostic logs');
++
++my $rejected = "$private/rejected";
++make_path("$rejected/configsctl-installed-leftover");
++eval { HostArtifactsInstalledSourceTest::check_run_logs($rejected, {}, '', \@credentials); };
++like($@, qr/unexpected temporary execution files/, 'an execution copy still fails cleanup');
++my $leaked = "$private/leaked/configs-runs";
++make_path($leaked);
++my ($name) = $failed[0] =~ m{/([^/]+)\z};
++copy($failed[0], "$leaked/$name") or die "cannot copy the real plan log: $!\n";
++open(my $file, '>>', "$leaked/$name") or die "cannot append the private test credential: $!\n";
++print {$file} $token or die "cannot write the private test credential: $!\n";
++close($file) or die "cannot close the copied log: $!\n";
++eval { HostArtifactsInstalledSourceTest::check_run_logs("$private/leaked", {}, '', \@credentials); };
++like($@, qr/run log exposed a fixture credential/, 'the scanner rejects a credential in a copied real log');
++print "Private native fixture and diagnostic logs: $private\n";
++done_testing();
 diff --git a/test/HostArtifactsInstalledSourceTest.pm b/test/HostArtifactsInstalledSourceTest.pm
 new file mode 100644
-index 00000000..cdc38037
+index 00000000..3b420aca
 --- /dev/null
 +++ b/test/HostArtifactsInstalledSourceTest.pm
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,406 @@
 +package HostArtifactsInstalledSourceTest;
 +
 +use strict;
@@ -3490,6 +3603,7 @@ index 00000000..cdc38037
 +my $target = sha256_hex($workspace);
 +my $json;
 +my @sensitive;
++my %run_logs;
 +
 +sub assert_private {
 +    my ($content, $label) = @_;
@@ -3505,6 +3619,59 @@ index 00000000..cdc38037
 +
 +sub digest {
 +    return Digest::SHA->new(256)->addfile($_[0])->hexdigest;
++}
++
++sub check_run_logs {
++    my ($temporary, $previous, $output, $credentials) = @_;
++    opendir(my $temporary_dir, $temporary)
++        or die "cannot inspect temporary execution files: $!\n";
++    my @left = grep { $_ ne '.' && $_ ne '..' } readdir($temporary_dir);
++    closedir($temporary_dir) or die "cannot close temporary execution directory: $!\n";
++    die "unexpected temporary execution files: @left\n"
++        if grep { $_ ne 'configs-runs' } @left;
++    my (%logs, %new);
++    if (@left) {
++        my $directory = "$temporary/configs-runs";
++        die "the run log directory must be a private owned directory\n"
++            unless !-l $directory && -d $directory && ((stat($directory))[2] & 07777) == 0700
++            && (stat($directory))[4] == $>;
++        opendir(my $log_dir, $directory) or die "cannot inspect run logs: $!\n";
++        my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($log_dir);
++        closedir($log_dir) or die "cannot close run log directory: $!\n";
++        for my $entry (@entries) {
++            my $path = "$directory/$entry";
++            die "unexpected retained run log: $path\n"
++                unless $entry =~ /\Atofu-(?:init|plan|show|apply)-[0-9]{8}T[0-9]{6}Z(?:-[0-9]+)?\.log\z/;
++            die "the run log must be a private owned regular file: $path\n"
++                unless !-l $path && -f $path && ((stat($path))[2] & 07777) == 0600
++                && (stat($path))[4] == $>;
++            open(my $file, '<:raw', $path) or die "cannot read run log $path: $!\n";
++            local $/;
++            my $content = <$file> // '';
++            close($file) or die "cannot close run log $path: $!\n";
++            for my $value (@$credentials) {
++                die "run log exposed a fixture credential\n" if index($content, $value) >= 0;
++            }
++            $logs{$path} = sha256_hex($content);
++            if (exists($previous->{$path})) {
++                die "a retained run log changed: $path\n" unless $logs{$path} eq $previous->{$path};
++            } else {
++                die "the command did not announce its new run log: $path\n"
++                    unless index($output, "Tofu output streams to $path\n") >= 0;
++                $new{$path} = $content;
++            }
++        }
++    }
++    for my $path (keys %$previous) {
++        die "the command removed a retained run log: $path\n" unless exists($logs{$path});
++    }
++    return (\%logs, \%new);
++}
++
++sub require_log_diagnostic {
++    my ($logs, $kind, $message) = @_;
++    my @matching = grep { m{/tofu-\Q$kind\E-} && index($logs->{$_}, $message) >= 0 } keys %$logs;
++    die "the new $kind logs did not report $message\n" unless @matching;
 +}
 +
 +sub command {
@@ -3524,15 +3691,20 @@ index 00000000..cdc38037
 +        assert_private($output[-1], 'command output');
 +    }
 +    my $label = join(' ', @args);
++    my ($logs, $new_logs) = check_run_logs("$private/tmp", \%run_logs,
++        join("\n", @output), \@sensitive);
++    %run_logs = %$logs;
 +    die "$label stopped on signal " . ($status & 127) . "\n" if $status & 127;
 +    my $code = $status >> 8;
 +    die "$label exited with $code (expected $expected)\n$output[1]\n" if $code != $expected;
-+    die "$label did not report $diagnostic\n$output[1]\n"
-+        if defined($diagnostic) && index(join("\n", @output), $diagnostic) < 0;
-+    opendir(my $dir, "$private/tmp") or die "cannot inspect temporary execution files: $!\n";
-+    my @left = grep { $_ ne '.' && $_ ne '..' } readdir($dir);
-+    closedir($dir);
-+    die "$label left temporary execution files: @left\n" if @left;
++    if (defined($diagnostic)) {
++        if (ref($diagnostic) eq 'HASH') {
++            require_log_diagnostic($new_logs, $diagnostic->{log}, $diagnostic->{message});
++        } else {
++            die "$label did not report $diagnostic\n$output[1]\n"
++                if index(join("\n", @output), $diagnostic) < 0;
++        }
++    }
 +    print "$label exited with $code\n";
 +    return @output;
 +}
@@ -3742,7 +3914,8 @@ index 00000000..cdc38037
 +    tofu(0, undef, 'init', '-input=false');
 +    {
 +        local $ENV{TF_VAR_expected_token_sha256} = sha256_hex($second);
-+        tofu(1, 'The supplied token must match the expected SHA-256 digest.', 'plan', '-input=false', '-no-color');
++        tofu(1, { log => 'plan', message => 'The supplied token must match the expected SHA-256 digest.' },
++            'plan', '-input=false', '-no-color');
 +    }
 +    my $plan = "$private/plans/first.tfplan";
 +    tofu(0, undef, 'plan', '-input=false', "-out=$plan");
@@ -7971,10 +8144,10 @@ index 00000000..dc992d43
 +
 +exit(0);
 diff --git a/test/Makefile b/test/Makefile
-index 2dfd20a4..a744c11c 100644
+index 2dfd20a4..9bd55fbc 100644
 --- a/test/Makefile
 +++ b/test/Makefile
-@@ -61,6 +61,26 @@ test-custom-cpu-models:
+@@ -61,6 +61,30 @@ test-custom-cpu-models:
  test-pvesh:
  	./pvesh_test.pl
  
@@ -7997,6 +8170,10 @@ index 2dfd20a4..a744c11c 100644
 +.PHONY: test-host-artifacts-installed-source
 +test-host-artifacts-installed-source:
 +	./HostArtifacts_attestation_test.pl --installed-source
++
++.PHONY: test-host-artifacts-installed-source-runlog
++test-host-artifacts-installed-source-runlog:
++	perl ./HostArtifactsInstalledSourceRunLog_test.pl "$(CONFIGSCTL)" "$(TOFU)"
 +
  .PHONY: install
  install:
@@ -8044,6 +8221,61 @@ index 00000000..faa1e884
 +    sleep 0.2
 +done
 +printf '%s' "${TEST_API_KEY:-}" | sha256sum | cut -d ' ' -f 1 > "$STATE_DIR/received"
+diff --git a/test/installed-source-runlog/configsctl.yml b/test/installed-source-runlog/configsctl.yml
+new file mode 100644
+index 00000000..c56b00fa
+--- /dev/null
++++ b/test/installed-source-runlog/configsctl.yml
+@@ -0,0 +1,4 @@
++tofu:
++  workspaces_dir: workspaces
++  configuration_root: native
++  env_key_prefix: fixture_env_
+diff --git a/test/installed-source-runlog/main.tf b/test/installed-source-runlog/main.tf
+new file mode 100644
+index 00000000..3cdba26f
+--- /dev/null
++++ b/test/installed-source-runlog/main.tf
+@@ -0,0 +1,24 @@
++terraform {
++  backend "local" {
++    path = "state.tfstate"
++  }
++}
++
++variable "vault_installed_source_token" {
++  type      = string
++  sensitive = true
++  ephemeral = true
++
++  validation {
++    condition     = sha256(var.vault_installed_source_token) == var.expected_token_sha256
++    error_message = "The supplied token must match the expected SHA-256 digest."
++  }
++}
++
++variable "expected_token_sha256" {
++  type = string
++}
++
++resource "terraform_data" "marker" {
++  input = "one"
++}
+diff --git a/test/installed-source-runlog/native.tf b/test/installed-source-runlog/native.tf
+new file mode 100644
+index 00000000..7d738cfa
+--- /dev/null
++++ b/test/installed-source-runlog/native.tf
+@@ -0,0 +1,9 @@
++variable "workspace" {
++  type = string
++}
++
++output "lock_targets" {
++  value = {
++    lock_free_types = ["terraform_data"]
++  }
++}
 diff --git a/test/installed-source-seed.pass b/test/installed-source-seed.pass
 new file mode 100644
 index 00000000..f3097ab1
