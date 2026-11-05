@@ -119,21 +119,8 @@ jobs:
             exit 1
           fi
           docker exec "$id" timeout 120 systemctl start pve-cluster
-          ready=false
-          for attempt in {1..30}; do
-            if docker exec "$id" timeout 5 mountpoint -q /etc/pve; then
-              if docker exec "$id" timeout 5 /usr/bin/pvesh get /version --output-format json; then
-                ready=true
-                break
-              fi
-            fi
-            echo "pve-cluster readiness attempt $attempt failed."
-            sleep 1
-          done
-          if [ "$ready" != true ]; then
-            echo "pve-cluster did not mount /etc/pve and serve /version within 30 attempts."
-            exit 1
-          fi
+          docker exec "$id" timeout 5 mountpoint /etc/pve
+          docker exec "$id" timeout 5 /usr/bin/pvesh get /version --output-format json
       - name: Run the pve-manager host API tests
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
