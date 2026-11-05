@@ -3464,10 +3464,10 @@ index efcb250d..73cf7879 100644
  	PullMetric.pm		\
 diff --git a/test/HostArtifactsInstalledSourceRunLog_test.pl b/test/HostArtifactsInstalledSourceRunLog_test.pl
 new file mode 100755
-index 00000000..7a895d8d
+index 00000000..c7df5457
 --- /dev/null
 +++ b/test/HostArtifactsInstalledSourceRunLog_test.pl
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,94 @@
 +#!/usr/bin/env perl
 +
 +use strict;
@@ -3476,9 +3476,8 @@ index 00000000..7a895d8d
 +use Digest::SHA qw(sha256_hex);
 +use File::Copy qw(copy);
 +use File::Path qw(make_path);
-+use File::Temp qw(tempdir tempfile);
++use File::Temp qw(tempdir);
 +use FindBin;
-+use IPC::Open3;
 +use Test::More;
 +
 +use lib $FindBin::Bin;
@@ -3523,24 +3522,10 @@ index 00000000..7a895d8d
 +
 +sub invoke {
 +    my ($input, $expected, @arguments) = @_;
-+    my ($out) = tempfile(DIR => $private, UNLINK => 1);
-+    my ($err) = tempfile(DIR => $private, UNLINK => 1);
-+    my $pid = open3(my $writer, '>&' . fileno($out), '>&' . fileno($err), $configsctl, @arguments);
-+    print {$writer} $input or die "cannot write command input: $!\n" if length($input);
-+    close($writer) or die "cannot close command input: $!\n";
-+    waitpid($pid, 0) == $pid or die "cannot wait for configsctl: $!\n";
-+    my $status = $?;
-+    my $output = '';
-+    for my $file ($out, $err) {
-+        seek($file, 0, 0) or die "cannot rewind command output: $!\n";
-+        local $/;
-+        $output .= (<$file> // '') . "\n";
-+    }
-+    for my $value (@credentials) {
-+        die "command output exposed a fixture credential\n" if index($output, $value) >= 0;
-+    }
-+    die "configsctl stopped on a signal\n" if $status & 127;
-+    is($status >> 8, $expected, "configsctl @arguments exits with $expected") or die $output;
++    my ($code, $streams) = HostArtifactsInstalledSourceTest::capture_command(
++        $private, \@credentials, $input, $configsctl, @arguments);
++    my $output = join("\n", @$streams);
++    is($code, $expected, "configsctl @arguments exits with $expected") or die $output;
 +    my $new;
 +    ($logs, $new) = HostArtifactsInstalledSourceTest::check_run_logs(
 +        "$private/tmp", $logs, $output, \@credentials);
@@ -3579,10 +3564,10 @@ index 00000000..7a895d8d
 +done_testing();
 diff --git a/test/HostArtifactsInstalledSourceTest.pm b/test/HostArtifactsInstalledSourceTest.pm
 new file mode 100644
-index 00000000..a6f80004
+index 00000000..3c0bc6a5
 --- /dev/null
 +++ b/test/HostArtifactsInstalledSourceTest.pm
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,428 @@
 +package HostArtifactsInstalledSourceTest;
 +
 +use strict;
@@ -3676,10 +3661,10 @@ index 00000000..a6f80004
 +    die "the new $kind logs did not report $message\n" unless @matching;
 +}
 +
-+sub command {
-+    my ($input, $expected, $diagnostic, @args) = @_;
-+    my ($out) = tempfile(UNLINK => 1, DIR => $private);
-+    my ($err) = tempfile(UNLINK => 1, DIR => $private);
++sub capture_command {
++    my ($directory, $credentials, $input, @args) = @_;
++    my ($out) = tempfile(UNLINK => 1, DIR => $directory);
++    my ($err) = tempfile(UNLINK => 1, DIR => $directory);
 +    my $pid = open3(my $writer, '>&' . fileno($out), '>&' . fileno($err), @args);
 +    print {$writer} $input or die "cannot write command input: $!\n" if length($input);
 +    close($writer) or die "cannot close command input: $!\n";
@@ -3690,14 +3675,23 @@ index 00000000..a6f80004
 +        seek($file, 0, 0) or die "cannot rewind command output: $!\n";
 +        local $/;
 +        push @output, scalar(<$file>) // '';
-+        assert_private($output[-1], 'command output');
++        for my $value (@$credentials) {
++            die "command output exposed a fixture credential\n" if index($output[-1], $value) >= 0;
++        }
 +    }
++    my $label = join(' ', @args);
++    die "$label stopped on signal " . ($status & 127) . "\n" if $status & 127;
++    return ($status >> 8, \@output);
++}
++
++sub command {
++    my ($input, $expected, $diagnostic, @args) = @_;
++    my ($code, $output) = capture_command($private, \@sensitive, $input, @args);
++    my @output = @$output;
 +    my $label = join(' ', @args);
 +    my ($logs, $new_logs) = check_run_logs("$private/tmp", \%run_logs,
 +        join("\n", @output), \@sensitive);
 +    %run_logs = %$logs;
-+    die "$label stopped on signal " . ($status & 127) . "\n" if $status & 127;
-+    my $code = $status >> 8;
 +    die "$label exited with $code (expected $expected)\n$output[1]\n" if $code != $expected;
 +    if (defined($diagnostic)) {
 +        if (ref($diagnostic) eq 'HASH') {
@@ -4002,12 +3996,32 @@ index 00000000..a6f80004
 +}
 +
 +1;
+diff --git a/test/HostArtifactsInstalledSource_test.pl b/test/HostArtifactsInstalledSource_test.pl
+new file mode 100755
+index 00000000..c53fb789
+--- /dev/null
++++ b/test/HostArtifactsInstalledSource_test.pl
+@@ -0,0 +1,14 @@
++#!/usr/bin/perl -T
++
++use strict;
++use warnings;
++
++use lib qw(.. .);
++
++use HostArtifactsTest;
++use HostArtifactsInstalledSourceTest;
++
++die "this test does not accept arguments\n" if @ARGV;
++my ($rpcenv, $fixture_dir, $user) = HostArtifactsTest::initialize_attested_fixture();
++HostArtifactsInstalledSourceTest::run($rpcenv, $user, "$fixture_dir/installed-source");
++exit(0);
 diff --git a/test/HostArtifactsTest.pm b/test/HostArtifactsTest.pm
 new file mode 100644
-index 00000000..f4962a65
+index 00000000..2c2f1146
 --- /dev/null
 +++ b/test/HostArtifactsTest.pm
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,416 @@
 +package HostArtifactsTest;
 +
 +use strict;
@@ -4026,6 +4040,7 @@ index 00000000..f4962a65
 +use PVE::HostArtifacts;
 +use PVE::INotify;
 +use PVE::ProcFSTools;
++use PVE::RPCEnvironment;
 +use PVE::Tools;
 +
 +my $TARGET_POLICY_DIR = '/etc/pve-overlay/host-artifacts/targets';
@@ -4036,6 +4051,8 @@ index 00000000..f4962a65
 +my $TAR_BLOCK_BYTES = 512;
 +my $INTERRUPT_FILE_COUNT = 300;
 +my $INTERRUPT_TIMEOUT_SECONDS = 120;
++my $NETWORK_DEVICE_DIR = '/sys/class/net';
++my $DEVICE_UP_FLAG = 0x1;
 +
 +my $json = JSON->new->utf8->canonical;
 +
@@ -4049,6 +4066,55 @@ index 00000000..f4962a65
 +        if $> != 0;
 +    make_path($TARGET_POLICY_DIR, $TASK_DIR, { mode => 0755 });
 +    use_emulated_start_time();
++}
++
++sub initialize_attested_fixture {
++    my $fixture_dir = $ENV{HOST_ARTIFACT_FIXTURE_DIR};
++    die "set HOST_ARTIFACT_FIXTURE_DIR to the directory with the attested fixture\n"
++        if !defined($fixture_dir) || $fixture_dir !~ m{\A(/[^\0]+)\z};
++    $fixture_dir = $1;
++    delete @ENV{qw(PATH IFS CDPATH ENV BASH_ENV)};
++    require_disposable_root();
++    require_no_network();
++    my $rpcenv = PVE::RPCEnvironment->init('priv');
++    $rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
++    write_file(PVE::HostArtifacts::trusted_root_path(), read_file("$fixture_dir/trusted_root.jsonl"));
++    return ($rpcenv, $fixture_dir, 'deploy@pve!install');
++}
++
++sub directory_names {
++    my ($dir) = @_;
++    opendir(my $handle, $dir) or die "cannot read $dir: $!\n";
++    my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($handle);
++    closedir($handle);
++    return \@names;
++}
++
++# The rollback and the new install count as offline evidence only when every device other than
++# lo is down and does not have a route.
++sub require_no_network {
++    my @active;
++    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
++        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
++        next if $device eq 'lo' || !-e $flags_path;
++        my $flags = read_file($flags_path);
++        chomp($flags);
++        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
++    }
++    die "this test needs a container without network access, and these devices are up:"
++        . " @active\n"
++        if @active;
++    my @routes = split(m/\n/, read_file('/proc/net/route'));
++    shift @routes;
++    my @devices = map { (split(' ', $_))[0] } @routes;
++    if (-e '/proc/net/ipv6_route') {
++        my @routes_v6 = split(m/\n/, read_file('/proc/net/ipv6_route'));
++        push @devices, map { (split(' ', $_))[-1] } @routes_v6;
++    }
++    my @routed = grep { $_ ne 'lo' } @devices;
++    die "this test needs a container without network access, and these devices have routes:"
++        . " @routed\n"
++        if @routed;
 +}
 +
 +# fork_worker compares the start time that the parent reads for the worker with the start time
@@ -4374,10 +4440,10 @@ index 00000000..f4962a65
 +1;
 diff --git a/test/HostArtifacts_attestation_test.pl b/test/HostArtifacts_attestation_test.pl
 new file mode 100755
-index 00000000..b222e991
+index 00000000..153a6153
 --- /dev/null
 +++ b/test/HostArtifacts_attestation_test.pl
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,862 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the installed /usr/bin/gh with the host artifact module against real attested
@@ -4401,7 +4467,6 @@ index 00000000..b222e991
 +use Time::HiRes qw();
 +
 +use PVE::HostArtifacts;
-+use PVE::RPCEnvironment;
 +
 +use HostArtifactsTest;
 +
@@ -4417,7 +4482,6 @@ index 00000000..b222e991
 +my $FIXTURE_REF = 'refs/heads/main';
 +my $WRONG_REF = 'refs/heads/other';
 +my $WORK = '/srv/host-artifacts-attestation-work';
-+my $TOKEN = 'deploy@pve!install';
 +my $STATE_DIR = '/var/lib/pve-overlay/host-artifacts';
 +my $CHUNK_BYTES = 96 * 1024;
 +my $PROGRAM_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
@@ -4426,8 +4490,6 @@ index 00000000..b222e991
 +my $INTERRUPT_ATTEMPTS = 5;
 +my $INTERRUPT_TIMEOUT_SECONDS = 120;
 +my $POLL_SECONDS = 0.0005;
-+my $NETWORK_DEVICE_DIR = '/sys/class/net';
-+my $DEVICE_UP_FLAG = 0x1;
 +my $GH_REJECTS = qr/gh attestation verify exited with code [1-9]/;
 +my $WANCONFIG_ASSET = 'wanconfig-stack_linux_amd64.tar.gz';
 +my $WANCONFIG_SHA256 = '60bf467c9601f612785e2d6fb6f973258fd94af05311e89df87deacf72e1b0c8';
@@ -4457,60 +4519,12 @@ index 00000000..b222e991
 +};
 +my @PROGRAM_NAMES = sort keys %$PROGRAMS;
 +
-+my $fixture_dir = $ENV{HOST_ARTIFACT_FIXTURE_DIR};
-+die "set HOST_ARTIFACT_FIXTURE_DIR to the directory with the attested configsctl fixture\n"
-+    if !defined($fixture_dir) || $fixture_dir !~ m{\A(/[^\0]+)\z};
-+$fixture_dir = $1;
-+delete @ENV{qw(PATH IFS CDPATH ENV BASH_ENV)};
-+
-+HostArtifactsTest::require_disposable_root();
++die "this test does not accept arguments\n" if @ARGV;
++my ($rpcenv, $fixture_dir, $TOKEN) = HostArtifactsTest::initialize_attested_fixture();
 +my $check = \&HostArtifactsTest::check;
 +my $check_error = \&HostArtifactsTest::check_error;
 +my $check_match = \&HostArtifactsTest::check_match;
 +my $json = HostArtifactsTest::json();
-+
-+# The rollback and the new install count as offline evidence only when every device other than
-+# lo is down and does not have a route.
-+sub require_no_network {
-+    my @active;
-+    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
-+        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
-+        next if $device eq 'lo' || !-e $flags_path;
-+        my $flags = HostArtifactsTest::read_file($flags_path);
-+        chomp($flags);
-+        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
-+    }
-+    die "this test needs a container without network access, and these devices are up:"
-+        . " @active\n"
-+        if @active;
-+
-+    my @routes = split(m/\n/, HostArtifactsTest::read_file('/proc/net/route'));
-+    shift @routes;
-+    my @devices = map { (split(' ', $_))[0] } @routes;
-+    if (-e '/proc/net/ipv6_route') {
-+        my @routes_v6 = split(m/\n/, HostArtifactsTest::read_file('/proc/net/ipv6_route'));
-+        push @devices, map { (split(' ', $_))[-1] } @routes_v6;
-+    }
-+    my @routed = grep { $_ ne 'lo' } @devices;
-+    die "this test needs a container without network access, and these devices have routes:"
-+        . " @routed\n"
-+        if @routed;
-+}
-+require_no_network();
-+
-+my $rpcenv = PVE::RPCEnvironment->init('priv');
-+$rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
-+
-+HostArtifactsTest::write_file(
-+    PVE::HostArtifacts::trusted_root_path(),
-+    HostArtifactsTest::read_file("$fixture_dir/trusted_root.jsonl"),
-+);
-+if (@ARGV) {
-+    die "expected --installed-source\n" unless @ARGV == 1 && $ARGV[0] eq '--installed-source';
-+    require HostArtifactsInstalledSourceTest;
-+    HostArtifactsInstalledSourceTest::run($rpcenv, $TOKEN, "$fixture_dir/installed-source");
-+    exit(0);
-+}
 +
 +remove_tree($WORK);
 +make_path($WORK, { mode => 0755 });
@@ -4841,22 +4855,13 @@ index 00000000..b222e991
 +    );
 +}
 +
-+sub directory_names {
-+    my ($dir) = @_;
-+
-+    opendir(my $handle, $dir) or die "cannot read $dir: $!\n";
-+    my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($handle);
-+    closedir($handle);
-+    return \@names;
-+}
-+
 +# The state includes each target file, every name in the two directories, and the installed
 +# record, secret record, journal, and lock file of the selected target.
 +sub program_state {
 +    return $json->encode([
 +        HostArtifactsTest::target_state($program_target, @$program_paths, @$file_paths),
-+        directory_names($program_dir),
-+        directory_names($file_dir),
++        HostArtifactsTest::directory_names($program_dir),
++        HostArtifactsTest::directory_names($file_dir),
 +    ]);
 +}
 +
@@ -8159,7 +8164,7 @@ index 00000000..dc992d43
 +
 +exit(0);
 diff --git a/test/Makefile b/test/Makefile
-index 2dfd20a4..9bd55fbc 100644
+index 2dfd20a4..a19ae4ce 100644
 --- a/test/Makefile
 +++ b/test/Makefile
 @@ -61,6 +61,30 @@ test-custom-cpu-models:
@@ -8184,7 +8189,7 @@ index 2dfd20a4..9bd55fbc 100644
 +
 +.PHONY: test-host-artifacts-installed-source
 +test-host-artifacts-installed-source:
-+	./HostArtifacts_attestation_test.pl --installed-source
++	./HostArtifactsInstalledSource_test.pl
 +
 +.PHONY: test-host-artifacts-installed-source-runlog
 +test-host-artifacts-installed-source-runlog:
