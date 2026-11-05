@@ -3579,10 +3579,10 @@ index 00000000..7a895d8d
 +done_testing();
 diff --git a/test/HostArtifactsInstalledSourceTest.pm b/test/HostArtifactsInstalledSourceTest.pm
 new file mode 100644
-index 00000000..3b420aca
+index 00000000..a6f80004
 --- /dev/null
 +++ b/test/HostArtifactsInstalledSourceTest.pm
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,419 @@
 +package HostArtifactsInstalledSourceTest;
 +
 +use strict;
@@ -3714,6 +3714,17 @@ index 00000000..3b420aca
 +sub tofu {
 +    my ($code, $message, @args) = @_;
 +    return command('', $code, $message, "$private/bin/configsctl", 'tofu', 'sample', @args);
++}
++
++sub require_apply_lock {
++    my ($stderr) = @_;
++    my @selected = grep { /\bINFO tofu\.mutation\.explicit_lock_hosts(?:[ \t]|$)/ }
++        split(/\n/, $stderr);
++    die "the apply did not select exactly the hypervisor host\n"
++        unless @selected == 1 && $selected[0] =~ /(?:^|[ \t])hosts=\[hypervisor\](?:[ \t]|\r?$)/;
++    my @acquired = grep { /\bINFO hostlock\.acquired(?:[ \t]|$)/ } split(/\n/, $stderr);
++    die "the apply did not acquire exactly one host lock\n"
++        unless @acquired == 1 && $acquired[0] =~ /(?:^|[ \t])hosts=1(?:[ \t]|\r?$)/;
 +}
 +
 +sub field {
@@ -3922,7 +3933,8 @@ index 00000000..3b420aca
 +    my $plan = "$private/plans/first.tfplan";
 +    tofu(0, undef, 'plan', '-input=false', "-out=$plan");
 +    check_plan($plan);
-+    tofu(0, 'hostlock.acquired', 'apply', '-input=false', $plan);
++    my (undef, $first_apply_stderr) = tofu(0, undef, 'apply', '-input=false', $plan);
++    require_apply_lock($first_apply_stderr);
 +    my $state = backend('one');
 +    tofu(0, undef, 'plan', '-input=false', '-detailed-exitcode');
 +    my $encrypted = digest($vault);
@@ -3970,7 +3982,8 @@ index 00000000..3b420aca
 +    my $fresh = "$private/plans/fresh.tfplan";
 +    tofu(0, undef, 'plan', '-input=false', "-out=$fresh");
 +    check_plan($fresh);
-+    tofu(0, 'hostlock.acquired', 'apply', '-input=false', $fresh);
++    my (undef, $fresh_apply_stderr) = tofu(0, undef, 'apply', '-input=false', $fresh);
++    require_apply_lock($fresh_apply_stderr);
 +    my $final_state = backend('two');
 +    tofu(0, undef, 'plan', '-input=false', '-detailed-exitcode');
 +    die "the final plan changed backend state\n" unless backend('two') eq $final_state;
