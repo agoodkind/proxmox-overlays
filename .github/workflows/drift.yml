@@ -130,8 +130,8 @@ jobs:
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           docker exec "$id" make -k -C /src/pve-manager/test \
-            test-host-artifacts test-host-secrets test-host-artifacts-attestation \
-            test-host-artifacts-installed-source
+            test-host-artifacts test-host-secrets test-host-units \
+            test-host-artifacts-attestation test-host-artifacts-installed-source
       - name: Print container diagnostics after a failure
         if: failure() && steps.boot.outcome != 'skipped'
         continue-on-error: true
