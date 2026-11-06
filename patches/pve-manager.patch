@@ -1,34 +1,43 @@
 diff --git a/PVE/API2/ACME.pm b/PVE/API2/ACME.pm
-index a948a72a..d5e65a38 100644
+index a67b7260..518852df 100644
 --- a/PVE/API2/ACME.pm
 +++ b/PVE/API2/ACME.pm
-@@ -160,7 +160,8 @@ __PACKAGE__->register_method({
+@@ -160,7 +160,11 @@ __PACKAGE__->register_method({
      path => 'certificate',
      method => 'POST',
      permissions => {
--        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
-+        check =>
-+            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Order'], any => 1],
+-        check => ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++        check => [
++            'or',
++            ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++            ['perm', '/nodes/{node}', ['Sys.ACME.Certificate.Order']],
++        ],
      },
      description => "Order a new certificate from ACME-compatible CA.",
      protected => 1,
-@@ -232,7 +233,8 @@ __PACKAGE__->register_method({
+@@ -232,7 +236,11 @@ __PACKAGE__->register_method({
      path => 'certificate',
      method => 'PUT',
      permissions => {
--        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
-+        check =>
-+            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Renew'], any => 1],
+-        check => ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++        check => [
++            'or',
++            ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++            ['perm', '/nodes/{node}', ['Sys.ACME.Certificate.Renew']],
++        ],
      },
      description => "Renew existing certificate from CA.",
      protected => 1,
-@@ -319,7 +321,8 @@ __PACKAGE__->register_method({
+@@ -321,7 +329,11 @@ __PACKAGE__->register_method({
      path => 'certificate',
      method => 'DELETE',
      permissions => {
--        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
-+        check =>
-+            ['perm', '/nodes/{node}', ['Sys.Modify', 'Sys.ACME.Certificate.Revoke'], any => 1],
+-        check => ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++        check => [
++            'or',
++            ['perm', '/nodes/{node}/certificates', ['Sys.Modify']],
++            ['perm', '/nodes/{node}', ['Sys.ACME.Certificate.Revoke']],
++        ],
      },
      description => "Revoke existing certificate from CA.",
      protected => 1,
@@ -1103,10 +1112,10 @@ index cc726dac..f0b774ad 100644
              my $conf = PVE::NodeConfig::load_config($node);
  
 diff --git a/PVE/API2/Nodes.pm b/PVE/API2/Nodes.pm
-index 2ca3244d..0cceaeea 100644
+index df0b2c2d..283795ca 100644
 --- a/PVE/API2/Nodes.pm
 +++ b/PVE/API2/Nodes.pm
-@@ -49,6 +49,8 @@ use PVE::API2::Certificates;
+@@ -50,6 +50,8 @@ use PVE::API2::Certificates;
  use PVE::API2::Disks;
  use PVE::API2::Firewall::Host;
  use PVE::API2::Hardware;
@@ -1115,7 +1124,7 @@ index 2ca3244d..0cceaeea 100644
  use PVE::API2::LXC::Status;
  use PVE::API2::LXC;
  use PVE::API2::Network;
-@@ -199,6 +201,16 @@ __PACKAGE__->register_method({
+@@ -200,6 +202,16 @@ __PACKAGE__->register_method({
      path => 'config',
  });
  
@@ -3462,6 +3471,60 @@ index efcb250d..73cf7879 100644
  	Jobs.pm			\
  	NodeConfig.pm		\
  	PullMetric.pm		\
+diff --git a/test/ACMEPermissions_test.pl b/test/ACMEPermissions_test.pl
+new file mode 100755
+index 00000000..17c3fd8f
+--- /dev/null
++++ b/test/ACMEPermissions_test.pl
+@@ -0,0 +1,48 @@
++#!/usr/bin/perl -T
++
++use strict;
++use warnings;
++
++use lib qw(.. .);
++
++use PVE::API2::ACME;
++use PVE::RPCEnvironment;
++use Test::More;
++
++delete @ENV{qw(PATH IFS CDPATH ENV BASH_ENV)};
++my $rpcenv = PVE::RPCEnvironment->init('priv');
++$rpcenv->init_request(userconfig => 'acme-permissions-test.cfg');
++
++my @methods = qw(new_certificate renew_certificate revoke_certificate);
++my @users = (
++    ['stock@pve', [1, 1, 1]],
++    ['stock-node@pve', [0, 0, 0]],
++    ['stock-inherited@pve', [1, 1, 1]],
++    ['order@pve', [1, 0, 0]],
++    ['renew@pve', [0, 1, 0]],
++    ['revoke@pve', [0, 0, 1]],
++    ['reference@pve', [1, 1, 1]],
++    ['child@pve', [0, 0, 0]],
++    ['other@pve', [0, 0, 0]],
++    ['denied@pve', [0, 0, 0]],
++);
++for my $index (0 .. $#methods) {
++    my $name = $methods[$index];
++    my @registered = grep { $_->{name} eq $name } @{PVE::API2::ACME->method_attributes()};
++    die "expected exactly one registered $name method\n" unless @registered == 1;
++    for my $case (@users) {
++        my ($user, $expected) = @$case;
++        my $allowed = eval {
++            $rpcenv->check_api2_permissions($registered[0]->{permissions}, $user, { node => 'localhost' });
++            1;
++        };
++        my $error = $@;
++        if ($expected->[$index]) {
++            ok($allowed, "$user can authorize $name") or diag("$error");
++        } else {
++            ok(!$allowed && "$error" =~ /permission check failed/i,
++                "$user cannot authorize $name") or diag("$error");
++        }
++    }
++}
++done_testing();
 diff --git a/test/HostArtifactsInstalledSourceRunLog_test.pl b/test/HostArtifactsInstalledSourceRunLog_test.pl
 new file mode 100755
 index 00000000..c7df5457
@@ -8164,10 +8227,10 @@ index 00000000..dc992d43
 +
 +exit(0);
 diff --git a/test/Makefile b/test/Makefile
-index 2dfd20a4..a19ae4ce 100644
+index 2dfd20a4..c96f3524 100644
 --- a/test/Makefile
 +++ b/test/Makefile
-@@ -61,6 +61,30 @@ test-custom-cpu-models:
+@@ -61,6 +61,31 @@ test-custom-cpu-models:
  test-pvesh:
  	./pvesh_test.pl
  
@@ -8176,6 +8239,7 @@ index 2dfd20a4..a19ae4ce 100644
 +# /usr/bin/gh and HOST_ARTIFACT_FIXTURE_DIR.
 +.PHONY: test-host-artifacts
 +test-host-artifacts:
++	./ACMEPermissions_test.pl
 +	./HostArtifacts_test.pl
 +
 +# This target also needs systemd as process 1.
@@ -8198,6 +8262,38 @@ index 2dfd20a4..a19ae4ce 100644
  .PHONY: install
  install:
  
+diff --git a/test/acme-permissions-test.cfg b/test/acme-permissions-test.cfg
+new file mode 100644
+index 00000000..8fcbc9f0
+--- /dev/null
++++ b/test/acme-permissions-test.cfg
+@@ -0,0 +1,26 @@
++user:stock@pve:1:
++user:stock-node@pve:1:
++user:stock-inherited@pve:1:
++user:order@pve:1:
++user:renew@pve:1:
++user:revoke@pve:1:
++user:reference@pve:1:
++user:child@pve:1:
++user:other@pve:1:
++user:denied@pve:1:
++
++role:certificate_stock:Sys.Modify:
++role:certificate_order:Sys.ACME.Certificate.Order:
++role:certificate_renew:Sys.ACME.Certificate.Renew:
++role:certificate_revoke:Sys.ACME.Certificate.Revoke:
++role:certificate_reference:Sys.ACME.Certificate.Order,Sys.ACME.Certificate.Renew,Sys.ACME.Certificate.Revoke,Sys.ACME.Config.Audit,Sys.ACME.Config.Account.Modify,Sys.ACME.Config.Domain.Modify,Sys.ACME.Config.Domain.Remove:
++
++acl:0:/nodes/localhost/certificates:stock@pve:certificate_stock:
++acl:0:/nodes/localhost:stock-node@pve:certificate_stock:
++acl:1:/nodes/localhost:stock-inherited@pve:certificate_stock:
++acl:0:/nodes/localhost:order@pve:certificate_order:
++acl:0:/nodes/localhost:renew@pve:certificate_renew:
++acl:0:/nodes/localhost:revoke@pve:certificate_revoke:
++acl:1:/:reference@pve:certificate_reference:
++acl:0:/nodes/localhost/certificates:child@pve:certificate_reference:
++acl:1:/nodes/other:other@pve:certificate_reference:
 diff --git a/test/host-artifacts-test.cfg b/test/host-artifacts-test.cfg
 new file mode 100644
 index 00000000..988f4204

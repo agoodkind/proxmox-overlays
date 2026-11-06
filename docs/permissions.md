@@ -57,7 +57,7 @@ An account name or plugin id starts with a letter and continues with one or more
 
 ## ACME plugins, certificates, and node options
 
-`Sys.Modify` grants the same operations as before: on `/` for plugins and node options, and on `/nodes/<node>` for certificates. `Sys.Audit` on `/` still reads the whole node config.
+`Sys.Modify` authorizes plugin and node-option operations on `/` and certificate operations on `/nodes/<node>/certificates`. `Sys.Audit` on `/` reads the whole node configuration.
 
 A plugin request needs one privilege for each kind of change. A `POST` or `PUT` that sets `data` needs `Sys.ACME.Plugin.Secret.Modify` in addition to `Create` or `Modify`. A `PUT` that changes only `data` needs only `Sys.ACME.Plugin.Secret.Modify`.
 
