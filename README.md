@@ -63,9 +63,9 @@ The `drift` workflow runs daily, on each pull request, and on each push to `main
 
 The workflow installs the packages in a container image in GHCR and builds the image from `image/Dockerfile`. The image tag is `<component>-<hash of the Proxmox package index>-<hash of image/Dockerfile>`. The workflow builds a new image when Proxmox publishes a package or when `image/Dockerfile` changes. Otherwise, the workflow pulls the existing image from GHCR.
 
-To update a patch, run `git diff <upstream base commit> HEAD --output=<patch file>` on the `overlays` branch of the fork. The pve-manager fork has two patch files with separate file scopes:
+Generate each patch from its upstream base and reviewed fork commit. Generate the two default pve-manager patches with separate file scopes:
 
-1. Run `git diff <upstream base commit> HEAD --output=patches/pve-manager-acme.patch PVE/API2/ACME.pm`.
-2. Run `git diff <upstream base commit> HEAD --output=patches/pve-manager.patch . ':!PVE/API2/ACME.pm'`.
+1. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager-acme.patch -- PVE/API2/ACME.pm`.
+2. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager.patch -- . ':!PVE/API2/ACME.pm'`.
 
-`pve-overlay` reads only the files directly in `patches`. `patches/compat/pve-manager-acme-node.patch` is the `PVE/API2/ACME.pm` patch for pve-manager 9.2.24, which checks the certificate methods at `/nodes/{node}`. A host uses it in place of `patches/pve-manager-acme.patch` only when its OpenTofu configuration selects it.
+`pve-overlay` reads patch files directly in the [patches directory](patches/). The [compatibility patch](patches/compat/pve-manager-acme-node.patch) preserves the node-based certificate checks in pve-manager 9.2.24. Configurations for that package select it instead of the [default certificate patch](patches/pve-manager-acme.patch).
