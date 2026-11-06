@@ -37,7 +37,7 @@ jobs:
     env:
       PVE_COMPONENT: ${{ matrix.component }}
       IMAGE: ghcr.io/${{ github.repository }}/pve
-      PVE_MANAGER_BASE: 58350116c198b838dfb50739e886bc92bcc751c3
+      PVE_MANAGER_BASE: 41a0e2e09b9e6f9da5a19b580a38db2b45ece97b
     steps:
       - uses: actions/checkout@v4
       - name: Hash the Proxmox package index

@@ -22,5 +22,11 @@
     "source_revision": "df9606b0ef46f3dca46cab0f6da801dddf896fd5",
     "signer_revision": "4e9b31f5b944594bb74e316aefa49093b5abd865",
     "member_sha256": "e8cfd000aa683d93d62c13b3400f98f33c82412502c480b2acdf9a9a622b862d"
+  },
+  "tofu": {
+    "release_tag": "v1.13.2",
+    "asset": "tofu_1.13.2_linux_amd64.zip",
+    "sha256": "723bebb0df8411daff1e5fc3862e28ff5581fe5634087f4c29a9aa41d78208b5",
+    "member_sha256": "949061cbb3c3d4558928ca9a459a5052b8c5e5545d17656f33316d2e3bc335f2"
   }
 }

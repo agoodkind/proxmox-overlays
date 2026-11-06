@@ -65,6 +65,10 @@ field($program, 'asset', qr/\Aconfigsctl_linux_amd64\.tar\.gz\z/);
 my $revision = field($program, 'source_revision', qr/\A[0-9a-f]{40}\z/);
 my $signer = field($program, 'signer_revision', qr/\A[0-9a-f]{40}\z/);
 my $member_digest = field($program, 'member_sha256', qr/\A[0-9a-f]{64}\z/);
+my $tofu_version = field('tofu', 'release_tag', qr/\Av[0-9]+\.[0-9]+\.[0-9]+\z/);
+$tofu_version =~ s/\Av//;
+field('tofu', 'asset', qr/\Atofu_\Q$tofu_version\E_linux_amd64\.zip\z/);
+my $tofu_digest = field('tofu', 'member_sha256', qr/\A[0-9a-f]{64}\z/);
 for my $case (@cases) {
     download($case, 'agoodkind/configs', 'asset', 'sha256');
     download($case, 'agoodkind/configs', 'bundle_asset', 'bundle_sha256');
@@ -82,16 +86,11 @@ make_path("$work/bin");
 open(my $output, '>:raw', "$work/bin/$program") or die "cannot create $program: $!\n";
 print {$output} $member or die "cannot write $program: $!\n";
 close($output) or die "cannot finish writing $program: $!\n";
-my $tofu_archive = 'tofu_1.13.2_linux_amd64.zip';
-my $tofu_digest = '949061cbb3c3d4558928ca9a459a5052b8c5e5545d17656f33316d2e3bc335f2';
-gh('release', 'download', 'v1.13.2', '--repo', 'opentofu/opentofu',
-    '--pattern', $tofu_archive, '--dir', $work);
-verify_file("$work/$tofu_archive", '723bebb0df8411daff1e5fc3862e28ff5581fe5634087f4c29a9aa41d78208b5');
-system('unzip', '-q', "$work/$tofu_archive", 'tofu', '-d', "$work/bin") == 0
+my $tofu_archive = download('tofu', 'opentofu/opentofu', 'asset', 'sha256');
+system('unzip', '-q', $tofu_archive, 'tofu', '-d', "$work/bin") == 0
     or die "cannot extract the OpenTofu executable (wait status $?)\n";
 verify_file("$work/bin/tofu", $tofu_digest);
 chmod(0755, "$work/bin/$program", "$work/bin/tofu") == 2 or die "cannot set executable modes: $!\n";
-$pins->{tofu} = { member_sha256 => $tofu_digest };
 open(my $receipt, '>:raw', "$work/pins.json") or die "cannot create the verified pins: $!\n";
 print {$receipt} JSON::PP->new->canonical->encode($pins) or die "cannot write the verified pins: $!\n";
 close($receipt) or die "cannot finish writing the verified pins: $!\n";
