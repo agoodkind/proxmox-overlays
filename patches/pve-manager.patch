@@ -318,7 +318,7 @@ index 2f210903..0b780254 100644
              undef,
 diff --git a/PVE/API2/HostArtifacts.pm b/PVE/API2/HostArtifacts.pm
 new file mode 100644
-index 00000000..c53452da
+index 00000000..d34c1222
 --- /dev/null
 +++ b/PVE/API2/HostArtifacts.pm
 @@ -0,0 +1,578 @@
@@ -656,7 +656,7 @@ index 00000000..c53452da
 +my $unit_property = {
 +    type => 'string',
 +    pattern => '[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service',
-+    description => 'The value is a unit name. The target policy must list the unit file'
++    description => 'The service unit name. The target policy must list the unit file'
 +        . ' /etc/systemd/system/<name>.',
 +};
 +
@@ -669,8 +669,8 @@ index 00000000..c53452da
 +    permissions => {
 +        check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Audit']],
 +    },
-+    description => 'The method returns the unit file state and the active state of a unit that'
-+        . ' the target policy lists. The method does not change a file or a unit.',
++    description => 'Returns the unit file state and active state of a service that the target'
++        . ' policy lists. This method does not change files or units.',
 +    parameters => {
 +        additionalProperties => 0,
 +        properties => {
@@ -682,21 +682,21 @@ index 00000000..c53452da
 +    returns => {
 +        type => 'object',
 +        properties => {
-+            name => { type => 'string', description => 'The value is the unit name.' },
++            name => { type => 'string', description => 'The service unit name.' },
 +            found => {
 +                type => 'boolean',
-+                description => 'The value is false when the unit file does not exist or systemd'
++                description => 'False when the unit file does not exist or systemd'
 +                    . ' does not find the unit.',
 +            },
 +            unit_file_state => {
 +                type => 'string',
 +                optional => 1,
-+                description => 'The value is the output of systemctl is-enabled.',
++                description => 'The output of systemctl is-enabled.',
 +            },
 +            active_state => {
 +                type => 'string',
 +                optional => 1,
-+                description => 'The value is the output of systemctl is-active.',
++                description => 'The output of systemctl is-active.',
 +            },
 +        },
 +    },
@@ -729,14 +729,14 @@ index 00000000..c53452da
 +            action => {
 +                type => 'string',
 +                enum => [qw(daemon-reload enable reenable disable start stop restart)],
-+                description => 'The value selects the systemctl action. daemon-reload reloads'
++                description => 'The systemctl action. daemon-reload reloads'
 +                    . ' the systemd manager configuration.',
 +            },
 +        },
 +    },
 +    returns => {
 +        type => 'string',
-+        description => 'The value is the UPID of the hostunit task.',
++        description => 'The UPID of the hostunit task.',
 +    },
 +    code => sub {
 +        my ($param) = @_;
@@ -1249,10 +1249,10 @@ index df0b2c2d..283795ca 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..d357edc0
+index 00000000..73c1bcd0
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2426 @@
+@@ -0,0 +1,2413 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -3493,11 +3493,8 @@ index 00000000..d357edc0
 +
 +my $UNIT_DIR = '/etc/systemd/system';
 +
-+# The unit methods accept only these actions. Each action runs systemctl with fixed arguments.
 +my $UNIT_ACTIONS = { map { $_ => 1 } qw(daemon-reload enable reenable disable start stop restart) };
 +
-+# The function returns the unit name and the unit file path. A target owns a unit only when its
-+# policy lists the unit file path.
 +my $owned_unit = sub {
 +    my ($policy, $unit) = @_;
 +
@@ -3508,8 +3505,6 @@ index 00000000..d357edc0
 +    return ($name, $path);
 +};
 +
-+# The function requires a committed installed record that lists the unit file and a live unit
-+# file that matches the record in content, size, mode, owner, and group.
 +my $check_installed_unit = sub {
 +    my ($policy, $path) = @_;
 +
@@ -3525,9 +3520,7 @@ index 00000000..d357edc0
 +        if !$observation_matches->(observe_file($path), $record);
 +};
 +
-+# The function runs a read-only systemctl query and returns the first line of its output.
-+# systemctl is-enabled and is-active print the state and exit with a nonzero status for most
-+# states.
++# systemctl is-enabled and is-active can print a state and exit with a nonzero status.
 +my $query_systemctl = sub {
 +    my (@arguments) = @_;
 +
@@ -3549,9 +3542,6 @@ index 00000000..d357edc0
 +    return $line;
 +};
 +
-+# The function returns the unit file state and the active state of a unit that the target owns.
-+# found is false when the unit file does not exist or systemd does not find the unit. The
-+# function does not change a file or a unit.
 +sub read_unit {
 +    my ($target, $unit) = @_;
 +
@@ -3570,8 +3560,6 @@ index 00000000..d357edc0
 +    };
 +}
 +
-+# The function checks a unit action before the API starts a worker and returns the checked
-+# target, unit, and action.
 +sub check_unit_request {
 +    my ($target, $unit, $action) = @_;
 +
@@ -3588,8 +3576,7 @@ index 00000000..d357edc0
 +    };
 +}
 +
-+# The function runs one unit action in a task worker. After it acquires the target lock, it
-+# loads the policy and checks the installed unit file again.
++# Recheck the policy and installed unit after acquiring the target lock.
 +sub run_unit_action {
 +    my ($target, $unit, $action) = @_;
 +
@@ -8510,10 +8497,10 @@ index 00000000..dc992d43
 +exit(0);
 diff --git a/test/HostUnits_test.pl b/test/HostUnits_test.pl
 new file mode 100755
-index 00000000..08712135
+index 00000000..1d168cf5
 --- /dev/null
 +++ b/test/HostUnits_test.pl
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,425 @@
 +#!/usr/bin/perl -T
 +
 +# The test reads and controls units that a target policy lists through the REST methods and
@@ -8596,7 +8583,6 @@ index 00000000..08712135
 +    return { path => unit_path($unit), mode => '0644', owner => 'root', group => 'root' };
 +}
 +
-+# The function installs files for a target with the module entry point.
 +sub install_files {
 +    my ($document, $files, $name) = @_;
 +
@@ -8634,7 +8620,6 @@ index 00000000..08712135
 +    );
 +}
 +
-+# The function starts a unit action and returns the task status and the task log.
 +sub unit_action {
 +    my ($target, $unit, $action) = @_;
 +
@@ -8699,8 +8684,6 @@ index 00000000..08712135
 +run_systemctl('daemon-reload');
 +run_systemctl('restart', $UNRELATED_UNIT);
 +
-+# The tests check the target before it has an installed record.
-+
 +my $missing = unit_state($target, $UNIT);
 +$check->(
 +    'GET reports found 0 for a listed unit without a unit file',
@@ -8737,7 +8720,6 @@ index 00000000..08712135
 +    { unit_path($INTERRUPTED_UNIT) => unit_content('/bin/true') },
 +);
 +
-+# The function returns the state that every unit request leaves unchanged.
 +sub unrelated_state {
 +    return $json->encode({
 +        target => HostArtifactsTest::target_state($target, $app_file),
@@ -8762,7 +8744,6 @@ index 00000000..08712135
 +    );
 +};
 +
-+# The function returns the state of the test unit that a rejected request leaves unchanged.
 +sub test_unit_state {
 +    return join(
 +        ' ',
@@ -8772,8 +8753,6 @@ index 00000000..08712135
 +        unit_property($UNIT, 'UnitFileState'),
 +    );
 +}
-+
-+# The tests check callers without the required privileges.
 +
 +for my $user ('deploy@pve!audit', 'deploy@pve!rotate', 'deploy@pve!none') {
 +    my $response = unit_post($user, $target, $UNIT, { action => 'start' });
@@ -8788,8 +8767,6 @@ index 00000000..08712135
 +    unit_property($UNIT, 'ActiveState') eq 'inactive',
 +);
 +$check_unrelated->('the denied requests');
-+
-+# The tests check the actions on an owned unit.
 +
 +my ($status) = unit_action($target, $UNIT, 'daemon-reload');
 +$check->('daemon-reload succeeds', $status eq 'OK', $status);
@@ -8830,8 +8807,6 @@ index 00000000..08712135
 +);
 +$check_unrelated->('the owned unit actions');
 +
-+# The tests check rejected requests.
-+
 +my $unlisted = qr/does not list the unit file/;
 +my $start = { action => 'start' };
 +my $rejections = [
@@ -8867,8 +8842,6 @@ index 00000000..08712135
 +);
 +$check_unrelated->('the rejected requests');
 +
-+# The tests check changed unit files.
-+
 +my $path = unit_path($UNIT);
 +for my $change (
 +    ['content', sub { HostArtifactsTest::write_file($path, "$unit_content# changed\n") }],
@@ -8892,8 +8865,6 @@ index 00000000..08712135
 +$check->('a restored unit file permits actions again', $status eq 'OK', $status);
 +$check_unrelated->('the changed unit files');
 +
-+# The tests check an interrupted installation.
-+
 +my $interrupted_before = unrelated_state();
 +my $interrupted =
 +    unit_post($MODIFY_TOKEN, $interrupted_target, $INTERRUPTED_UNIT, { action => 'start' });
@@ -8911,8 +8882,6 @@ index 00000000..08712135
 +    unrelated_state() eq $interrupted_before,
 +);
 +
-+# The tests check a failed action.
-+
 +($status) = unit_action($target, $FAILING_UNIT, 'daemon-reload');
 +my ($failed_status, $failed_log) = unit_action($target, $FAILING_UNIT, 'start');
 +$check_match->(
@@ -8928,16 +8897,12 @@ index 00000000..08712135
 +expect_state('after the failed start', $target, $FAILING_UNIT, 'disabled', 'failed');
 +$check_unrelated->('the failed action');
 +
-+# The tests check stop and disable.
-+
 +($status) = unit_action($target, $UNIT, 'stop');
 +$check->('stop succeeds', $status eq 'OK', $status);
 +($status) = unit_action($target, $UNIT, 'disable');
 +$check->('disable succeeds', $status eq 'OK', $status);
 +expect_state('after stop and disable', $target, $UNIT, 'disabled', 'inactive');
 +$check_unrelated->('stop and disable');
-+
-+# The tests check the cleanup.
 +
 +PVE::HostArtifacts::with_target_lock(
 +    $interrupted_target, sub { PVE::HostArtifacts::recover($interrupted_target) },

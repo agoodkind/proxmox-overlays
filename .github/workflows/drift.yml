@@ -2,7 +2,7 @@ name: drift
 
 # Applies the patches to the newest published Proxmox VE packages and loads
 # the patched modules. A failure means a patch no longer fits a release.
-# The job also runs test-host-artifacts, test-host-secrets,
+# The job also runs test-host-artifacts, test-host-secrets, test-host-units,
 # test-host-artifacts-attestation, and test-host-artifacts-installed-source against
 # the patched pve-manager source in a disposable container. It then removes its own
 # container.

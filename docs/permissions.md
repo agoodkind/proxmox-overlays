@@ -210,6 +210,8 @@ At boot, `systemd-modules-load.service` reads `/etc/modules-load.d` before `pve-
 | `POST` | `/nodes/{node}/host-artifacts/{target}/stage` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
 | `POST` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
 | `GET` | `/nodes/{node}/host-artifacts/{target}` | `Sys.HostArtifacts.Audit` on `/nodes/{node}` |
+| `GET` | `/nodes/{node}/host-artifacts/{target}/units/{name}` | `Sys.HostArtifacts.Audit` on `/nodes/{node}` |
+| `POST` | `/nodes/{node}/host-artifacts/{target}/units/{name}` | `Sys.HostArtifacts.Modify` on `/nodes/{node}` |
 | `PUT` | `/nodes/{node}/host-artifacts/{target}/secrets/{field}` | `Sys.HostSecrets.Modify` on `/nodes/{node}` |
 
 Each method runs as root in `pvedaemon` on `{node}`. `{target}` is the lowercase hexadecimal SHA-256 of the UTF-8 bytes of a workspace selector. The installer accepts every selector that `validateWorkspaceSelector` in configsctl accepts, including nested selectors and selectors with underscores.
