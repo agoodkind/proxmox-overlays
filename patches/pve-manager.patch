@@ -1249,10 +1249,10 @@ index df0b2c2d..283795ca 100644
      path => 'sdn',
 diff --git a/PVE/HostArtifacts.pm b/PVE/HostArtifacts.pm
 new file mode 100644
-index 00000000..73c1bcd0
+index 00000000..779b55ad
 --- /dev/null
 +++ b/PVE/HostArtifacts.pm
-@@ -0,0 +1,2413 @@
+@@ -0,0 +1,2409 @@
 +package PVE::HostArtifacts;
 +
 +use strict;
@@ -3493,8 +3493,6 @@ index 00000000..73c1bcd0
 +
 +my $UNIT_DIR = '/etc/systemd/system';
 +
-+my $UNIT_ACTIONS = { map { $_ => 1 } qw(daemon-reload enable reenable disable start stop restart) };
-+
 +my $owned_unit = sub {
 +    my ($policy, $unit) = @_;
 +
@@ -3566,8 +3564,6 @@ index 00000000..73c1bcd0
 +    my $policy = load_policy($target);
 +    check_node($policy);
 +    my ($name, $path) = $owned_unit->($policy, $unit);
-+    die "the unit action is missing\n" if !defined($action) || ref($action);
-+    die "the unit action '$action' is not supported\n" if !$UNIT_ACTIONS->{$action};
 +    $check_installed_unit->($policy, $path);
 +    return {
 +        target => $policy->{target},
@@ -8497,10 +8493,10 @@ index 00000000..dc992d43
 +exit(0);
 diff --git a/test/HostUnits_test.pl b/test/HostUnits_test.pl
 new file mode 100755
-index 00000000..1d168cf5
+index 00000000..29cf36af
 --- /dev/null
 +++ b/test/HostUnits_test.pl
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,420 @@
 +#!/usr/bin/perl -T
 +
 +# The test reads and controls units that a target policy lists through the REST methods and
@@ -8830,11 +8826,6 @@ index 00000000..1d168cf5
 +    'GET fails for a unit of another target',
 +    $other_get->{message},
 +    qr/does not list the unit file/,
-+);
-+HostArtifactsTest::check_error(
-+    'the module rejects an unsupported action',
-+    sub { PVE::HostArtifacts::check_unit_request($target, $UNIT, 'mask') },
-+    qr/the unit action 'mask' is not supported/,
 +);
 +$check->(
 +    'the rejected requests do not change the unlisted unit',
