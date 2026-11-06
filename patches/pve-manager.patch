@@ -3462,12 +3462,566 @@ index efcb250d..73cf7879 100644
  	Jobs.pm			\
  	NodeConfig.pm		\
  	PullMetric.pm		\
+diff --git a/test/HostArtifactsInstalledSourceRunLog_test.pl b/test/HostArtifactsInstalledSourceRunLog_test.pl
+new file mode 100755
+index 00000000..c7df5457
+--- /dev/null
++++ b/test/HostArtifactsInstalledSourceRunLog_test.pl
+@@ -0,0 +1,94 @@
++#!/usr/bin/env perl
++
++use strict;
++use warnings;
++
++use Digest::SHA qw(sha256_hex);
++use File::Copy qw(copy);
++use File::Path qw(make_path);
++use File::Temp qw(tempdir);
++use FindBin;
++use Test::More;
++
++use lib $FindBin::Bin;
++use HostArtifactsInstalledSourceTest;
++
++my ($configsctl, $tofu) = @ARGV;
++die "usage: $0 /absolute/path/to/configsctl /absolute/path/to/tofu\n"
++    unless @ARGV == 2 && $configsctl =~ m{\A/} && $tofu =~ m{\A/}
++    && -x $configsctl && -x $tofu;
++umask(0077);
++my $private = tempdir('installed-source-runlog-XXXXXXXX', TMPDIR => 1, CLEANUP => 1);
++END {
++    chdir($FindBin::Bin) or die "cannot leave the temporary fixture before cleanup: $!\n";
++}
++make_path(map { "$private/$_" } qw(tmp bin data native workspaces/sample
++    ansible/inventory/group_vars/all home/.config/ansible));
++for my $pair (
++    ['installed-source-runlog/configsctl.yml', 'configsctl.yml'],
++    ['installed-source-runlog/main.tf', 'workspaces/sample/main.tf'],
++    ['installed-source-runlog/native.tf', 'native/main.tf'],
++    ['installed-source-seed.vault', 'ansible/inventory/group_vars/all/vault.yml'],
++    ['installed-source-seed.pass', 'home/.config/ansible/vault.pass'],
++) {
++    copy("$FindBin::Bin/$pair->[0]", "$private/$pair->[1]") or die "cannot copy fixture: $!\n";
++    chmod(0600, "$private/$pair->[1]") == 1 or die "cannot restrict fixture: $!\n";
++}
++symlink($tofu, "$private/bin/tofu") or die "cannot link the real OpenTofu executable: $!\n";
++chdir($private) or die "cannot enter the private fixture: $!\n";
++local %ENV = (HOME => "$private/home", PATH => "$private/bin:/usr/bin:/bin",
++    TMPDIR => "$private/tmp", TF_DATA_DIR => "$private/data", TF_IN_AUTOMATION => '1');
++my $token = HostArtifactsInstalledSourceTest::random_token();
++my $password;
++{
++    open(my $file, '<', "$private/home/.config/ansible/vault.pass") or die "cannot read seed: $!\n";
++    local $/;
++    $password = <$file>;
++    close($file) or die "cannot close seed: $!\n";
++    chomp($password);
++}
++my @credentials = ($password, $token);
++my $logs = {};
++
++sub invoke {
++    my ($input, $expected, @arguments) = @_;
++    my ($code, $streams) = HostArtifactsInstalledSourceTest::capture_command(
++        $private, \@credentials, $input, $configsctl, @arguments);
++    my $output = join("\n", @$streams);
++    is($code, $expected, "configsctl @arguments exits with $expected") or die $output;
++    my $new;
++    ($logs, $new) = HostArtifactsInstalledSourceTest::check_run_logs(
++        "$private/tmp", $logs, $output, \@credentials);
++    return ($output, $new);
++}
++
++invoke("vault_installed_source_token: '$token'\n", 0, 'set-secrets');
++my (undef, $init) = invoke('', 0, 'tofu', 'sample', 'init', '-input=false', '-no-color');
++ok(scalar(grep { m{/tofu-init-} } keys %$init), 'successful init retains its private diagnostic log');
++is(scalar(keys %$init), 3, 'init and native configuration retain three checked logs');
++$ENV{TF_VAR_expected_token_sha256} = sha256_hex("wrong-$token");
++my ($output, $plan) = invoke('', 1, 'tofu', 'sample', 'plan', '-input=false', '-no-color');
++my $diagnostic = 'The supplied token must match the expected SHA-256 digest.';
++ok(index($output, $diagnostic) < 0, 'the failed plan does not print its validation diagnostic');
++my @failed = grep { m{/tofu-plan-} && index($plan->{$_}, $diagnostic) >= 0 } keys %$plan;
++is(scalar(@failed), 1, 'the new failed plan log contains the validation diagnostic');
++HostArtifactsInstalledSourceTest::require_log_diagnostic($plan, 'plan', $diagnostic);
++eval { HostArtifactsInstalledSourceTest::require_log_diagnostic($init, 'plan', $diagnostic); };
++like($@, qr/the new plan logs did not report/, 'older logs cannot satisfy the failed plan diagnostic');
++is(scalar(keys %$plan), 4, 'the failed plan scans only its four new native logs');
++is(scalar(keys %$logs), 7, 'both invocations preserve all seven diagnostic logs');
++
++my $rejected = "$private/rejected";
++make_path("$rejected/configsctl-installed-leftover");
++eval { HostArtifactsInstalledSourceTest::check_run_logs($rejected, {}, '', \@credentials); };
++like($@, qr/unexpected temporary execution files/, 'an execution copy still fails cleanup');
++my $leaked = "$private/leaked/configs-runs";
++make_path($leaked);
++my ($name) = $failed[0] =~ m{/([^/]+)\z};
++copy($failed[0], "$leaked/$name") or die "cannot copy the real plan log: $!\n";
++open(my $file, '>>', "$leaked/$name") or die "cannot append the private test credential: $!\n";
++print {$file} $token or die "cannot write the private test credential: $!\n";
++close($file) or die "cannot close the copied log: $!\n";
++eval { HostArtifactsInstalledSourceTest::check_run_logs("$private/leaked", {}, '', \@credentials); };
++like($@, qr/run log exposed a fixture credential/, 'the scanner rejects a credential in a copied real log');
++done_testing();
+diff --git a/test/HostArtifactsInstalledSourceTest.pm b/test/HostArtifactsInstalledSourceTest.pm
+new file mode 100644
+index 00000000..3c0bc6a5
+--- /dev/null
++++ b/test/HostArtifactsInstalledSourceTest.pm
+@@ -0,0 +1,428 @@
++package HostArtifactsInstalledSourceTest;
++
++use strict;
++use warnings;
++
++use Archive::Tar;
++use Digest::SHA qw(sha256_hex);
++use File::Find qw(find);
++use File::Path qw(make_path);
++use File::Temp qw(tempfile);
++use IPC::Open3;
++use IO::Uncompress::Unzip qw($UnzipError);
++
++my $workspace = 'suburban/hostartifact-acceptance';
++my $root = '/srv/hostartifact-acceptance';
++my $private = '/var/lib/configsctl-acceptance';
++my $password_file = '/root/.config/ansible/vault.pass';
++my $vault = "$root/ansible/inventory/group_vars/all/vault.yml";
++my $module = "$root/workspaces/sample/host/main.tf";
++my $target = sha256_hex($workspace);
++my $json;
++my @sensitive;
++my %run_logs;
++
++sub assert_private {
++    my ($content, $label) = @_;
++    for my $value (@sensitive) {
++        die "$label exposed a fixture credential\n" if index($content, $value) >= 0;
++    }
++}
++
++sub read_json {
++    my ($path) = @_;
++    return $json->decode(HostArtifactsTest::read_file($path));
++}
++
++sub digest {
++    return Digest::SHA->new(256)->addfile($_[0])->hexdigest;
++}
++
++sub check_run_logs {
++    my ($temporary, $previous, $output, $credentials) = @_;
++    opendir(my $temporary_dir, $temporary)
++        or die "cannot inspect temporary execution files: $!\n";
++    my @left = grep { $_ ne '.' && $_ ne '..' } readdir($temporary_dir);
++    closedir($temporary_dir) or die "cannot close temporary execution directory: $!\n";
++    die "unexpected temporary execution files: @left\n"
++        if grep { $_ ne 'configs-runs' } @left;
++    my (%logs, %new);
++    if (@left) {
++        my $directory = "$temporary/configs-runs";
++        die "the run log directory must be a private owned directory\n"
++            unless !-l $directory && -d $directory && ((stat($directory))[2] & 07777) == 0700
++            && (stat($directory))[4] == $>;
++        opendir(my $log_dir, $directory) or die "cannot inspect run logs: $!\n";
++        my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($log_dir);
++        closedir($log_dir) or die "cannot close run log directory: $!\n";
++        for my $entry (@entries) {
++            my $path = "$directory/$entry";
++            die "unexpected retained run log: $path\n"
++                unless $entry =~ /\Atofu-(?:init|plan|show|apply)-[0-9]{8}T[0-9]{6}Z(?:-[0-9]+)?\.log\z/;
++            die "the run log must be a private owned regular file: $path\n"
++                unless !-l $path && -f $path && ((stat($path))[2] & 07777) == 0600
++                && (stat($path))[4] == $>;
++            open(my $file, '<:raw', $path) or die "cannot read run log $path: $!\n";
++            local $/;
++            my $content = <$file> // '';
++            close($file) or die "cannot close run log $path: $!\n";
++            for my $value (@$credentials) {
++                die "run log exposed a fixture credential\n" if index($content, $value) >= 0;
++            }
++            $logs{$path} = sha256_hex($content);
++            if (exists($previous->{$path})) {
++                die "a retained run log changed: $path\n" unless $logs{$path} eq $previous->{$path};
++            } else {
++                die "the command did not announce its new run log: $path\n"
++                    unless index($output, "Tofu output streams to $path\n") >= 0;
++                $new{$path} = $content;
++            }
++        }
++    }
++    for my $path (keys %$previous) {
++        die "the command removed a retained run log: $path\n" unless exists($logs{$path});
++    }
++    return (\%logs, \%new);
++}
++
++sub require_log_diagnostic {
++    my ($logs, $kind, $message) = @_;
++    my @matching = grep { m{/tofu-\Q$kind\E-} && index($logs->{$_}, $message) >= 0 } keys %$logs;
++    die "the new $kind logs did not report $message\n" unless @matching;
++}
++
++sub capture_command {
++    my ($directory, $credentials, $input, @args) = @_;
++    my ($out) = tempfile(UNLINK => 1, DIR => $directory);
++    my ($err) = tempfile(UNLINK => 1, DIR => $directory);
++    my $pid = open3(my $writer, '>&' . fileno($out), '>&' . fileno($err), @args);
++    print {$writer} $input or die "cannot write command input: $!\n" if length($input);
++    close($writer) or die "cannot close command input: $!\n";
++    waitpid($pid, 0) == $pid or die "cannot wait for $args[0]: $!\n";
++    my $status = $?;
++    my @output;
++    for my $file ($out, $err) {
++        seek($file, 0, 0) or die "cannot rewind command output: $!\n";
++        local $/;
++        push @output, scalar(<$file>) // '';
++        for my $value (@$credentials) {
++            die "command output exposed a fixture credential\n" if index($output[-1], $value) >= 0;
++        }
++    }
++    my $label = join(' ', @args);
++    die "$label stopped on signal " . ($status & 127) . "\n" if $status & 127;
++    return ($status >> 8, \@output);
++}
++
++sub command {
++    my ($input, $expected, $diagnostic, @args) = @_;
++    my ($code, $output) = capture_command($private, \@sensitive, $input, @args);
++    my @output = @$output;
++    my $label = join(' ', @args);
++    my ($logs, $new_logs) = check_run_logs("$private/tmp", \%run_logs,
++        join("\n", @output), \@sensitive);
++    %run_logs = %$logs;
++    die "$label exited with $code (expected $expected)\n$output[1]\n" if $code != $expected;
++    if (defined($diagnostic)) {
++        if (ref($diagnostic) eq 'HASH') {
++            require_log_diagnostic($new_logs, $diagnostic->{log}, $diagnostic->{message});
++        } else {
++            die "$label did not report $diagnostic\n$output[1]\n"
++                if index(join("\n", @output), $diagnostic) < 0;
++        }
++    }
++    print "$label exited with $code\n";
++    return @output;
++}
++
++sub tofu {
++    my ($code, $message, @args) = @_;
++    return command('', $code, $message, "$private/bin/configsctl", 'tofu', 'sample', @args);
++}
++
++sub require_apply_lock {
++    my ($stderr) = @_;
++    my @selected = grep { /\bINFO tofu\.mutation\.explicit_lock_hosts(?:[ \t]|$)/ }
++        split(/\n/, $stderr);
++    die "the apply did not select exactly the hypervisor host\n"
++        unless @selected == 1 && $selected[0] =~ /(?:^|[ \t])hosts=\[hypervisor\](?:[ \t]|\r?$)/;
++    my @acquired = grep { /\bINFO hostlock\.acquired(?:[ \t]|$)/ } split(/\n/, $stderr);
++    die "the apply did not acquire exactly one host lock\n"
++        unless @acquired == 1 && $acquired[0] =~ /(?:^|[ \t])hosts=1(?:[ \t]|\r?$)/;
++}
++
++sub field {
++    my ($pin, $name, $pattern) = @_;
++    die "supply a valid $name in the installed-source pin\n"
++        unless defined($pin->{$name}) && !ref($pin->{$name}) && $pin->{$name} =~ $pattern;
++    return $1;
++}
++
++sub configuration {
++    my ($dir, $case, $pins) = @_;
++    my $pin = $pins->{$case};
++    die "supply the $case release pin\n" unless ref($pin) eq 'HASH';
++    my $asset = field($pin, 'asset', qr/\A(hostconfig_[A-Za-z0-9_-]+\.tar\.gz)\z/);
++    my $bundle = field($pin, 'bundle_asset', qr/\A([A-Za-z0-9_.-]+\.jsonl?)\z/);
++    my $release = field($pin, 'release_tag', qr/\A(hostconfig-[A-Za-z0-9_-]+)\z/);
++    my $revision = field($pin, 'source_revision', qr/\A([0-9a-f]{40})\z/);
++    my $sha = field($pin, 'sha256', qr/\A([0-9a-f]{64})\z/);
++    my $bundle_sha = field($pin, 'bundle_sha256', qr/\A([0-9a-f]{64})\z/);
++    my $archive = "$dir/$case/$asset";
++    my $bundle_path = "$dir/$case/$bundle";
++    die "$case archive digest differs from its pin\n" unless digest($archive) eq $sha;
++    die "$case attestation bundle digest differs from its pin\n"
++        unless digest($bundle_path) eq $bundle_sha;
++    my $tar = Archive::Tar->new;
++    $tar->read($archive, 1) or die "cannot read $case archive\n";
++    for my $entry ($tar->get_files) {
++        assert_private($entry->name . $entry->get_content, "$case archive member");
++    }
++    my $manifest = $tar->get_content('manifest.json') // die "$case lacks manifest.json\n";
++    assert_private(HostArtifactsTest::read_file($bundle_path), "$case attestation bundle");
++    return {
++        archive => $archive, bundle => $bundle_path, asset => $asset, release_tag => $release,
++        source_revision => $revision, sha256 => $sha, manifest_sha256 => sha256_hex($manifest),
++    };
++}
++
++sub policy {
++    my @files = map { { path => "$root/$_", mode => '0644', owner => 'root', group => 'root' } }
++        qw(configsctl.yml native/main.tf workspaces/sample/main.tf workspaces/sample/host/main.tf);
++    my @directories = map { { path => $_, mode => '0755', owner => 'root', group => 'root' } }
++        ($root, map { "$root/$_" } qw(native workspaces workspaces/sample workspaces/sample/host));
++    my $policy = HostArtifactsTest::base_policy($workspace, \@files, \@directories);
++    die "run acceptance on the disposable hypervisor node\n" unless $policy->{node} eq 'hypervisor';
++    return $policy;
++}
++
++sub install_release {
++    my ($rpcenv, $user, $pin) = @_;
++    my %params = (
++        'release-tag' => $pin->{release_tag}, asset => $pin->{asset},
++        sha256 => $pin->{sha256}, 'source-revision' => $pin->{source_revision},
++    );
++    for my $kind (qw(archive bundle)) {
++        $params{"$kind-stage"} = HostArtifactsTest::stage_file(
++            $rpcenv, $user, $target, $kind, HostArtifactsTest::read_file($pin->{$kind}),
++        );
++    }
++    my $response = HostArtifactsTest::api_request($rpcenv, $user, 'POST', $target, \%params);
++    die "install returned status $response->{status}\n" if $response->{status} != 200;
++    my ($status, $log) = HostArtifactsTest::wait_for_task($response->{data});
++    assert_private($log, 'install task log');
++    die "install failed: $log\n" unless $status eq 'OK';
++    die "install did not verify the configuration attestation\n"
++        unless index($log, "gh attestation verify accepted $pin->{asset} with SHA-256 $pin->{sha256}") >= 0;
++    print "Installed $pin->{release_tag} from $pin->{source_revision} with manifest $pin->{manifest_sha256}\n";
++}
++
++sub observation {
++    my ($stdout) = command('', 0, undef, '/usr/bin/pvesh', 'get',
++        "/nodes/localhost/host-artifacts/$target", '--output-format', 'json');
++    return $json->decode($stdout);
++}
++
++sub verify_install {
++    my ($policy, $pin) = @_;
++    my $state = observation();
++    die "pvesh did not report a committed install\n" unless $state->{state} eq 'committed';
++    for my $key (qw(workspace node environment)) {
++        die "pvesh reported the wrong current or installed $key\n"
++            unless $state->{$key} eq $policy->{$key} && $state->{installed}->{$key} eq $policy->{$key};
++    }
++    for my $key (qw(release_tag asset source_revision sha256 manifest_sha256)) {
++        die "pvesh reported the wrong installed $key\n" unless $state->{installed}->{$key} eq $pin->{$key};
++    }
++    for my $kind (qw(files directories)) {
++        my %expected = map { $_->{path} => $_ } @{$policy->{$kind}};
++        for my $entry (@{$state->{$kind}}) {
++            my $path = $entry->{path};
++            my $wanted = delete($expected{$path}) // die "unexpected $kind entry: $path\n";
++            die "pvesh reported drift for $path\n" unless $entry->{present} && $entry->{matches};
++            for my $key (qw(mode owner group)) {
++                die "unexpected $key for $path\n" unless $entry->{$key} eq $wanted->{$key};
++            }
++            if ($kind eq 'files') {
++                my $bytes = HostArtifactsTest::read_file($wanted->{path});
++                assert_private($bytes, $wanted->{path});
++                die "wrong observation for $path\n"
++                    unless length($bytes) == $entry->{size} && sha256_hex($bytes) eq $entry->{sha256};
++            }
++        }
++        die "pvesh omitted expected $kind\n" if keys %expected;
++    }
++}
++
++sub check_plan {
++    my ($path) = @_;
++    assert_private(HostArtifactsTest::read_file($path), 'saved plan');
++    my $zip = IO::Uncompress::Unzip->new($path, Transparent => 0)
++        or die "cannot open saved plan: $UnzipError\n";
++    my $next;
++    do {
++        my $data = '';
++        my $read;
++        while (($read = $zip->read(my $block)) > 0) {
++            $data .= $block;
++        }
++        die "cannot read saved plan: $UnzipError\n" if $read < 0;
++        assert_private($data, 'saved plan member');
++        $next = $zip->nextStream();
++    } while ($next > 0);
++    die "cannot read saved plan member: $UnzipError\n" if $next < 0;
++    $zip->close();
++    my ($shown) = tofu(0, undef, 'show', '-json', $path);
++    return $json->decode($shown);
++}
++
++sub backend {
++    my ($version) = @_;
++    my $bytes = HostArtifactsTest::read_file("$private/state.tfstate");
++    assert_private($bytes, 'backend state');
++    my $state = $json->decode($bytes);
++    my @marker = grep { ($_->{module} // '') eq 'module.host' && $_->{type} eq 'terraform_data'
++        && $_->{name} eq 'marker' } @{$state->{resources}};
++    die "expected one module.host.terraform_data.marker instance\n"
++        unless @marker == 1 && @{$marker[0]->{instances}} == 1;
++    my $input = $marker[0]->{instances}->[0]->{attributes}->{input};
++    die "the backend marker does not contain $version\n" unless $input->{value} eq $version;
++    die "the backend lacks its lineage or serial\n"
++        unless $state->{lineage} && defined($state->{serial}) && $state->{serial} =~ /^\d+$/;
++    return join(' ', sha256_hex($bytes), $state->{lineage}, $state->{serial});
++}
++
++sub random_token {
++    open(my $random, '<:raw', '/dev/urandom') or die "cannot open the random device: $!\n";
++    read($random, my $bytes, 32) == 32 or die "cannot read a fixture token: $!\n";
++    close($random);
++    return unpack('H*', $bytes);
++}
++
++sub set_token {
++    my ($token) = @_;
++    command("vault_installed_source_token: '$token'\n", 0, undef, "$private/bin/configsctl", 'set-secrets');
++    $ENV{TF_VAR_expected_token_sha256} = sha256_hex($token);
++}
++
++sub run {
++    my ($rpcenv, $user, $dir) = @_;
++    require HostArtifactsTest;
++    $json = HostArtifactsTest::json();
++    my $pins = read_json("$dir/pins.json");
++    my $policy = policy();
++    my $seed_phrase = HostArtifactsTest::read_file('installed-source-seed.pass');
++    chomp($seed_phrase);
++    die "the empty Vault fixture requires its seed passphrase\n" unless length($seed_phrase);
++    my ($first, $second) = (random_token(), random_token());
++    @sensitive = ($seed_phrase, $first, $second);
++    my ($one, $two) = map { configuration($dir, $_, $pins) } qw(installed-source-v1 installed-source-v2);
++    die "publish both configurations from the same revision with different manifests\n"
++        unless $one->{source_revision} eq $two->{source_revision} && $one->{manifest_sha256} ne $two->{manifest_sha256};
++    # The empty ciphertext and its public test passphrase come from TestDecrypt
++    # in the controller's ansible-vault-go v0.2.0 dependency.
++    my $seed = HostArtifactsTest::read_file('installed-source-seed.vault');
++    for my $path ($private, $root, $password_file) {
++        die "acceptance requires a fresh disposable container: $path exists\n" if -e $path || -l $path;
++    }
++    umask(0077);
++    make_path(map { "$private/$_" } qw(tmp bin data plans));
++    local %ENV = (HOME => '/root', PATH => "$private/bin:/usr/sbin:/usr/bin:/sbin:/bin",
++        TMPDIR => "$private/tmp", TF_DATA_DIR => "$private/data", TF_IN_AUTOMATION => '1');
++    for my $tool (qw(configsctl tofu)) {
++        my $expected = field($pins->{$tool}, 'member_sha256', qr/\A([a-f0-9]{64})\z/);
++        my $bytes = HostArtifactsTest::read_file("$dir/bin/$tool");
++        die "$tool does not match its executable pin\n" unless sha256_hex($bytes) eq $expected;
++        HostArtifactsTest::write_file("$private/bin/$tool", $bytes, 0700);
++        print "$tool SHA-256 $expected\n";
++    }
++    command('', 0, 'OpenTofu v1.13.2', "$private/bin/tofu", 'version');
++    HostArtifactsTest::write_policy($policy);
++    install_release($rpcenv, $user, $one);
++    verify_install($policy, $one);
++
++    make_path("$root/ansible/inventory/group_vars/all", '/root/.config/ansible', { mode => 0700 });
++    HostArtifactsTest::write_file($vault, $seed, 0600);
++    HostArtifactsTest::write_file($password_file, "$seed_phrase\n", 0600);
++    chdir($root) or die "cannot enter the installed configuration: $!\n";
++    set_token($first);
++    my ($version) = command('', 0, undef, "$private/bin/configsctl", 'version');
++    print $version;
++    tofu(0, undef, 'init', '-input=false');
++    {
++        local $ENV{TF_VAR_expected_token_sha256} = sha256_hex($second);
++        tofu(1, { log => 'plan', message => 'The supplied token must match the expected SHA-256 digest.' },
++            'plan', '-input=false', '-no-color');
++    }
++    my $plan = "$private/plans/first.tfplan";
++    tofu(0, undef, 'plan', '-input=false', "-out=$plan");
++    check_plan($plan);
++    my (undef, $first_apply_stderr) = tofu(0, undef, 'apply', '-input=false', $plan);
++    require_apply_lock($first_apply_stderr);
++    my $state = backend('one');
++    tofu(0, undef, 'plan', '-input=false', '-detailed-exitcode');
++    my $encrypted = digest($vault);
++    set_token($second);
++    die "rotation did not replace the encrypted Vault\n" if digest($vault) eq $encrypted;
++    tofu(0, undef, 'plan', '-input=false', '-detailed-exitcode');
++    verify_install($policy, $one);
++    my $old = "$private/plans/old.tfplan";
++    tofu(0, undef, 'plan', '-input=false', '-replace=module.host.terraform_data.marker', "-out=$old");
++    my $replacement = check_plan($old);
++    my @changes = grep { $_->{address} eq 'module.host.terraform_data.marker' }
++        @{$replacement->{resource_changes}};
++    die "the old plan must replace the installed marker\n"
++        unless @changes == 1 && join(',', @{$changes[0]->{change}->{actions}}) eq 'delete,create';
++    my $old_digest = digest($old);
++    die "the repeat or replacement plan changed backend state\n" unless backend('one') eq $state;
++    print "Backend SHA-256, lineage and serial: $state\nOld plan SHA-256: $old_digest\n";
++
++    my $original = HostArtifactsTest::read_file($module);
++    HostArtifactsTest::write_file($module, "$original\n", 0644);
++    my @drift = grep { $_->{path} eq $module } @{observation()->{files}};
++    die "pvesh did not report the altered module\n"
++        unless @drift == 1 && exists($drift[0]->{matches}) && !$drift[0]->{matches};
++    tofu(1, "installed file $module must have a matching fresh observation", 'apply', '-input=false', $old);
++    die "the altered-file refusal changed backend state\n" unless backend('one') eq $state;
++    HostArtifactsTest::write_file($module, $original, 0644);
++    verify_install($policy, $one);
++
++    HostArtifactsTest::write_policy({ %$policy, environment => 'other' });
++    my $changed = observation();
++    die "pvesh did not distinguish current and saved environments\n"
++        unless $changed->{environment} eq 'other' && $changed->{installed}->{environment} eq 'testbed';
++    tofu(1, 'the current and saved installed workspace, node, and environment must match tofu.installed_source',
++        'apply', '-input=false', $old);
++    die "the identity refusal changed backend state\n" unless backend('one') eq $state;
++    HostArtifactsTest::write_policy($policy);
++    verify_install($policy, $one);
++    install_release($rpcenv, $user, $two);
++    verify_install($policy, $two);
++    die "the old plan changed before its apply\n" unless digest($old) eq $old_digest;
++    tofu(1, 'regenerate the saved plan from the current installed artifact; its recorded source does not match',
++        'apply', '-input=false', $old);
++    die "the stale-plan refusal changed backend state or plan bytes\n"
++        unless backend('one') eq $state && digest($old) eq $old_digest;
++    my $fresh = "$private/plans/fresh.tfplan";
++    tofu(0, undef, 'plan', '-input=false', "-out=$fresh");
++    check_plan($fresh);
++    my (undef, $fresh_apply_stderr) = tofu(0, undef, 'apply', '-input=false', $fresh);
++    require_apply_lock($fresh_apply_stderr);
++    my $final_state = backend('two');
++    tofu(0, undef, 'plan', '-input=false', '-detailed-exitcode');
++    die "the final plan changed backend state\n" unless backend('two') eq $final_state;
++    verify_install($policy, $two);
++    find({
++        no_chdir => 1,
++        wanted => sub {
++            my $path = $File::Find::name;
++            return unless -f $path;
++            assert_private(HostArtifactsTest::read_file($path), $path);
++        },
++    }, $root, "$private/data");
++    for my $path ($vault, $password_file) {
++        die "the fixture credential file requires mode 0600\n" unless ((stat($path))[2] & 07777) == 0600;
++    }
++}
++
++1;
+diff --git a/test/HostArtifactsInstalledSource_test.pl b/test/HostArtifactsInstalledSource_test.pl
+new file mode 100755
+index 00000000..c53fb789
+--- /dev/null
++++ b/test/HostArtifactsInstalledSource_test.pl
+@@ -0,0 +1,14 @@
++#!/usr/bin/perl -T
++
++use strict;
++use warnings;
++
++use lib qw(.. .);
++
++use HostArtifactsTest;
++use HostArtifactsInstalledSourceTest;
++
++die "this test does not accept arguments\n" if @ARGV;
++my ($rpcenv, $fixture_dir, $user) = HostArtifactsTest::initialize_attested_fixture();
++HostArtifactsInstalledSourceTest::run($rpcenv, $user, "$fixture_dir/installed-source");
++exit(0);
 diff --git a/test/HostArtifactsTest.pm b/test/HostArtifactsTest.pm
 new file mode 100644
-index 00000000..f4962a65
+index 00000000..2c2f1146
 --- /dev/null
 +++ b/test/HostArtifactsTest.pm
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,416 @@
 +package HostArtifactsTest;
 +
 +use strict;
@@ -3486,6 +4040,7 @@ index 00000000..f4962a65
 +use PVE::HostArtifacts;
 +use PVE::INotify;
 +use PVE::ProcFSTools;
++use PVE::RPCEnvironment;
 +use PVE::Tools;
 +
 +my $TARGET_POLICY_DIR = '/etc/pve-overlay/host-artifacts/targets';
@@ -3496,6 +4051,8 @@ index 00000000..f4962a65
 +my $TAR_BLOCK_BYTES = 512;
 +my $INTERRUPT_FILE_COUNT = 300;
 +my $INTERRUPT_TIMEOUT_SECONDS = 120;
++my $NETWORK_DEVICE_DIR = '/sys/class/net';
++my $DEVICE_UP_FLAG = 0x1;
 +
 +my $json = JSON->new->utf8->canonical;
 +
@@ -3509,6 +4066,55 @@ index 00000000..f4962a65
 +        if $> != 0;
 +    make_path($TARGET_POLICY_DIR, $TASK_DIR, { mode => 0755 });
 +    use_emulated_start_time();
++}
++
++sub initialize_attested_fixture {
++    my $fixture_dir = $ENV{HOST_ARTIFACT_FIXTURE_DIR};
++    die "set HOST_ARTIFACT_FIXTURE_DIR to the directory with the attested fixture\n"
++        if !defined($fixture_dir) || $fixture_dir !~ m{\A(/[^\0]+)\z};
++    $fixture_dir = $1;
++    delete @ENV{qw(PATH IFS CDPATH ENV BASH_ENV)};
++    require_disposable_root();
++    require_no_network();
++    my $rpcenv = PVE::RPCEnvironment->init('priv');
++    $rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
++    write_file(PVE::HostArtifacts::trusted_root_path(), read_file("$fixture_dir/trusted_root.jsonl"));
++    return ($rpcenv, $fixture_dir, 'deploy@pve!install');
++}
++
++sub directory_names {
++    my ($dir) = @_;
++    opendir(my $handle, $dir) or die "cannot read $dir: $!\n";
++    my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($handle);
++    closedir($handle);
++    return \@names;
++}
++
++# The rollback and the new install count as offline evidence only when every device other than
++# lo is down and does not have a route.
++sub require_no_network {
++    my @active;
++    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
++        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
++        next if $device eq 'lo' || !-e $flags_path;
++        my $flags = read_file($flags_path);
++        chomp($flags);
++        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
++    }
++    die "this test needs a container without network access, and these devices are up:"
++        . " @active\n"
++        if @active;
++    my @routes = split(m/\n/, read_file('/proc/net/route'));
++    shift @routes;
++    my @devices = map { (split(' ', $_))[0] } @routes;
++    if (-e '/proc/net/ipv6_route') {
++        my @routes_v6 = split(m/\n/, read_file('/proc/net/ipv6_route'));
++        push @devices, map { (split(' ', $_))[-1] } @routes_v6;
++    }
++    my @routed = grep { $_ ne 'lo' } @devices;
++    die "this test needs a container without network access, and these devices have routes:"
++        . " @routed\n"
++        if @routed;
 +}
 +
 +# fork_worker compares the start time that the parent reads for the worker with the start time
@@ -3834,10 +4440,10 @@ index 00000000..f4962a65
 +1;
 diff --git a/test/HostArtifacts_attestation_test.pl b/test/HostArtifacts_attestation_test.pl
 new file mode 100755
-index 00000000..9f9ab0b8
+index 00000000..153a6153
 --- /dev/null
 +++ b/test/HostArtifacts_attestation_test.pl
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,862 @@
 +#!/usr/bin/perl -T
 +
 +# The test runs the installed /usr/bin/gh with the host artifact module against real attested
@@ -3861,7 +4467,6 @@ index 00000000..9f9ab0b8
 +use Time::HiRes qw();
 +
 +use PVE::HostArtifacts;
-+use PVE::RPCEnvironment;
 +
 +use HostArtifactsTest;
 +
@@ -3877,7 +4482,6 @@ index 00000000..9f9ab0b8
 +my $FIXTURE_REF = 'refs/heads/main';
 +my $WRONG_REF = 'refs/heads/other';
 +my $WORK = '/srv/host-artifacts-attestation-work';
-+my $TOKEN = 'deploy@pve!install';
 +my $STATE_DIR = '/var/lib/pve-overlay/host-artifacts';
 +my $CHUNK_BYTES = 96 * 1024;
 +my $PROGRAM_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
@@ -3886,8 +4490,6 @@ index 00000000..9f9ab0b8
 +my $INTERRUPT_ATTEMPTS = 5;
 +my $INTERRUPT_TIMEOUT_SECONDS = 120;
 +my $POLL_SECONDS = 0.0005;
-+my $NETWORK_DEVICE_DIR = '/sys/class/net';
-+my $DEVICE_UP_FLAG = 0x1;
 +my $GH_REJECTS = qr/gh attestation verify exited with code [1-9]/;
 +my $WANCONFIG_ASSET = 'wanconfig-stack_linux_amd64.tar.gz';
 +my $WANCONFIG_SHA256 = '60bf467c9601f612785e2d6fb6f973258fd94af05311e89df87deacf72e1b0c8';
@@ -3917,58 +4519,17 @@ index 00000000..9f9ab0b8
 +};
 +my @PROGRAM_NAMES = sort keys %$PROGRAMS;
 +
-+my $fixture_dir = $ENV{HOST_ARTIFACT_FIXTURE_DIR};
-+die "set HOST_ARTIFACT_FIXTURE_DIR to the directory with the attested configsctl fixture\n"
-+    if !defined($fixture_dir) || $fixture_dir !~ m{\A(/[^\0]+)\z};
-+$fixture_dir = $1;
-+delete @ENV{qw(PATH IFS CDPATH ENV BASH_ENV)};
-+
-+HostArtifactsTest::require_disposable_root();
++die "this test does not accept arguments\n" if @ARGV;
++my ($rpcenv, $fixture_dir, $TOKEN) = HostArtifactsTest::initialize_attested_fixture();
 +my $check = \&HostArtifactsTest::check;
 +my $check_error = \&HostArtifactsTest::check_error;
 +my $check_match = \&HostArtifactsTest::check_match;
 +my $json = HostArtifactsTest::json();
 +
-+# The rollback and the new install count as offline evidence only when every device other than
-+# lo is down and does not have a route.
-+sub require_no_network {
-+    my @active;
-+    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
-+        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
-+        next if $device eq 'lo' || !-e $flags_path;
-+        my $flags = HostArtifactsTest::read_file($flags_path);
-+        chomp($flags);
-+        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
-+    }
-+    die "this test needs a container without network access, and these devices are up:"
-+        . " @active\n"
-+        if @active;
-+
-+    my @routes = split(m/\n/, HostArtifactsTest::read_file('/proc/net/route'));
-+    shift @routes;
-+    my @devices = map { (split(' ', $_))[0] } @routes;
-+    if (-e '/proc/net/ipv6_route') {
-+        my @routes_v6 = split(m/\n/, HostArtifactsTest::read_file('/proc/net/ipv6_route'));
-+        push @devices, map { (split(' ', $_))[-1] } @routes_v6;
-+    }
-+    my @routed = grep { $_ ne 'lo' } @devices;
-+    die "this test needs a container without network access, and these devices have routes:"
-+        . " @routed\n"
-+        if @routed;
-+}
-+require_no_network();
-+
-+my $rpcenv = PVE::RPCEnvironment->init('priv');
-+$rpcenv->init_request(userconfig => 'host-artifacts-test.cfg');
-+
 +remove_tree($WORK);
 +make_path($WORK, { mode => 0755 });
 +my $archive = "$fixture_dir/$FIXTURE_ASSET";
 +my $bundle = "$fixture_dir/$FIXTURE_ASSET.sigstore.jsonl";
-+HostArtifactsTest::write_file(
-+    PVE::HostArtifacts::trusted_root_path(),
-+    HostArtifactsTest::read_file("$fixture_dir/trusted_root.jsonl"),
-+);
 +my $archive_bytes = HostArtifactsTest::read_file($archive);
 +$check->(
 +    'the fixture has the release SHA-256',
@@ -4294,22 +4855,13 @@ index 00000000..9f9ab0b8
 +    );
 +}
 +
-+sub directory_names {
-+    my ($dir) = @_;
-+
-+    opendir(my $handle, $dir) or die "cannot read $dir: $!\n";
-+    my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($handle);
-+    closedir($handle);
-+    return \@names;
-+}
-+
 +# The state includes each target file, every name in the two directories, and the installed
 +# record, secret record, journal, and lock file of the selected target.
 +sub program_state {
 +    return $json->encode([
 +        HostArtifactsTest::target_state($program_target, @$program_paths, @$file_paths),
-+        directory_names($program_dir),
-+        directory_names($file_dir),
++        HostArtifactsTest::directory_names($program_dir),
++        HostArtifactsTest::directory_names($file_dir),
 +    ]);
 +}
 +
@@ -7612,10 +8164,10 @@ index 00000000..dc992d43
 +
 +exit(0);
 diff --git a/test/Makefile b/test/Makefile
-index 2dfd20a4..90f7fd1a 100644
+index 2dfd20a4..a19ae4ce 100644
 --- a/test/Makefile
 +++ b/test/Makefile
-@@ -61,6 +61,22 @@ test-custom-cpu-models:
+@@ -61,6 +61,30 @@ test-custom-cpu-models:
  test-pvesh:
  	./pvesh_test.pl
  
@@ -7634,6 +8186,14 @@ index 2dfd20a4..90f7fd1a 100644
 +.PHONY: test-host-artifacts-attestation
 +test-host-artifacts-attestation:
 +	./HostArtifacts_attestation_test.pl
++
++.PHONY: test-host-artifacts-installed-source
++test-host-artifacts-installed-source:
++	./HostArtifactsInstalledSource_test.pl
++
++.PHONY: test-host-artifacts-installed-source-runlog
++test-host-artifacts-installed-source-runlog:
++	perl ./HostArtifactsInstalledSourceRunLog_test.pl "$(CONFIGSCTL)" "$(TOFU)"
 +
  .PHONY: install
  install:
@@ -7681,3 +8241,77 @@ index 00000000..faa1e884
 +    sleep 0.2
 +done
 +printf '%s' "${TEST_API_KEY:-}" | sha256sum | cut -d ' ' -f 1 > "$STATE_DIR/received"
+diff --git a/test/installed-source-runlog/configsctl.yml b/test/installed-source-runlog/configsctl.yml
+new file mode 100644
+index 00000000..c56b00fa
+--- /dev/null
++++ b/test/installed-source-runlog/configsctl.yml
+@@ -0,0 +1,4 @@
++tofu:
++  workspaces_dir: workspaces
++  configuration_root: native
++  env_key_prefix: fixture_env_
+diff --git a/test/installed-source-runlog/main.tf b/test/installed-source-runlog/main.tf
+new file mode 100644
+index 00000000..3cdba26f
+--- /dev/null
++++ b/test/installed-source-runlog/main.tf
+@@ -0,0 +1,24 @@
++terraform {
++  backend "local" {
++    path = "state.tfstate"
++  }
++}
++
++variable "vault_installed_source_token" {
++  type      = string
++  sensitive = true
++  ephemeral = true
++
++  validation {
++    condition     = sha256(var.vault_installed_source_token) == var.expected_token_sha256
++    error_message = "The supplied token must match the expected SHA-256 digest."
++  }
++}
++
++variable "expected_token_sha256" {
++  type = string
++}
++
++resource "terraform_data" "marker" {
++  input = "one"
++}
+diff --git a/test/installed-source-runlog/native.tf b/test/installed-source-runlog/native.tf
+new file mode 100644
+index 00000000..7d738cfa
+--- /dev/null
++++ b/test/installed-source-runlog/native.tf
+@@ -0,0 +1,9 @@
++variable "workspace" {
++  type = string
++}
++
++output "lock_targets" {
++  value = {
++    lock_free_types = ["terraform_data"]
++  }
++}
+diff --git a/test/installed-source-seed.pass b/test/installed-source-seed.pass
+new file mode 100644
+index 00000000..f3097ab1
+--- /dev/null
++++ b/test/installed-source-seed.pass
+@@ -0,0 +1 @@
++password
+diff --git a/test/installed-source-seed.vault b/test/installed-source-seed.vault
+new file mode 100644
+index 00000000..f42ebf7f
+--- /dev/null
++++ b/test/installed-source-seed.vault
+@@ -0,0 +1,6 @@
++$ANSIBLE_VAULT;1.1;AES256
++62613733343936633739383863623438363535336535643539623734313533663838643661313230
++6231343261616531393039313562663037303566356437370a643965616335653166653032656566
++37646235336630613233633233396136636434303338373563366237383939616361313638376434
++6464623462326236650a663235666338633036633336303632343834633164323537333030363061
++3163

@@ -2,9 +2,10 @@ name: drift
 
 # Applies the patches to the newest published Proxmox VE packages and loads
 # the patched modules. A failure means a patch no longer fits a release.
-# The job also runs test-host-artifacts, test-host-secrets, and
-# test-host-artifacts-attestation against the patched pve-manager source in a
-# disposable container. It then removes its own container.
+# The job also runs test-host-artifacts, test-host-secrets,
+# test-host-artifacts-attestation, and test-host-artifacts-installed-source against
+# the patched pve-manager source in a disposable container. It then removes its own
+# container.
 #
 # The workflow installs the Proxmox packages in a container image in GHCR. The
 # image tag is <component>-<hash of the Proxmox package index>-<hash of
@@ -92,6 +93,10 @@ jobs:
           fetch agoodkind/opnsensectl 202609190337-7-7db20fb opnsensectl_linux_amd64.tar.gz
           fetch agoodkind/mwan 202610291257-ff-c09e62f mwan_linux_amd64.tar.gz
           gh attestation trusted-root > trusted_root.jsonl
+      - name: Prepare the pinned installed-source acceptance fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: perl image/prepare-installed-source.pl image/installed-source-pins.json "$RUNNER_TEMP/fixture"
       - name: Start systemd in the disposable test container
         id: boot
         env:
@@ -125,7 +130,8 @@ jobs:
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           docker exec "$id" make -k -C /src/pve-manager/test \
-            test-host-artifacts test-host-secrets test-host-artifacts-attestation
+            test-host-artifacts test-host-secrets test-host-artifacts-attestation \
+            test-host-artifacts-installed-source
       - name: Print container diagnostics after a failure
         if: failure() && steps.boot.outcome != 'skipped'
         continue-on-error: true
