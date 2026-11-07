@@ -68,6 +68,12 @@ Generate each patch from its upstream base and reviewed fork commit. Generate th
 1. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager-acme.patch -- PVE/API2/ACME.pm`.
 2. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager.patch -- . ':!PVE/API2/ACME.pm'`.
 
+Regenerate the compatibility patch from the upstream base and reviewed overlay commit for pve-manager 9.2.24.
+
+```sh
+git -C <fork-checkout> diff <compat-upstream-base> <compat-overlay-commit> --output=<overlay-checkout>/patches/compat/pve-manager-acme-node.patch PVE/API2/ACME.pm
+```
+
 `pve-overlay` reads patch files directly in the [patches directory](patches/). Select the certificate patch that matches the package's `Sys.Modify` check:
 
 | pve-manager version | Check path | Selected patch |
