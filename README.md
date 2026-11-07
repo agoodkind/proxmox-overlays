@@ -59,8 +59,24 @@ Both grants are required. The token cannot change another option or another gues
 
 ## Drift check
 
-The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. A failed run means a patch needs a rebase in its fork. The job also runs `test-host-artifacts`, `test-host-secrets`, `test-host-units`, `test-host-artifacts-attestation`, and `test-host-artifacts-installed-source` against the pve-manager source rebuilt from `patches/pve-manager.patch` in a disposable container, then removes that container.
+The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. A failed run means a patch needs a rebase in its fork. The job also runs `test-host-artifacts`, `test-host-secrets`, `test-host-units`, `test-host-artifacts-attestation`, and `test-host-artifacts-installed-source` against reconstructed pve-manager source in a disposable container, then removes that container.
 
 The workflow installs the packages in a container image in GHCR and builds the image from `image/Dockerfile`. The image tag is `<component>-<hash of the Proxmox package index>-<hash of image/Dockerfile>`. The workflow builds a new image when Proxmox publishes a package or when `image/Dockerfile` changes. Otherwise, the workflow pulls the existing image from GHCR.
 
-To update a patch, run `git diff <upstream base commit> HEAD --output=<patch file>` on the `overlays` branch of the fork.
+Generate each patch from its upstream base and reviewed fork commit. Generate the two default pve-manager patches with separate file scopes:
+
+1. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager-acme.patch -- PVE/API2/ACME.pm`.
+2. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager.patch -- . ':!PVE/API2/ACME.pm'`.
+
+Regenerate the compatibility patch from the upstream base and reviewed overlay commit for pve-manager 9.2.24.
+
+```sh
+git -C <fork-checkout> diff <compat-upstream-base> <compat-overlay-commit> --output=<overlay-checkout>/patches/compat/pve-manager-acme-node.patch PVE/API2/ACME.pm
+```
+
+`pve-overlay` reads patch files directly in the [patches directory](patches/). Select the certificate patch that matches the package's `Sys.Modify` check:
+
+| pve-manager version | Check path | Selected patch |
+|---|---|---|
+| 9.2.24 | `/nodes/{node}` | [Compatibility patch](patches/compat/pve-manager-acme-node.patch) |
+| 9.2.26 | `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |

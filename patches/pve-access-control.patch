@@ -228,7 +228,7 @@ index a4e1c36..3232890 100644
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1326,11 +1465,18 @@ sub check_path {
+@@ -1326,10 +1465,17 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -246,7 +246,6 @@ index a4e1c36..3232890 100644
 +	|/hostnic/[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}
  	|/nodes
  	|/nodes/[[:alnum:]\.\-\_]+
- 	|/nodes/[[:alnum:]\.\-\_]+/certificates
 diff --git a/src/test/Makefile b/src/test/Makefile
 index 53f2da7..3759b7f 100644
 --- a/src/test/Makefile
