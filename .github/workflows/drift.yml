@@ -76,7 +76,7 @@ jobs:
           repository: agoodkind/pve-manager
           ref: ${{ env.PVE_MANAGER_BASE }}
           path: pve-manager
-      - name: Apply patches/pve-manager-acme.patch and patches/pve-manager.patch to pve-manager source
+      - name: Apply pve-manager patches
         run: git -C pve-manager apply "$PWD/patches/pve-manager-acme.patch" "$PWD/patches/pve-manager.patch"
       - name: Download the attested host test fixture
         env:
