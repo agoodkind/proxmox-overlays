@@ -732,7 +732,7 @@ index c348af75..14c3063a 100644
  .PHONY: install
  install:
 diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
-index f199371d..0f8e35e5 100644
+index f199371d..b4e37a9e 100644
 --- a/src/PVE/QemuServer.pm
 +++ b/src/PVE/QemuServer.pm
 @@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
@@ -760,7 +760,7 @@ index f199371d..0f8e35e5 100644
      # add usb controllers
      my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
      push @$devices, @usbcontrollers if @usbcontrollers;
-@@ -5617,6 +5628,15 @@ sub vm_start_nolock {
+@@ -5617,6 +5628,19 @@ sub vm_start_nolock {
      my $vollist = get_current_vm_volumes($storecfg, $conf);
      push $vollist->@*, $statefile if $statefile_is_a_volume;
  
@@ -771,25 +771,30 @@ index f199371d..0f8e35e5 100644
 +            die "VM $vmid still has a running QEMU process.\n"
 +                if PVE::QemuServer::Helpers::vm_running_locally($vmid);
 +        }
-+        cleanup_pci_devices($vmid, $conf);
++        eval { cleanup_pci_devices($vmid, $conf) };
++        my $cleanup_error = $@;
++        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist) };
++        $cleanup_error .= $@;
++        die $cleanup_error if $cleanup_error;
 +    };
      my ($cmd, $spice_port, $start_timeout);
      my $pci_reserve_list = [];
      eval {
-@@ -5821,19 +5841,36 @@ sub vm_start_nolock {
+@@ -5821,19 +5845,35 @@ sub vm_start_nolock {
      }
  
      if (my $err = $@) {
 -        # deactivate volumes if start fails
-+        if ($attachment_lock) {
-+            eval { $teardown_attachment->() };
-+            die "start failed: $err\nPCI device teardown failed: $@" if $@;
-+        }
-         eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
-         warn $@ if $@;
+-        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
+-        warn $@ if $@;
 -        eval { cleanup_pci_devices($vmid, $conf) };
 -        warn $@ if $@;
-+        if (!$attachment_lock) {
++        if ($attachment_lock) {
++            eval { $teardown_attachment->() };
++            die "start failed: $err\nVM cleanup failed: $@" if $@;
++        } else {
++            eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
++            warn $@ if $@;
 +            eval { cleanup_pci_devices($vmid, $conf) };
 +            warn $@ if $@;
 +        }
@@ -810,7 +815,7 @@ index f199371d..0f8e35e5 100644
 +            eval { $teardown_attachment->() };
 +            my $teardown = $@;
 +            die "Could not register the PCI devices for VM $vmid: $error"
-+                . ($teardown ? "PCI reservations remain protected after teardown failed: $teardown" : '');
++                . ($teardown ? "VM cleanup failed: $teardown" : '');
 +        }
 +        warn $error;
 +    }
@@ -819,7 +824,7 @@ index f199371d..0f8e35e5 100644
      my $qemu_pkg_string = PVE::QemuServer::QMPHelpers::get_qemu_package_string($vmid);
      syslog("info", "VM $vmid started with PID $pid using $qemu_pkg_string.");
 diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
-index d7dc6121..c8aa3aea 100644
+index d7dc6121..ab936af8 100644
 --- a/src/PVE/QemuServer/PCI.pm
 +++ b/src/PVE/QemuServer/PCI.pm
 @@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
@@ -873,19 +878,85 @@ index d7dc6121..c8aa3aea 100644
      }
      return $pci_ids;
  };
-@@ -797,6 +811,12 @@ sub remove_pci_reservation {
+@@ -797,6 +811,24 @@ sub remove_pci_reservation {
      die $@ if $@;
  }
  
-+# The reservation exists during startup before QEMU publishes its PID.
++my $reservation_is_active = sub {
++    my ($reservation, $now) = @_;
++    return $reservation->{time} > $now if defined($reservation->{time});
++    my $running_pid = PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
++    return defined($running_pid) && $running_pid == $reservation->{pid};
++};
++
 +sub get_reservation_owners {
 +    my $reservations = $parse_pci_reservation_unlocked->(1);
-+    return { map { $_ => $reservations->{$_}->{vmid} } keys %$reservations };
++    my $now = time();
++    my %owners;
++    for my $pci (keys %$reservations) {
++        my $reservation = $reservations->{$pci};
++        $owners{$pci} = $reservation->{vmid} if $reservation_is_active->($reservation, $now);
++    }
++    return \%owners;
 +}
 +
  # return all currently reserved ids from the given vmid
  sub get_reservations {
      my ($vmid) = @_;
+@@ -828,22 +860,13 @@ sub reserve_pci_usage {
+             for my $id ($requested_ids->@*) {
+                 my $reservation = $reservation_list->{$id};
+                 if ($reservation && $reservation->{vmid} != $vmid) {
+-                    # check time based reservation
+-                    die
+-                        "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
+-                        if defined($reservation->{time}) && $reservation->{time} > $ctime;
+-
+-                    if (my $reserved_pid = $reservation->{pid}) {
+-                        # check running vm
+-                        my $running_pid =
+-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
+-                        if (defined($running_pid) && $running_pid == $reserved_pid) {
+-                            die
+-                                "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
+-                        } else {
+-                            warn "leftover PCI reservation found for $id, lets take it...\n";
+-                        }
++                    if ($reservation_is_active->($reservation, $ctime)) {
++                        die "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
++                            if defined($reservation->{time});
++                        die "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
+                     }
++                    warn "leftover PCI reservation found for $id, lets take it...\n"
++                        if defined($reservation->{pid});
+                 } elsif ($reservation) {
+                     # already reserved by the same vmid
+                     if (my $reserved_time = $reservation->{time}) {
+@@ -852,19 +875,11 @@ sub reserve_pci_usage {
+                             my $old_timeout = $reservation->{time} - 5 - $ctime;
+                             $timeout = $old_timeout if $old_timeout > $timeout;
+                         }
+-                    } elsif (my $reserved_pid = $reservation->{pid}) {
+-                        my $running_pid =
+-                            PVE::QemuServer::Helpers::vm_running_locally($reservation->{vmid});
+-                        if (defined($running_pid) && $running_pid == $reservation->{pid}) {
+-                            if (defined($pid)) {
+-                                die
+-                                    "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n";
+-                            } elsif (defined($timeout)) {
+-                                # ignore timeout reservation for running vms, can happen with e.g.
+-                                # qm showcmd
+-                                return;
+-                            }
+-                        }
++                    } elsif ($reservation_is_active->($reservation, $ctime)) {
++                        die "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n"
++                            if defined($pid);
++                        # qm showcmd can request a timed reservation for a running VM.
++                        return if defined($timeout);
+                     }
+                 }
+ 
 diff --git a/src/test/GuestTestRequest.pm b/src/test/GuestTestRequest.pm
 new file mode 100644
 index 00000000..56f56260

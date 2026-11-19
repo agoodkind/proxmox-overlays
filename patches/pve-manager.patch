@@ -3758,10 +3758,10 @@ index efcb250d..9f409cf4 100644
  all: pvecfg.pm $(SUBDIRS)
 diff --git a/PVE/SRIOV.pm b/PVE/SRIOV.pm
 new file mode 100644
-index 00000000..abf59655
+index 00000000..b4327b5f
 --- /dev/null
 +++ b/PVE/SRIOV.pm
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,540 @@
 +package PVE::SRIOV;
 +
 +use strict;
@@ -3920,20 +3920,42 @@ index 00000000..abf59655
 +}
 +
 +sub inspect_guest {
-+    my ($id, $guest, $by_pci, $by_link, $owners, $netns) = @_;
++    my ($id, $guest, $by_pci, $by_link, $owners, $netns, $reservations) = @_;
 +    my $type = $guest->{type};
 +    if ($type eq 'qemu') {
 +        return if !PVE::QemuServer::check_running($id, 1);
-+        my @addresses;
 +        my $config = PVE::QemuConfig->load_config($id, $guest->{node});
++        my (%devices, %possible_keys);
 +        for my $key (grep { /\Ahostpci\d+\z/ } keys %$config) {
-+            my $device = PVE::QemuServer::PCI::parse_hostpci($config->{$key});
-+            for my $alternative ($device->{ids}->@*) {
-+                push @addresses, map { $_->{id} } @$alternative;
++            my $alternatives = PVE::QemuServer::PCI::parse_hostpci($config->{$key})->{ids};
++            $devices{$key} = $alternatives;
++            for my $group (@$alternatives) {
++                $possible_keys{$_->{id}}->{$key} = 1 for @$group;
 +            }
 +        }
-+        for my $address (@addresses) {
-+            $owners->{$address} = "VM $id" if exists($by_pci->{$address});
++        for my $key (keys %devices) {
++            my $alternatives = $devices{$key};
++            if (@$alternatives == 1) {
++                for my $function ($alternatives->[0]->@*) {
++                    $owners->{$function->{id}} = "in use by VM $id" if exists($by_pci->{$function->{id}});
++                }
++                next;
++            }
++
++            my @selected = grep {
++                !grep { ($reservations->{$_->{id}} // -1) != $id } @$_
++            } @$alternatives;
++            # A reservation records the VMID, but not the hostpci property.
++            next if @selected == 1 && !grep {
++                keys($possible_keys{$_->{id}}->%*) > 1
++            } $selected[0]->@*;
++            for my $alternative (@$alternatives) {
++                for my $function (@$alternative) {
++                    my $pci = $function->{id};
++                    next if !exists($by_pci->{$pci});
++                    $owners->{$pci} //= "unavailable because QEMU cannot identify the selected PCI mapping for $key on VM $id";
++                }
++            }
 +        }
 +        return;
 +    }
@@ -3945,7 +3967,7 @@ index 00000000..abf59655
 +    my $hostnics = PVE::LXC::Config->get_hostnics($config);
 +    for my $nic (values %$hostnics) {
 +        my $address = $by_link->{$nic->{link}};
-+        $owners->{$address} = "container $id" if defined($address);
++        $owners->{$address} = "in use by container $id" if defined($address);
 +    }
 +
 +    return if !grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
@@ -3965,7 +3987,7 @@ index 00000000..abf59655
 +        next if !defined($bus) || !exists($by_pci->{$bus});
 +        $by_pci->{$bus}->{ifname} = $name;
 +        $netns->{$bus} = $pid;
-+        $owners->{$bus} = "container $id";
++        $owners->{$bus} = "in use by container $id";
 +    }
 +}
 +
@@ -3987,7 +4009,7 @@ index 00000000..abf59655
 +    my (%owners, %netns);
 +    return ($state, \%owners, \%netns) if !$count;
 +    my $links = decode_json(output(['/sbin/ip', '-j', '-d', 'link', 'show', 'dev', $name]));
-+    my %macs = map { $_->{vf} => $_->{mac} } $links->[0]->{vfinfo_list}->@*;
++    my %macs = map { $_->{vf} => $_->{address} } $links->[0]->{vfinfo_list}->@*;
 +    my (%by_pci, %by_link);
 +    for my $index (0 .. $count - 1) {
 +        my $path = "$pf/virtfn$index";
@@ -4011,12 +4033,12 @@ index 00000000..abf59655
 +        next if !defined($vf->{ifname}) || $vf->{index} >= $count;
 +        $by_link{$vf->{ifname}} = $state->{vfs}->[$vf->{index}]->{pci};
 +    }
-+    for my $id (sort { $a <=> $b } keys %$guests) {
-+        inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns);
-+    }
 +    my $reservations = PVE::QemuServer::PCI::get_reservation_owners();
++    for my $id (sort { $a <=> $b } keys %$guests) {
++        inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns, $reservations);
++    }
 +    for my $pci (keys %by_pci) {
-+        $owners{$pci} = "VM $reservations->{$pci}" if defined($reservations->{$pci});
++        $owners{$pci} = "in use by VM $reservations->{$pci}" if defined($reservations->{$pci});
 +    }
 +    return ($state, \%owners, \%netns);
 +}
@@ -4142,8 +4164,8 @@ index 00000000..abf59655
 +            my $host_name = defined($old) ? $old->{ifname} : $vf->{ifname};
 +            $change ||= differs($vf, $wanted, $host_name);
 +        }
-+        my $reason = $owner // 'an unidentified network namespace';
-+        die "VF $index ($vf->{pci}) on $name is in use by $reason.\n" if $change;
++        my $reason = $owner // 'in use by an unidentified network namespace';
++        die "VF $index ($vf->{pci}) on $name is $reason.\n" if $change;
 +    }
 +
 +    if ($resize) {
@@ -9659,10 +9681,10 @@ index 2dfd20a4..de723d70 100644
  
 diff --git a/test/SRIOV_hardware_test.pl b/test/SRIOV_hardware_test.pl
 new file mode 100644
-index 00000000..d4ec0b64
+index 00000000..0b49d6c3
 --- /dev/null
 +++ b/test/SRIOV_hardware_test.pl
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,185 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -9675,7 +9697,7 @@ index 00000000..d4ec0b64
 +use PVE::File;
 +use PVE::Tools qw(run_command);
 +
-+my $mode = shift // die "Specify unused or attached.\n";
++my $mode = shift // die "Specify unused, attached, or mapped.\n";
 +my $port = shift // die "Specify the dedicated physical interface.\n";
 +my $path = shift // die "Specify the JSON declaration file.\n";
 +my $desired = decode_json(PVE::File::file_get_contents($path));
@@ -9690,6 +9712,18 @@ index 00000000..d4ec0b64
 +    return $handler->handle($info, $param, 1);
 +}
 +
++sub check_declared_vfs {
++    my ($state) = @_;
++    is($state->{numvfs}, $desired->{numvfs}, 'The PF reports the requested number of VFs');
++    for my $vf ($desired->{vfs}->@*) {
++        my $actual = $state->{vfs}->[$vf->{index}];
++        is($actual->{driver}, $vf->{driver}, "VF $vf->{index} binds to the declared driver");
++        is($actual->{mac}, lc($vf->{mac}), "VF $vf->{index} uses the declared MAC");
++        like($actual->{pci}, qr/\A[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\z/, 'GET reports the PCI address');
++        is($actual->{ifname}, $vf->{ifname}, 'The network driver uses the stable name') if defined($vf->{ifname});
++    }
++}
++
 +my $before = request('GET');
 +if ($mode eq 'unused') {
 +    die "This test requires a dedicated unmanaged adapter with zero enabled VFs.\n"
@@ -9698,15 +9732,21 @@ index 00000000..d4ec0b64
 +    my $reserve_id = shift // die "Specify an unused VMID for the pending PCI reservation test.\n";
 +    die "The reservation test requires an unused VMID.\n"
 +        if $reserve_id !~ /\A\d+\z/ || PVE::Cluster::get_vmlist()->{ids}->{$reserve_id};
++    my $isolated_node = shift // die "Specify the name of the isolated, guest-free test node.\n";
++    die "The isolated test node '$isolated_node' does not match '$node'.\n" if $isolated_node ne $node;
++    my $check_isolation = sub {
++        my ($guests) = @_;
++        die "This restore test requires a node without guests.\n" if keys %$guests;
++        my $dir = '/etc/pve-overlay/sriov';
++        if (-d $dir) {
++            die "Direct restore would apply a declaration for another adapter.\n"
++                if grep { /\.json\z/ && $_ ne "$port.json" } PVE::SRIOV::entries($dir);
++        }
++    };
++    PVE::SRIOV::with_mutation_locks($check_isolation);
 +    my $after = request('PUT', $desired);
-+    is($after->{numvfs}, $desired->{numvfs}, 'PUT enables the requested number of VFs');
-+    for my $vf ($desired->{vfs}->@*) {
-+        my $actual = $after->{vfs}->[$vf->{index}];
-+        is($actual->{driver}, $vf->{driver}, "VF $vf->{index} binds to the declared driver");
-+        is($actual->{mac}, lc($vf->{mac}), "VF $vf->{index} uses the declared MAC");
-+        like($actual->{pci}, qr/\A[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\z/, 'GET reports the PCI address');
-+        is($actual->{ifname}, $vf->{ifname}, 'The network driver uses the stable name') if defined($vf->{ifname});
-+    }
++    is_deeply(request('GET'), $after, 'GET reads the enabled VFs and the saved declaration');
++    check_declared_vfs($after);
 +    is_deeply(request('PUT', $desired), $after, 'Repeated PUT preserves runtime and desired state');
 +    my $pci = $after->{vfs}->[$desired->{vfs}->[0]->{index}]->{pci};
 +    PVE::QemuServer::PCI::reserve_pci_usage($pci, $reserve_id, 30);
@@ -9714,8 +9754,27 @@ index 00000000..d4ec0b64
 +    my $reserve_error = "$@";
 +    PVE::QemuServer::PCI::remove_pci_reservation($reserve_id, [$pci]);
 +    like($reserve_error, qr/in use by VM \Q$reserve_id\E\b/, 'A PCI reservation protects the VF before QEMU publishes its PID');
-+    run_command(['/bin/systemctl', 'restart', 'pve-overlay-sriov.service']);
-+    is_deeply(request('GET'), $after, 'Boot restoration preserves the declaration');
++    PVE::SRIOV::with_mutation_locks(sub {
++        my ($guests) = @_;
++        $check_isolation->($guests);
++        my $saved = PVE::SRIOV::saved($port);
++        my ($state, $owners, $netns) = PVE::SRIOV::observe($port, $saved, $guests);
++        die "Runtime or desired state changed before the restoration test.\n"
++            if $json->encode($state) ne $json->encode($after);
++        PVE::SRIOV::apply_port($port, $state, $owners, { numvfs => 0, vfs => [] }, $guests, $netns);
++    });
++    my $cleared = request('GET');
++    is_deeply($cleared, { %$after, numvfs => 0, vfs => [] },
++        'The kernel removed all VFs and the original declaration remains on disk')
++        or BAIL_OUT('Cannot verify reconstruction without cleared runtime state');
++    run_command(['/usr/bin/perl', '-T', '/usr/share/pve-overlay/sriov-restore']);
++    my $restored = request('GET');
++    is_deeply($restored->{desired}, $after->{desired}, 'The restore program preserves the saved declaration');
++    check_declared_vfs($restored);
++    for my $vf ($desired->{vfs}->@*) {
++        my $index = $vf->{index};
++        is($restored->{vfs}->[$index]->{pci}, $after->{vfs}->[$index]->{pci}, "Restore recreates VF $index at its PCI address");
++    }
 +    request('DELETE');
 +    is_deeply(request('GET'), $before, 'DELETE restores the unused adapter');
 +} elsif ($mode eq 'attached') {
@@ -9766,9 +9825,127 @@ index 00000000..d4ec0b64
 +    eval { request('DELETE') };
 +    like("$@", $owner, 'A running guest prevents DELETE');
 +    is_deeply(request('GET'), $before, 'Rejected changes preserve runtime and desired state');
++} elsif ($mode eq 'mapped') {
++    my ($vmid, $key, $selected, $spare, $test_mac) = @ARGV;
++    die "Specify the VMID, hostpci property, selected index, spare index, and spare test MAC.\n"
++        if !defined($test_mac) || $vmid !~ /\A\d+\z/ || $key !~ /\Ahostpci\d+\z/
++        || $selected !~ /\A\d+\z/ || $spare !~ /\A\d+\z/ || $selected == $spare;
++    die "The test requires a running VM and its current declaration.\n"
++        if !PVE::QemuServer::check_running($vmid, 1)
++        || $json->encode($desired) ne $json->encode($before->{desired});
++    my $value = PVE::QemuConfig->load_config($vmid)->{$key} // die "Missing $key on VM $vmid.\n";
++    my $device = PVE::QemuServer::PCI::parse_hostpci($value);
++    my %choices = map { @$_ == 1 ? ($_->[0]->{id} => 1) : () } $device->{ids}->@*;
++    my $selected_pci = $before->{vfs}->[$selected]->{pci} // die "Missing selected VF.\n";
++    my $spare_pci = $before->{vfs}->[$spare]->{pci} // die "Missing spare VF.\n";
++    die "Both VFs must be distinct alternatives of $key.\n" if !$choices{$selected_pci} || !$choices{$spare_pci};
++    my $owners = PVE::QemuServer::PCI::get_reservation_owners();
++    die "QEMU must own the selected VF and leave the spare unreserved.\n"
++        if ($owners->{$selected_pci} // -1) != $vmid || exists($owners->{$spare_pci});
++    die "Choose a fresh test MAC outside the current declaration.\n"
++        if grep { lc($_->{mac}) eq lc($test_mac) } $desired->{vfs}->@*;
++    my $changed_mac = sub {
++        my ($index) = @_;
++        my $changed = decode_json($json->encode($desired));
++        my ($vf) = grep { $_->{index} == $index } $changed->{vfs}->@*;
++        die "VF $index must have a declaration.\n" if !$vf;
++        $vf->{mac} = $test_mac;
++        return $changed;
++    };
++    my $active_change = $changed_mac->($selected);
++    my $spare_change = $changed_mac->($spare);
++    eval { request('PUT', $active_change) };
++    like("$@", qr/in use by VM \Q$vmid\E\b/, 'PUT rejects a change to the selected mapping');
++    eval {
++        request('PUT', $spare_change);
++        my $actual = request('GET');
++        is($actual->{vfs}->[$spare]->{mac}, lc($test_mac), 'PUT changes the unused mapping alternative');
++        is_deeply($actual->{vfs}->[$selected], $before->{vfs}->[$selected], 'The selected VF retains its settings');
++    };
++    my $error = $@;
++    request('PUT', $desired);
++    die $error if $error;
++    is_deeply(request('GET'), $before, 'The spare VF returns to its original configuration');
 +} else {
-+    die "Specify unused or attached.\n";
++    die "Specify unused, attached, or mapped.\n";
 +}
++done_testing();
+diff --git a/test/SRIOV_reservation_test.pl b/test/SRIOV_reservation_test.pl
+new file mode 100644
+index 00000000..79c7094d
+--- /dev/null
++++ b/test/SRIOV_reservation_test.pl
+@@ -0,0 +1,71 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use POSIX qw(WNOHANG _exit);
++use Test::More;
++use PVE::QemuServer::PCI;
++use PVE::QemuServer::Helpers;
++
++my ($address, $vmid, $other) = @ARGV;
++die "Specify a PCI address and two unused VMIDs on an isolated test node.\n"
++    if !defined($other) || $vmid !~ /\A\d+\z/ || $other !~ /\A\d+\z/ || $vmid == $other
++    || $address !~ /\A[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\z/;
++die "Missing PCI device $address.\n" if !-e "/sys/bus/pci/devices/$address";
++for my $id ($vmid, $other) {
++    my @configs = (glob("/etc/pve/nodes/*/qemu-server/$id.conf"), glob("/etc/pve/nodes/*/lxc/$id.conf"));
++    die "VMID $id is already in use.\n" if @configs || -e PVE::QemuServer::Helpers::vm_pidfile_name($id);
++}
++my $owners = sub { PVE::QemuServer::PCI::get_reservation_owners()->{$address} };
++die "PCI device $address is reserved.\n" if defined($owners->());
++my $child;
++eval {
++    PVE::QemuServer::PCI::reserve_pci_usage($address, $vmid, 0);
++    is($owners->(), $vmid, 'A pending reservation protects the device before PID publication');
++    eval { PVE::QemuServer::PCI::reserve_pci_usage($address, $other, 0) };
++    like("$@", qr/currently reserved/, 'QEMU rejects another VM during the pending reservation');
++    for (1 .. 70) {
++        last if !defined($owners->());
++        select(undef, undef, undef, 0.1);
++    }
++    is($owners->(), undef, 'An expired deadline releases ownership without manual cleanup');
++    PVE::QemuServer::PCI::reserve_pci_usage($address, $other, 0);
++    is($owners->(), $other, 'Another VM can reuse the expired reservation');
++
++    my $pidfile = PVE::QemuServer::Helpers::vm_pidfile_name($other);
++    $child = fork() // die "Cannot start QEMU: $!\n";
++    if (!$child) {
++        exec('/usr/bin/kvm', '-machine', 'none,accel=tcg', '-nodefaults', '-display', 'none',
++            '-S', '-pidfile', $pidfile) or _exit(127);
++    }
++    my $running_pid;
++    for (1 .. 100) {
++        $running_pid = PVE::QemuServer::Helpers::vm_running_locally($other);
++        last if defined($running_pid);
++        if (waitpid($child, WNOHANG) == $child) {
++            undef $child;
++            die "The test QEMU process exited during startup: $?.\n";
++        }
++        select(undef, undef, undef, 0.1);
++    }
++    die "Proxmox could not identify the test QEMU process.\n" if !defined($running_pid);
++    PVE::QemuServer::PCI::reserve_pci_usage($address, $other, undef, $running_pid);
++    is($owners->(), $other, 'A running VM owns its PID reservation');
++    eval { PVE::QemuServer::PCI::reserve_pci_usage($address, $vmid, 0) };
++    like("$@", qr/already in use/, 'QEMU rejects another VM while the owner is running');
++    kill('TERM', $child) or die "Cannot stop the test QEMU process: $!\n";
++    waitpid($child, 0);
++    undef $child;
++    is($owners->(), undef, 'The exited VM releases ownership without manual cleanup');
++    PVE::QemuServer::PCI::reserve_pci_usage($address, $vmid, 0);
++    is($owners->(), $vmid, 'Another VM can reuse the exited owner reservation');
++};
++my $error = $@;
++if ($child) {
++    kill('TERM', $child);
++    waitpid($child, 0);
++}
++PVE::QemuServer::PCI::remove_pci_reservation($_, [$address]) for ($vmid, $other);
++die $error if $error;
 +done_testing();
 diff --git a/test/SRIOV_start_test.pl b/test/SRIOV_start_test.pl
 new file mode 100644
