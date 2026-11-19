@@ -9,6 +9,7 @@ use strict;
 use warnings;
 
 use Cwd qw(abs_path);
+use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Getopt::Long qw(GetOptions);
@@ -32,6 +33,12 @@ my $STATE_FILE = 'var/lib/pve-overlay/installed';
 # A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
 # at /<path>. Only a path below one of these directories is installed.
 my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
+my %sriov_boot_files = map { $_ => 1 } qw(
+    etc/systemd/system/pve-overlay-sriov.service
+    etc/systemd/system/pve-guests.service.d/50-pve-overlay-sriov.conf
+    etc/systemd/system/pve-ha-lrm.service.d/50-pve-overlay-sriov.conf
+    usr/share/pve-overlay/sriov-restore
+);
 my $APPARMOR_DIR = 'etc/apparmor.d/';
 my $APPARMOR_ENABLED_FILE = '/sys/module/apparmor/parameters/enabled';
 
@@ -66,7 +73,7 @@ sub write_file {
 sub host_file_dir_allows {
     my ($relative_path) = @_;
     return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
-    return scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
+    return $sriov_boot_files{$relative_path} || scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
 }
 
 # Patch files also include tests, which the installer does not install.
@@ -338,6 +345,7 @@ sub is_installable_path {
     my ($path, $kind) = @_;
     return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
     return index($path, "$target_dir/PVE/") == 0 if $kind eq 'module';
+    return 1 if grep { $path eq "$host_root/$_" } keys %sriov_boot_files;
     for my $host_dir (@HOST_FILE_DIRS) {
         return 1 if index($path, "$host_root/$host_dir") == 0;
     }
@@ -364,7 +372,28 @@ sub remove_installed_path {
     return 1;
 }
 
-# Deletes every recorded path and every path that the current patches produce.
+sub require_sriov_restore {
+    my ($paths) = @_;
+    return if !grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
+    my $lockdir = "$host_root/run/lock";
+    make_path($lockdir) if !-d $lockdir;
+    open(my $lock, '>>', "$lockdir/pve-overlay-sriov.lock") or die "Cannot open the SR-IOV lock: $!\n";
+    flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n";
+    my $dir = "$host_root/etc/pve-overlay/sriov";
+    return $lock if !-d $dir;
+    opendir(my $handle, $dir) or die "Cannot inspect $dir: $!\n";
+    my @saved = sort grep { /\.json\z/ } readdir($handle);
+    closedir($handle) or die "Cannot close $dir: $!\n";
+    die "pve-overlay: remove the saved SR-IOV declarations through the node API before removing boot restoration: @saved\n" if @saved;
+    return $lock;
+}
+
+sub reload_systemd {
+    return if !$system_mode;
+    system('systemctl', 'daemon-reload') == 0 or die "pve-overlay: systemctl daemon-reload failed\n";
+}
+
+# Delete all recorded and currently produced paths.
 sub remove_copies {
     my ($apparmor_enabled) = @_;
     my $paths = read_state();
@@ -373,11 +402,13 @@ sub remove_copies {
         $paths->{$path} = $produced->{$path};
     }
 
+    my $sriov_lock = require_sriov_restore($paths);
     my $removed_count = 0;
     for my $path (sort keys %$paths) {
         $removed_count += remove_installed_path($path, $paths->{$path}, $apparmor_enabled);
     }
     unlink(state_path()) if -e state_path();
+    reload_systemd() if $removed_count && grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
     return $removed_count;
 }
 
@@ -391,7 +422,8 @@ sub command_apply {
     my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         # A patched copy of an older module must not shadow a newer package.
-        my $removed_count = remove_copies($apparmor_enabled);
+        my $removed_count = eval { remove_copies($apparmor_enabled) };
+        die "pve-overlay: could not apply patches: $error" . "Cleanup failed: $@" if $@;
         restart_units() if $removed_count;
         die "pve-overlay: removed the patched copies, Proxmox runs packaged modules: $error";
     }
@@ -399,6 +431,8 @@ sub command_apply {
     my $produced = produced_paths();
     my $recorded = read_state();
 
+    my %obsolete = map { $_ => $recorded->{$_} } grep { !exists($produced->{$_}) } keys %$recorded;
+    my $sriov_lock = require_sriov_restore(\%obsolete);
     my $deleted_count = 0;
     for my $path (sort keys %$recorded) {
         next if exists($produced->{$path});
@@ -423,6 +457,8 @@ sub command_apply {
         $changed_count++;
     }
     write_state($produced);
+    undef $sriov_lock;
+    reload_systemd() if grep { exists($produced->{"$host_root/$_"}) || exists($obsolete{"$host_root/$_"}) } keys %sriov_boot_files;
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
