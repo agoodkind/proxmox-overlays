@@ -887,7 +887,7 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index e403bbd..8927eb6 100644
+index e403bbd..1389285 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -670,6 +670,73 @@ sub make_apparmor_config {
@@ -1377,22 +1377,30 @@ index e403bbd..8927eb6 100644
      update_lxc_config($vmid, $conf);
  
      eval {
-@@ -3179,7 +3503,13 @@ sub vm_start {
-     PVE::Storage::activate_volumes($storage_cfg, $vollist);
+@@ -3165,6 +3489,12 @@ sub vm_start {
+     };
+     warn "lxc.idmap: $@" if $@;
  
-     my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
--    warn $@ if $@;
++    my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
 +    if (my $err = $@) {
-+        if ($attachment_lock) {
-+            unlink $skiplock_flag_fn if $skiplock;
-+            die "Cannot monitor startup for container $vmid: $err";
-+        }
++        die "Cannot monitor startup for container $vmid: $err" if $attachment_lock;
 +        warn $err;
 +    }
++
+     my $skiplock_flag_fn = "/run/lxc/skiplock-$vmid";
  
+     if ($skiplock) {
+@@ -3178,9 +3508,6 @@ sub vm_start {
+ 
+     PVE::Storage::activate_volumes($storage_cfg, $vollist);
+ 
+-    my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
+-    warn $@ if $@;
+-
      unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
  
-@@ -3192,7 +3522,8 @@ sub vm_start {
+     my $is_debug = $debug || (!defined($debug) && $conf->{debug});
+@@ -3192,7 +3519,8 @@ sub vm_start {
      eval {
          run_command($cmd);
  
@@ -1402,7 +1410,7 @@ index e403bbd..8927eb6 100644
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3201,8 +3532,21 @@ sub vm_start {
+@@ -3201,8 +3529,21 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
@@ -2194,6 +2202,56 @@ index 0000000..ff63547
 +done
 +shift
 +exec "$@"
+diff --git a/src/test/hostnic-monitor-storage-test.pl b/src/test/hostnic-monitor-storage-test.pl
+new file mode 100644
+index 0000000..4d9c824
+--- /dev/null
++++ b/src/test/hostnic-monitor-storage-test.pl
+@@ -0,0 +1,44 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use Test::More;
++use PVE::LXC;
++use PVE::LXC::Config;
++use PVE::LXC::Monitor;
++use PVE::Storage;
++
++# Run on a disposable node with lxc-monitord stopped. The guest must have a
++# hostnic and a missing rootfs file on an existing directory storage.
++my $vmid = shift // die "Specify a disposable container VMID.\n";
++die "Specify a numeric VMID.\n" if $vmid !~ /\A\d+\z/;
++die "The LXC monitor is running.\n" if eval { PVE::LXC::Monitor::get_monitor_socket() };
++
++PVE::LXC::Config->lock_config($vmid, sub {
++    my $conf = PVE::LXC::Config->load_config($vmid);
++    die "The test container is running.\n" if PVE::LXC::check_running($vmid);
++    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
++    die "The test requires a hostnic device.\n" if !keys %$hostnics;
++    my $mount = PVE::LXC::Config->parse_volume('rootfs', $conf->{rootfs});
++    my $volume = $mount->{volume};
++    my ($storeid) = PVE::Storage::parse_volume_id($volume);
++    my $storecfg = PVE::Storage::config();
++    my $storage = PVE::Storage::storage_config($storecfg, $storeid);
++    die "The test requires an existing directory storage.\n"
++        if $storage->{type} ne 'dir' || !-d $storage->{path};
++    die "The test rootfs file must be missing.\n" if -e PVE::Storage::path($storecfg, $volume);
++    die "The skiplock flag already exists.\n" if -e "/run/lxc/skiplock-$vmid";
++
++    my %ordinary = %$conf;
++    delete @ordinary{keys %$hostnics};
++    eval { PVE::LXC::vm_start($vmid, \%ordinary) };
++    like($@, qr/volume '\Q$volume\E' does not exist/,
++        'Without hostnic, startup continues to the real storage activation error');
++
++    eval { PVE::LXC::vm_start($vmid, $conf, 1) };
++    like($@, qr/Cannot monitor startup for container $vmid: failed to connect/,
++        'With hostnic, startup rejects the missing monitor before storage activation');
++    ok(!-e "/run/lxc/skiplock-$vmid", 'The rejected start does not leave a skiplock flag');
++});
++done_testing();
 diff --git a/src/test/hostnic-slow-start-test.pl b/src/test/hostnic-slow-start-test.pl
 new file mode 100644
 index 0000000..9bb8dca

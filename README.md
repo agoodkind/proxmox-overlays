@@ -86,8 +86,8 @@ Select the LXC and QEMU patches independently using the installed package versio
 
 | Package | Verified versions | Distribution patch | Upstream base | Overlay source |
 | --- | --- | --- | --- | --- |
-| pve-container | 6.1.15 through 6.1.21 | [Compatibility patch](patches/compat/pve-container-6.1.21.patch) | `de0ddd657525ef5c4bb0fd5783d0f585aa9034c1` | [d8d85b0](https://github.com/agoodkind/pve-container/commit/d8d85b022baf5841633742cb197dbc7c5e66f78d) |
-| pve-container | 6.1.22 through 6.1.24 | [Default container patch](patches/pve-container.patch) | `96021ad7dbc4ec8e618de880d59d2a12a9c8c0f1` | [0c33214](https://github.com/agoodkind/pve-container/commit/0c33214ab6dd6155e83a1c604cd28785e0a58916) |
+| pve-container | 6.1.15 through 6.1.21 | [Compatibility patch](patches/compat/pve-container-6.1.21.patch) | `de0ddd657525ef5c4bb0fd5783d0f585aa9034c1` | [def8ec4](https://github.com/agoodkind/pve-container/commit/def8ec485c40d6a30350356123ae0a98e473589d) |
+| pve-container | 6.1.22 through 6.1.24 | [Default container patch](patches/pve-container.patch) | `96021ad7dbc4ec8e618de880d59d2a12a9c8c0f1` | [8b9a52f](https://github.com/agoodkind/pve-container/commit/8b9a52fd7f464ee4d1c1995707b55928353bee60) |
 | qemu-server | 9.2.10 through 9.2.14 | [Compatibility patch](patches/compat/qemu-server-9.2.14.patch) | `a7b4240bba1dd493d6c76daad1e70af62b2ebcc8` | [0fdc2246](https://github.com/agoodkind/qemu-server/commit/0fdc2246385a9aedf2dff07a7a727696caacf219) |
 | qemu-server | 9.2.15 through 9.2.20 | [Default QEMU patch](patches/qemu-server.patch) | `91253ed548ea6bf9fbe8a3b0aa691933e52f8ed7` | [f6b62f09](https://github.com/agoodkind/qemu-server/commit/f6b62f091c066c6f2467d46025142ce3007e7259) |
 
