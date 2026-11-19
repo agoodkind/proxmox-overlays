@@ -1,8 +1,8 @@
 diff --git a/src/PVE/API2/Qemu.pm b/src/PVE/API2/Qemu.pm
-index 922c6599..3aa2f1e9 100644
+index e0661738..4892a042 100644
 --- a/src/PVE/API2/Qemu.pm
 +++ b/src/PVE/API2/Qemu.pm
-@@ -58,6 +58,7 @@ use PVE::Network;
+@@ -66,6 +66,7 @@ use PVE::Network;
  use PVE::Firewall;
  use PVE::API2::Firewall::VM;
  use PVE::API2::Qemu::Agent;
@@ -10,7 +10,7 @@ index 922c6599..3aa2f1e9 100644
  use PVE::API2::Qemu::HMPPerms;
  use PVE::VZDump::Plugin;
  use PVE::DataCenterConfig;
-@@ -1011,6 +1012,8 @@ my $check_vm_modify_config_perm = sub {
+@@ -1131,6 +1132,8 @@ my $check_vm_modify_config_perm = sub {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Memory']);
          } elsif ($hwtypeoptions->{$opt}) {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HWType']);
@@ -19,7 +19,7 @@ index 922c6599..3aa2f1e9 100644
          } elsif ($generaloptions->{$opt}) {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Options']);
              # special case for startup since it changes host behaviour
-@@ -1679,6 +1682,11 @@ __PACKAGE__->register_method({
+@@ -1811,6 +1814,11 @@ __PACKAGE__->register_method({
              { subdir => 'firewall' },
              { subdir => 'mtunnel' },
              { subdir => 'remote_migrate' },
@@ -31,7 +31,7 @@ index 922c6599..3aa2f1e9 100644
          ];
  
          return $res;
-@@ -1695,6 +1703,8 @@ __PACKAGE__->register_method({
+@@ -1827,6 +1835,8 @@ __PACKAGE__->register_method({
      path => '{vmid}/agent',
  });
  
@@ -40,7 +40,7 @@ index 922c6599..3aa2f1e9 100644
  __PACKAGE__->register_method({
      name => 'rrd',
      path => '{vmid}/rrd',
-@@ -2199,6 +2209,11 @@ my $update_vm_api = sub {
+@@ -2335,6 +2345,11 @@ my $update_vm_api = sub {
  
      &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [keys %$param]);
  
@@ -52,7 +52,7 @@ index 922c6599..3aa2f1e9 100644
      &$check_storage_access(
          $rpcenv, $authuser, $storecfg, $vmid, $param, undef, $extraction_storage,
      );
-@@ -2649,6 +2664,7 @@ my $vm_config_perm_list = [
+@@ -2785,6 +2800,7 @@ my $vm_config_perm_list = [
      'VM.Config.Memory',
      'VM.Config.Network',
      'VM.Config.HWType',
@@ -732,10 +732,10 @@ index c348af75..14c3063a 100644
  .PHONY: install
  install:
 diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
-index f199371d..b4e37a9e 100644
+index 148052cb..3458af98 100644
 --- a/src/PVE/QemuServer.pm
 +++ b/src/PVE/QemuServer.pm
-@@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
+@@ -558,6 +558,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
  NOTE: this option is for experts only.
  EODESCR
      },
@@ -760,7 +760,7 @@ index f199371d..b4e37a9e 100644
      # add usb controllers
      my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
      push @$devices, @usbcontrollers if @usbcontrollers;
-@@ -5617,6 +5628,19 @@ sub vm_start_nolock {
+@@ -5556,6 +5567,19 @@ sub vm_start_nolock {
      my $vollist = get_current_vm_volumes($storecfg, $conf);
      push $vollist->@*, $statefile if $statefile_is_a_volume;
  
@@ -780,15 +780,27 @@ index f199371d..b4e37a9e 100644
      my ($cmd, $spice_port, $start_timeout);
      my $pci_reserve_list = [];
      eval {
-@@ -5821,19 +5845,35 @@ sub vm_start_nolock {
+@@ -5785,12 +5809,26 @@ sub vm_start_nolock {
+         eval { $run_qemu->() };
      }
  
-     if (my $err = $@) {
+-    if (my $err = $@) {
 -        # deactivate volumes if start fails
 -        eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
 -        warn $@ if $@;
 -        eval { cleanup_pci_devices($vmid, $conf) };
 -        warn $@ if $@;
++    my $start_error = $@;
++    if (!$start_error && $attachment_lock) {
++        # Complete physical attachment before normal shutdown cleanup becomes active.
++        eval {
++            my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid);
++            die "Cannot find the running PID for VM $vmid.\n" if @$pci_reserve_list && !$pid;
++            PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid);
++        };
++        $start_error = "Could not register the PCI devices for VM $vmid: $@" if $@;
++    }
++    if (my $err = $start_error) {
 +        if ($attachment_lock) {
 +            eval { $teardown_attachment->() };
 +            die "start failed: $err\nVM cleanup failed: $@" if $@;
@@ -801,30 +813,22 @@ index f199371d..b4e37a9e 100644
  
          die "start failed: $err";
      }
+@@ -5799,8 +5837,11 @@ sub vm_start_nolock {
  
      # re-reserve all PCI IDs now that we can know the actual VM PID
      my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid);
 -    eval { PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid) };
 -    warn $@ if $@;
-+    eval {
-+        die "Cannot find the running PID for VM $vmid.\n" if @$pci_reserve_list && !$pid;
-+        PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid);
-+    };
-+    if (my $error = $@) {
-+        if ($attachment_lock) {
-+            eval { $teardown_attachment->() };
-+            my $teardown = $@;
-+            die "Could not register the PCI devices for VM $vmid: $error"
-+                . ($teardown ? "VM cleanup failed: $teardown" : '');
-+        }
-+        warn $error;
++    if (!$attachment_lock) {
++        eval { PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid) };
++        warn $@ if $@;
 +    }
 +    undef $attachment_lock;
  
      my $qemu_pkg_string = PVE::QemuServer::QMPHelpers::get_qemu_package_string($vmid);
      syslog("info", "VM $vmid started with PID $pid using $qemu_pkg_string.");
 diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
-index d7dc6121..ab936af8 100644
+index d54cd8a0..b8f4ada4 100644
 --- a/src/PVE/QemuServer/PCI.pm
 +++ b/src/PVE/QemuServer/PCI.pm
 @@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
@@ -832,10 +836,10 @@ index d7dc6121..ab936af8 100644
  use strict;
  
 +use Errno qw(ENOENT);
+ use Fcntl qw(SEEK_SET);
  use IO::File;
  
- use PVE::JSONSchema;
-@@ -220,6 +221,7 @@ sub get_pci_addr_map {
+@@ -222,6 +223,7 @@ sub get_pci_addr_map {
          'pci.4' => { bus => 1, addr => 28 },
          'rng0' => { bus => 1, addr => 29 },
          'pci.2-igd' => { bus => 1, addr => 30 }, # replaces pci.2 in case a legacy IGD device is passed through
@@ -843,7 +847,7 @@ index d7dc6121..ab936af8 100644
          'virtio6' => { bus => 2, addr => 1 },
          'virtio7' => { bus => 2, addr => 2 },
          'virtio8' => { bus => 2, addr => 3 },
-@@ -412,6 +414,13 @@ my sub print_pcie_root_port {
+@@ -414,6 +416,13 @@ my sub print_pcie_root_port {
      return $res;
  }
  
@@ -857,7 +861,7 @@ index d7dc6121..ab936af8 100644
  # returns the parsed pci config but parses the 'host' part into
  # a list if lists into the 'id' property like this:
  #
-@@ -747,6 +756,7 @@ my $PCIID_RESERVATION_LOCK = "${PCIID_RESERVATION_FILE}.lock";
+@@ -826,6 +835,7 @@ my $PCIID_RESERVATION_LOCK = "${PCIID_RESERVATION_FILE}.lock";
  # for successfully started VM processes, or a expiration time for the initial time window between
  # reservation and actual VM process start-up.
  my $parse_pci_reservation_unlocked = sub {
@@ -865,7 +869,7 @@ index d7dc6121..ab936af8 100644
      my $pci_ids = {};
      if (my $fh = IO::File->new($PCIID_RESERVATION_FILE, "r")) {
          while (my $line = <$fh>) {
-@@ -755,8 +765,12 @@ my $parse_pci_reservation_unlocked = sub {
+@@ -834,8 +844,12 @@ my $parse_pci_reservation_unlocked = sub {
                      vmid => $2,
                      "$3" => $4,
                  };
@@ -878,7 +882,7 @@ index d7dc6121..ab936af8 100644
      }
      return $pci_ids;
  };
-@@ -797,6 +811,24 @@ sub remove_pci_reservation {
+@@ -876,6 +890,24 @@ sub remove_pci_reservation {
      die $@ if $@;
  }
  
@@ -903,14 +907,15 @@ index d7dc6121..ab936af8 100644
  # return all currently reserved ids from the given vmid
  sub get_reservations {
      my ($vmid) = @_;
-@@ -828,22 +860,13 @@ sub reserve_pci_usage {
+@@ -907,23 +939,13 @@ sub reserve_pci_usage {
              for my $id ($requested_ids->@*) {
                  my $reservation = $reservation_list->{$id};
                  if ($reservation && $reservation->{vmid} != $vmid) {
 -                    # check time based reservation
--                    die
--                        "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
--                        if defined($reservation->{time}) && $reservation->{time} > $ctime;
+-                    if (defined($reservation->{time}) && $reservation->{time} > $ctime) {
+-                        die "PCI device '$id' is currently reserved for use by VMID"
+-                            . " '$reservation->{vmid}'\n";
+-                    }
 -
 -                    if (my $reserved_pid = $reservation->{pid}) {
 -                        # check running vm
@@ -932,7 +937,7 @@ index d7dc6121..ab936af8 100644
                  } elsif ($reservation) {
                      # already reserved by the same vmid
                      if (my $reserved_time = $reservation->{time}) {
-@@ -852,19 +875,11 @@ sub reserve_pci_usage {
+@@ -932,19 +954,11 @@ sub reserve_pci_usage {
                              my $old_timeout = $reservation->{time} - 5 - $ctime;
                              $timeout = $old_timeout if $old_timeout > $timeout;
                          }
@@ -986,20 +991,20 @@ index 00000000..56f56260
 +
 +1;
 diff --git a/src/test/Makefile b/src/test/Makefile
-index cf589f41..badd2997 100644
+index fa14908e..bb5a214a 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -1,6 +1,6 @@
  all: test
  
--test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config
-+test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_guest_permission test_guest_agent
+-test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_hotplug test_hotplug_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_memory test_agent test_raw_config_write test_api test_api_cloudinit_dump
++test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_hotplug test_hotplug_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_memory test_agent test_raw_config_write test_api test_api_cloudinit_dump test_guest_permission test_guest_agent
  
  test_snapshot: run_snapshot_tests.pl
  	./run_snapshot_tests.pl
-@@ -34,6 +34,12 @@ test_restore_config: run_qemu_restore_config_tests.pl
- test_parse_config: run_parse_config_tests.pl
- 	./run_parse_config_tests.pl
+@@ -57,6 +57,12 @@ test_api: run_api_tests.pl
+ test_api_cloudinit_dump: run_api_cloudinit_dump_tests.pl
+ 	./run_api_cloudinit_dump_tests.pl
  
 +test_guest_permission: guest-permission-test.pl
 +	./guest-permission-test.pl
@@ -1009,7 +1014,7 @@ index cf589f41..badd2997 100644
 +
  .PHONY: clean
  clean:
- 	rm -rf MigrationTest/run parse-config-output
+ 	rm -rf MigrationTest/run
 diff --git a/src/test/guest-agent-test.pl b/src/test/guest-agent-test.pl
 new file mode 100755
 index 00000000..9d842bfa

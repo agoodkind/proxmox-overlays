@@ -81,3 +81,14 @@ git -C <fork-checkout> diff <compat-upstream-base> <compat-overlay-commit> --out
 |---|---|---|
 | 9.2.24 | `/nodes/{node}` | [Compatibility patch](patches/compat/pve-manager-acme-node.patch) |
 | 9.2.26 | `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |
+
+Select the LXC and QEMU patches independently using the installed package versions. Install the selected files under the usual component filenames.
+
+| Package | Verified versions | Distribution patch | Upstream base | Overlay source |
+| --- | --- | --- | --- | --- |
+| pve-container | 6.1.15 through 6.1.21 | [Compatibility patch](patches/compat/pve-container-6.1.21.patch) | `de0ddd657525ef5c4bb0fd5783d0f585aa9034c1` | [110acb0](https://github.com/agoodkind/pve-container/commit/110acb0c067625379a956a52d58c925fbd48fe0d) |
+| pve-container | 6.1.22 through 6.1.24 | [Default container patch](patches/pve-container.patch) | `96021ad7dbc4ec8e618de880d59d2a12a9c8c0f1` | [a7e65b3](https://github.com/agoodkind/pve-container/commit/a7e65b33ab428ca2e23380ed2fa76a4b2c668a03) |
+| qemu-server | 9.2.10 through 9.2.14 | [Compatibility patch](patches/compat/qemu-server-9.2.14.patch) | `a7b4240bba1dd493d6c76daad1e70af62b2ebcc8` | [0fdc2246](https://github.com/agoodkind/qemu-server/commit/0fdc2246385a9aedf2dff07a7a727696caacf219) |
+| qemu-server | 9.2.15 through 9.2.20 | [Default QEMU patch](patches/qemu-server.patch) | `91253ed548ea6bf9fbe8a3b0aa691933e52f8ed7` | [f6b62f09](https://github.com/agoodkind/qemu-server/commit/f6b62f091c066c6f2467d46025142ce3007e7259) |
+
+Regenerate each distribution patch from its source fork with `git diff --output=<distribution-patch> <upstream-base> <overlay-source>`.

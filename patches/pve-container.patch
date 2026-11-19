@@ -1,21 +1,20 @@
 diff --git a/src/PVE/API2/LXC.pm b/src/PVE/API2/LXC.pm
-index 5f94d5a..c4c012e 100644
+index 64aba6b..026d461 100644
 --- a/src/PVE/API2/LXC.pm
 +++ b/src/PVE/API2/LXC.pm
-@@ -4,8 +4,12 @@ use strict;
+@@ -3,6 +3,11 @@ package PVE::API2::LXC;
+ use strict;
  use warnings;
  
- use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
 +use IO::Select;
- use IO::Socket::UNIX;
 +use MIME::Base64 qw(decode_base64 encode_base64);
 +use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
++use Time::HiRes (); # Guest exec also runs on packages that do not import usleep.
++
+ use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
+ use IO::Socket::UNIX;
  use Socket qw(SOCK_STREAM);
-+use Time::HiRes qw();
- use JSON;
- 
- use PVE::AccessControl;
-@@ -18,6 +22,7 @@ use PVE::INotify;
+@@ -20,6 +25,7 @@ use PVE::INotify;
  use PVE::JSONSchema qw(get_standard_option);
  use PVE::RESTHandler;
  use PVE::RPCEnvironment;
@@ -23,7 +22,7 @@ index 5f94d5a..c4c012e 100644
  use PVE::RRD;
  use PVE::RS::OCI;
  use PVE::ReplicationConfig;
-@@ -711,6 +716,11 @@ __PACKAGE__->register_method({
+@@ -784,6 +790,11 @@ __PACKAGE__->register_method({
              { subdir => 'snapshot' },
              { subdir => 'resize' },
              { subdir => 'interfaces' },
@@ -35,7 +34,7 @@ index 5f94d5a..c4c012e 100644
          ];
  
          return $res;
-@@ -3075,6 +3085,618 @@ __PACKAGE__->register_method({
+@@ -3156,6 +3167,618 @@ __PACKAGE__->register_method({
      },
  });
  
@@ -888,10 +887,10 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..be8e961 100644
+index e403bbd..e49f95f 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -694,6 +694,73 @@ sub make_apparmor_config {
+@@ -670,6 +670,73 @@ sub make_apparmor_config {
      return $raw;
  }
  
@@ -965,7 +964,7 @@ index dee073d..be8e961 100644
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -755,6 +822,8 @@ sub update_lxc_config {
+@@ -731,6 +798,8 @@ sub update_lxc_config {
          $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
      }
  
@@ -974,7 +973,7 @@ index dee073d..be8e961 100644
      if ($unprivileged && !$features->{force_rw_sys}) {
          # unpriv. CT default to sys:rw, but that doesn't always plays well with
          # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
-@@ -891,6 +960,8 @@ sub update_lxc_config {
+@@ -867,6 +936,8 @@ sub update_lxc_config {
          }
      }
  
@@ -983,7 +982,7 @@ index dee073d..be8e961 100644
      if (my $env = $conf->{env}) {
          for my $variable (split(/\0+/, $env)) {
              $raw .= "lxc.environment.runtime = $variable\n";
-@@ -1675,11 +1746,75 @@ sub delete_read_restricted_options {
+@@ -1623,11 +1694,75 @@ sub delete_read_restricted_options {
      return $conf;
  }
  
@@ -1060,7 +1059,7 @@ index dee073d..be8e961 100644
  
      my $check = sub {
          my ($opt, $delete) = @_;
-@@ -1696,6 +1831,8 @@ sub check_ct_modify_config_perm {
+@@ -1644,6 +1779,8 @@ sub check_ct_modify_config_perm {
                  my $sid = $1;
                  $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
              } else {
@@ -1069,7 +1068,7 @@ index dee073d..be8e961 100644
                  PVE::Storage::check_volume_access(
                      $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                  );
-@@ -1711,51 +1848,68 @@ sub check_ct_modify_config_perm {
+@@ -1659,51 +1796,68 @@ sub check_ct_modify_config_perm {
          } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
          } elsif ($opt eq 'features') {
@@ -1179,7 +1178,7 @@ index dee073d..be8e961 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2592,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2441,6 +2595,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1352,7 +1351,7 @@ index dee073d..be8e961 100644
  sub mountpoint_hotplug : prototype($$$$$) {
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
-@@ -3156,6 +3476,9 @@ sub vm_start {
+@@ -3157,6 +3477,9 @@ sub vm_start {
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
@@ -1362,7 +1361,7 @@ index dee073d..be8e961 100644
      update_lxc_config($vmid, $conf);
  
      eval {
-@@ -3191,7 +3514,13 @@ sub vm_start {
+@@ -3192,7 +3515,13 @@ sub vm_start {
      eval {
          run_command($cmd);
  
@@ -1377,7 +1376,7 @@ index dee073d..be8e961 100644
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3200,8 +3529,21 @@ sub vm_start {
+@@ -3201,8 +3530,21 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
@@ -1400,7 +1399,7 @@ index dee073d..be8e961 100644
  
      my @managed_dhcpv4_interfaces = ();
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
-index 3eb1905..47835c7 100644
+index b6eaf0b..9e3d888 100644
 --- a/src/PVE/LXC/Config.pm
 +++ b/src/PVE/LXC/Config.pm
 @@ -6,6 +6,7 @@ use warnings;
@@ -1411,7 +1410,7 @@ index 3eb1905..47835c7 100644
  use PVE::Cluster qw(cfs_register_file);
  use PVE::DataCenterConfig;
  use PVE::GuestHelpers;
-@@ -510,6 +511,119 @@ my $features_desc = {
+@@ -505,6 +506,119 @@ my $features_desc = {
      },
  };
  
@@ -1531,7 +1530,7 @@ index 3eb1905..47835c7 100644
  my $confdesc = {
      lock => {
          optional => 1,
-@@ -694,6 +808,14 @@ my $confdesc = {
+@@ -689,6 +803,14 @@ my $confdesc = {
          format => $features_desc,
          description => "Allow containers access to advanced features.",
      },
@@ -1546,7 +1545,7 @@ index 3eb1905..47835c7 100644
      env => {
          type => 'string',
          description => 'The container runtime environment as NUL-separated list.'
-@@ -969,6 +1091,26 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
+@@ -964,6 +1086,26 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
      };
  }
  
@@ -1573,17 +1572,17 @@ index 3eb1905..47835c7 100644
  PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
  
  sub verify_ct_timezone {
-@@ -1392,6 +1534,9 @@ sub update_pct_config {
+@@ -1392,6 +1534,9 @@ sub queue_pct_config_changes {
          $class->remove_from_pending_delete($conf, $opt);
      }
  
 +    $class->check_pending_hostnic_conflicts($conf)
 +        if grep { m/^(?:hostnic|net)\d+$/ } keys %$modified;
 +
-     my $changes = $class->cleanup_pending($conf);
+     $class->cleanup_pending($conf);
  
-     my $errors = {};
-@@ -1591,6 +1736,90 @@ sub parse_features {
+     return $modified;
+@@ -1600,6 +1745,90 @@ sub parse_features {
      return PVE::JSONSchema::parse_property_string($features_desc, $data);
  }
  
@@ -1675,10 +1674,10 @@ index 3eb1905..47835c7 100644
      my ($class, $name) = @_;
  
 diff --git a/src/PVE/LXC/Create.pm b/src/PVE/LXC/Create.pm
-index 08b65ca..e0e5146 100644
+index 6e6ec35..251d025 100644
 --- a/src/PVE/LXC/Create.pm
 +++ b/src/PVE/LXC/Create.pm
-@@ -550,6 +550,12 @@ sub sanitize_and_merge_config {
+@@ -546,6 +546,12 @@ sub sanitize_and_merge_config {
              next;
          }
  
@@ -1715,21 +1714,21 @@ index 0000000..2e13592
 +  mount options=(move),
 +}
 diff --git a/src/test/Makefile b/src/test/Makefile
-index 91ae6ff..3fa094a 100644
+index c1ff506..04a917e 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -2,7 +2,7 @@ RUN_USERNS := lxc-usernsexec -m "u:0:`id -u`:1" -m "g:0:`id -g`:1" --
  
  all: test
  
--test: test_setup test_snapshot test_bindmount test_idmap
-+test: test_setup test_snapshot test_bindmount test_idmap test_bpfdelegate test_exec_concurrency test_hostnic
+-test: test_setup test_snapshot test_bindmount test_idmap test_config test_raw_config_write
++test: test_setup test_snapshot test_bindmount test_idmap test_config test_raw_config_write test_bpfdelegate test_exec_concurrency test_hostnic
  
  test_setup: run_setup_tests.pl
  	if test -e /run/lock/sbuild; then \
-@@ -24,5 +24,14 @@ test_bindmount: bindmount_test.pl
- test_idmap: run_idmap_tests.pl
- 	./run_idmap_tests.pl
+@@ -30,5 +30,14 @@ test_config: config_tests.pl
+ test_raw_config_write: raw_config_write_test.pl
+ 	./raw_config_write_test.pl
  
 +test_bpfdelegate: bpfdelegate-test.pl
 +	./bpfdelegate-test.pl
