@@ -887,7 +887,7 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index e403bbd..e49f95f 100644
+index e403bbd..8927eb6 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -670,6 +670,73 @@ sub make_apparmor_config {
@@ -1351,7 +1351,23 @@ index e403bbd..e49f95f 100644
  sub mountpoint_hotplug : prototype($$$$$) {
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
-@@ -3157,6 +3477,9 @@ sub vm_start {
+@@ -3133,12 +3453,13 @@ my sub monitor_state_change($$) {
+         }
+     }
+ }
+-my sub monitor_start($$) {
+-    my ($monitor_socket, $vmid) = @_;
++my sub monitor_start($$$) {
++    my ($monitor_socket, $vmid, $attachment_lock) = @_;
+ 
+     my $success =
+         eval { PVE::Tools::run_with_timeout(10, \&monitor_state_change, $monitor_socket, $vmid) };
+     if (my $err = $@) {
++        die "Cannot confirm startup for container $vmid: $err" if $attachment_lock;
+         warn "problem with monitor socket, but continuing anyway: $err\n";
+     } elsif (!$success) {
+         print_ct_stderr_log($vmid);
+@@ -3157,6 +3478,9 @@ sub vm_start {
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
@@ -1361,22 +1377,32 @@ index e403bbd..e49f95f 100644
      update_lxc_config($vmid, $conf);
  
      eval {
-@@ -3192,7 +3515,13 @@ sub vm_start {
+@@ -3179,7 +3503,13 @@ sub vm_start {
+     PVE::Storage::activate_volumes($storage_cfg, $vollist);
+ 
+     my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
+-    warn $@ if $@;
++    if (my $err = $@) {
++        if ($attachment_lock) {
++            unlink $skiplock_flag_fn if $skiplock;
++            die "Cannot monitor startup for container $vmid: $err";
++        }
++        warn $err;
++    }
+ 
+     unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
+ 
+@@ -3192,7 +3522,8 @@ sub vm_start {
      eval {
          run_command($cmd);
  
 -        monitor_start($monitor_socket, $vmid) if defined($monitor_socket);
-+        if ($attachment_lock) {
-+            # liblxc moves physical interfaces into the namespace before publishing RUNNING.
-+            run_command(['/usr/bin/lxc-wait', '-n', $vmid, '-s', 'RUNNING', '-t', '60']);
-+            find_lxc_pid($vmid);
-+        } elsif (defined($monitor_socket)) {
-+            monitor_start($monitor_socket, $vmid);
-+        }
++        monitor_start($monitor_socket, $vmid, $attachment_lock) if defined($monitor_socket);
++        find_lxc_pid($vmid) if $attachment_lock;
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3201,8 +3530,21 @@ sub vm_start {
+@@ -3201,8 +3532,21 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
@@ -2168,6 +2194,96 @@ index 0000000..ff63547
 +done
 +shift
 +exec "$@"
+diff --git a/src/test/hostnic-slow-start-test.pl b/src/test/hostnic-slow-start-test.pl
+new file mode 100644
+index 0000000..9bb8dca
+--- /dev/null
++++ b/src/test/hostnic-slow-start-test.pl
+@@ -0,0 +1,84 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use Errno qw(EWOULDBLOCK);
++use Fcntl qw(:flock);
++use POSIX qw(_exit);
++use Test::More;
++use PVE::LXC;
++use PVE::LXC::Config;
++use PVE::LXC::Monitor;
++use PVE::RPCEnvironment;
++use PVE::SRIOVLock;
++use PVE::Tools qw(run_command);
++
++# Run on a disposable node with a stopped hostnic guest. Its liblxc pre-start
++# hook must take at least 70 seconds and then either succeed or reject startup.
++my ($vmid, $expected) = @ARGV;
++die "Specify a disposable container VMID and either running or aborted.\n"
++    if !defined($vmid) || $vmid !~ /^\d+$/ || ($expected // '') !~ /\A(?:running|aborted)\z/;
++
++my $rpcenv = PVE::RPCEnvironment->init('cli');
++$rpcenv->set_user('root@pam');
++my $config = PVE::LXC::Config->load_config($vmid);
++die "The test requires a hostnic device.\n" if !keys(PVE::LXC::Config->get_hostnics($config)->%*);
++die "Container $vmid is already running.\n" if PVE::LXC::check_running($vmid);
++my $monitor = PVE::LXC::Monitor::get_monitor_socket();
++pipe(my $reader, my $writer) or die "Cannot create the startup result pipe: $!\n";
++my $child = fork() // die "Cannot start the test worker: $!\n";
++if (!$child) {
++    close($reader);
++    close($monitor);
++    eval {
++        PVE::LXC::Config->lock_config($vmid, sub {
++            my $conf = PVE::LXC::Config->load_config($vmid);
++            PVE::LXC::vm_start($vmid, $conf, undef, 0);
++        });
++    };
++    my $err = $@;
++    print {$writer} $err;
++    close($writer) or _exit(2);
++    _exit($err ? 1 : 0);
++}
++close($writer);
++
++eval {
++    PVE::Tools::run_with_timeout(30, sub {
++        while (1) {
++            my ($type, $name, $state) = PVE::LXC::Monitor::read_lxc_message($monitor);
++            die "The LXC monitor closed before STARTING.\n" if !defined($type);
++            last if $type eq 'STATE' && $name eq "$vmid"
++                && $state == PVE::LXC::Monitor::STATE_STARTING;
++        }
++    });
++    sleep(63);
++    open(my $lock, '>>', PVE::SRIOVLock::PATH) or die "Cannot open the attachment lock: $!\n";
++    my $available = flock($lock, LOCK_EX | LOCK_NB);
++    my $busy = !$available && $! == EWOULDBLOCK;
++    close($lock);
++    ok($busy, 'The physical attachment still excludes mutation 63 seconds after STARTING');
++};
++my $monitor_error = $@;
++my $error = do { local $/; <$reader> };
++waitpid($child, 0) == $child or die "Cannot wait for the test worker: $!\n";
++my $status = $?;
++open(my $lock, '>>', PVE::SRIOVLock::PATH) or die "Cannot reopen the attachment lock: $!\n";
++ok(flock($lock, LOCK_EX | LOCK_NB), 'Mutation can acquire the lock after startup finishes');
++close($lock);
++if ($expected eq 'running') {
++    is($status, 0, 'The slow startup succeeds') or diag($error);
++    ok(eval { PVE::LXC::find_lxc_pid($vmid) }, 'The running container has an init PID');
++    run_command(['systemctl', 'stop', "pve-container\@$vmid.service"]);
++} else {
++    is($status, 256, 'The rejected startup fails');
++    like($error, qr/startup for container '\Q$vmid\E' failed/, 'The monitor reports the terminal state');
++    my $state;
++    run_command(['systemctl', 'show', "pve-container\@$vmid.service", '-p', 'ActiveState', '--value'],
++        outfunc => sub { $state = shift });
++    like($state, qr/\A(?:failed|inactive)\z/, 'The systemd unit has stopped');
++    ok(!PVE::LXC::check_running($vmid), 'Teardown finishes before vm_start returns');
++}
++die $monitor_error if $monitor_error;
++done_testing();
 diff --git a/src/test/hostnic-test.cfg b/src/test/hostnic-test.cfg
 new file mode 100644
 index 0000000..131a96c
