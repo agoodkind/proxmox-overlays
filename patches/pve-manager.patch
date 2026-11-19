@@ -3762,10 +3762,10 @@ index efcb250d..9f409cf4 100644
  all: pvecfg.pm $(SUBDIRS)
 diff --git a/PVE/SRIOV.pm b/PVE/SRIOV.pm
 new file mode 100644
-index 00000000..6bd64253
+index 00000000..ba1bed40
 --- /dev/null
 +++ b/PVE/SRIOV.pm
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,558 @@
 +package PVE::SRIOV;
 +
 +use strict;
@@ -3923,6 +3923,21 @@ index 00000000..6bd64253
 +    return $class->lock_config($id, sub { with_guest_locks($guests, $ids, $operation) });
 +}
 +
++sub open_container_netns {
++    my ($pid) = @_;
++    my $path = "/proc/$pid/ns/net";
++    open(my $namespace, '<', $path) or die "Cannot open the network namespace at $path: $!\n";
++    my ($device, $inode) = stat($namespace) or die "Cannot stat the network namespace at $path: $!\n";
++    my ($host_device, $host_inode) = stat('/proc/self/ns/net') or die "Cannot stat the host network namespace: $!\n";
++    return undef if $device == $host_device && $inode == $host_inode;
++    return $namespace;
++}
++
++sub enter_netns {
++    my ($namespace) = @_;
++    return ('/usr/bin/nsenter', '--net=/proc/' . $$ . '/fd/' . fileno($namespace), '--');
++}
++
 +sub inspect_guest {
 +    my ($id, $guest, $by_pci, $by_link, $owners, $netns, $reservations) = @_;
 +    my $type = $guest->{type};
@@ -3974,10 +3989,12 @@ index 00000000..6bd64253
 +        $owners->{$address} = "in use by container $id" if defined($address);
 +    }
 +
-+    return if !grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
 +    return if !$running;
-+    my $pid = PVE::LXC::find_lxc_pid($id);
-+    my @ns = ('/usr/bin/nsenter', '--target', $pid, '--net', '--');
++    my %missing = map { $_->{pci} => $_ }
++        grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
++    return if !%missing;
++    my $namespace = open_container_netns(PVE::LXC::find_lxc_pid($id)) // return;
++    my @ns = enter_netns($namespace);
 +    my $links = decode_json(output([@ns, '/sbin/ip', '-j', '-d', 'link', 'show']));
 +    for my $link (@$links) {
 +        next if grep { $_ eq 'LOOPBACK' } $link->{flags}->@*;
@@ -3988,9 +4005,9 @@ index 00000000..6bd64253
 +            my $info = output([@ns, '/sbin/ethtool', '-i', $name]);
 +            ($bus) = $info =~ /^bus-info:\s*($pci_pattern)$/m;
 +        }
-+        next if !defined($bus) || !exists($by_pci->{$bus});
-+        $by_pci->{$bus}->{ifname} = $name;
-+        $netns->{$bus} = $pid;
++        next if !defined($bus) || !exists($missing{$bus});
++        $missing{$bus}->{ifname} = $name;
++        $netns->{$bus} = $namespace;
 +        $owners->{$bus} = "in use by container $id";
 +    }
 +}
@@ -4105,8 +4122,8 @@ index 00000000..6bd64253
 +sub permanent_mac {
 +    my ($current, $netns) = @_;
 +    my $name = $current->{ifname} // die "PCI device $current->{pci} does not expose a network interface.\n";
-+    my $pid = $netns->{$current->{pci}};
-+    my @prefix = defined($pid) ? ('/usr/bin/nsenter', '--target', $pid, '--net', '--') : ();
++    my $namespace = $netns->{$current->{pci}};
++    my @prefix = defined($namespace) ? enter_netns($namespace) : ();
 +    my $output = output([@prefix, '/sbin/ethtool', '-P', $name]);
 +    my ($mac) = $output =~ /^Permanent address:\s*([[:xdigit:]]{2}(?::[[:xdigit:]]{2}){5})$/m;
 +    die "Interface $name on $current->{pci} did not report its permanent MAC: $output" if !defined($mac);
@@ -9686,10 +9703,10 @@ index 2dfd20a4..de723d70 100644
  
 diff --git a/test/SRIOV_hardware_test.pl b/test/SRIOV_hardware_test.pl
 new file mode 100644
-index 00000000..b6639a91
+index 00000000..9866ab1e
 --- /dev/null
 +++ b/test/SRIOV_hardware_test.pl
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,214 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -9702,7 +9719,7 @@ index 00000000..b6639a91
 +use PVE::File;
 +use PVE::Tools qw(run_command);
 +
-+my $mode = shift // die "Specify unused, attached, or mapped.\n";
++my $mode = shift // die "Specify unused, attached, mapped, or mixed.\n";
 +my $port = shift // die "Specify the dedicated physical interface.\n";
 +my $path = shift // die "Specify the JSON declaration file.\n";
 +my $desired = decode_json(PVE::File::file_get_contents($path));
@@ -9877,8 +9894,70 @@ index 00000000..b6639a91
 +    request('PUT', $desired);
 +    die $error if $error;
 +    is_deeply(request('GET'), $before, 'The spare VF returns to its original configuration');
++} elsif ($mode eq 'mixed') {
++    my ($host_index, $moved_index, $shared_id, $private_id, $guest_name) = @ARGV;
++    die "Specify the host VF index, moved VF index, shared-namespace CT ID, private-namespace CT ID, and guest interface.\n"
++        if !defined($guest_name) || grep { !defined($_) || $_ !~ /\A\d+\z/ } ($host_index, $moved_index, $shared_id, $private_id);
++    die "Use distinct VF indices and a lower CT ID for the shared namespace.\n"
++        if $host_index == $moved_index || $shared_id >= $private_id;
++    my $pf = PVE::SRIOV::pf_device($port);
++    my @host_names = PVE::SRIOV::entries("$pf/virtfn$host_index/net");
++    die "The host VF must expose exactly one network interface.\n" if @host_names != 1;
++    my $shared_pid = PVE::LXC::find_lxc_pid($shared_id);
++    my $private_pid = PVE::LXC::find_lxc_pid($private_id);
++    my $net_id = sub { readlink("/proc/$_[0]/ns/net") // die "Cannot inspect the namespace of $_[0]: $!\n" };
++    my $host_ns = $net_id->('self');
++    die "The first CT must share the host network namespace.\n" if $net_id->($shared_pid) ne $host_ns;
++    die "The second CT must use its own network namespace.\n" if $net_id->($private_pid) eq $host_ns;
++    my $info = PVE::SRIOV::output(['/usr/bin/nsenter', '--target', $private_pid, '--net', '--',
++        '/sbin/ethtool', '-i', PVE::SRIOV::port_name($guest_name)]);
++    my $pci = $before->{vfs}->[$moved_index]->{pci};
++    die "The specified container interface must use the moved VF.\n" if !defined($pci) || $info !~ /^bus-info:\s*\Q$pci\E$/m;
++    is($before->{vfs}->[$host_index]->{ifname}, $host_names[0], 'GET reports the host-visible VF name');
++    is($json->encode($before->{vfs}->[$host_index]->{in_container}), 'false', 'GET excludes the shared namespace');
++    is($before->{vfs}->[$moved_index]->{ifname}, $guest_name, 'GET reports the moved VF name');
++    is($json->encode($before->{vfs}->[$moved_index]->{in_container}), 'true', 'GET identifies the VF in the private namespace');
 +} else {
-+    die "Specify unused, attached, or mapped.\n";
++    die "Specify unused, attached, mapped, or mixed.\n";
++}
++done_testing();
+diff --git a/test/SRIOV_namespace_test.pl b/test/SRIOV_namespace_test.pl
+new file mode 100644
+index 00000000..786541cd
+--- /dev/null
++++ b/test/SRIOV_namespace_test.pl
+@@ -0,0 +1,33 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use IPC::Open2;
++use Test::More;
++use PVE::SRIOV;
++
++$ENV{PATH} = '/usr/sbin:/usr/bin:/sbin:/bin';
++for my $shared (1, 0) {
++    my @command = $shared ? ('/bin/cat') : ('/usr/bin/unshare', '--net', '--', '/bin/cat');
++    my $pid = open2(my $output, my $input, @command);
++    print {$input} "ready\n";
++    my $ready = <$output>;
++    die "The network namespace test process did not start.\n" if !defined($ready);
++    my $identity = readlink("/proc/$pid/ns/net") // die "Cannot read the test namespace for PID $pid: $!\n";
++    my $namespace = PVE::SRIOV::open_container_netns($pid);
++    close($input);
++    waitpid($pid, 0);
++    die "The network namespace test process exited with status $?.\n" if $?;
++    if ($shared) {
++        ok(!defined($namespace), 'The scanner skips a second process sharing the host network namespace');
++    } else {
++        ok(defined($namespace), 'The scanner opens a separate Linux network namespace');
++        my $actual = PVE::SRIOV::output([PVE::SRIOV::enter_netns($namespace), '/usr/bin/readlink', '/proc/self/ns/net']);
++        chomp $actual;
++        is($actual, $identity, 'nsenter uses the verified namespace even after the original process exits');
++    }
++    eval { PVE::SRIOV::open_container_netns($pid) };
++    like("$@", qr{Cannot open the network namespace at \Q/proc/$pid/ns/net\E:}, 'An unavailable namespace reports its path');
 +}
 +done_testing();
 diff --git a/test/SRIOV_reservation_test.pl b/test/SRIOV_reservation_test.pl
