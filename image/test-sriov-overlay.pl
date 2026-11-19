@@ -18,6 +18,7 @@ my @paths = qw(
     etc/systemd/system/pve-ha-lrm.service.d/50-pve-overlay-sriov.conf
     usr/share/pve-overlay/sriov-restore
     etc/perl/PVE/SRIOV.pm
+    etc/perl/PVE/SRIOVLock.pm
     etc/perl/PVE/API2/SRIOV.pm
 );
 ok(-f "$root/$_", "Installer wrote $_") for @paths;

@@ -378,7 +378,14 @@ sub require_sriov_restore {
     my $lockdir = "$host_root/run/lock";
     make_path($lockdir) if !-d $lockdir;
     open(my $lock, '>>', "$lockdir/pve-overlay-sriov.lock") or die "Cannot open the SR-IOV lock: $!\n";
-    flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n";
+    {
+        local $SIG{ALRM} = sub { die "Timed out waiting for the SR-IOV configuration lock.\n" };
+        alarm(60);
+        my $ok = eval { flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n"; 1 };
+        my $error = $@;
+        alarm(0);
+        die $error if !$ok;
+    }
     my $dir = "$host_root/etc/pve-overlay/sriov";
     return $lock if !-d $dir;
     opendir(my $handle, $dir) or die "Cannot inspect $dir: $!\n";
@@ -408,6 +415,7 @@ sub remove_copies {
         $removed_count += remove_installed_path($path, $paths->{$path}, $apparmor_enabled);
     }
     unlink(state_path()) if -e state_path();
+    undef $sriov_lock;
     reload_systemd() if $removed_count && grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
     return $removed_count;
 }

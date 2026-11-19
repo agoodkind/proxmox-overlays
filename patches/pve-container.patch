@@ -888,10 +888,10 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index dee073d..186e2a8 100644
+index dee073d..be8e961 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -694,6 +694,66 @@ sub make_apparmor_config {
+@@ -694,6 +694,73 @@ sub make_apparmor_config {
      return $raw;
  }
  
@@ -940,6 +940,13 @@ index dee073d..186e2a8 100644
 +    return $raw;
 +}
 +
++sub lock_hostnics_for_start {
++    my ($conf) = @_;
++    return undef if !grep { /\Ahostnic\d+\z/ } keys %$conf;
++    require PVE::SRIOVLock;
++    return PVE::SRIOVLock::lock_attachment();
++}
++
 +sub check_hostnic_links {
 +    my ($conf, $net_dir) = @_;
 +
@@ -958,7 +965,7 @@ index dee073d..186e2a8 100644
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -755,6 +815,8 @@ sub update_lxc_config {
+@@ -755,6 +822,8 @@ sub update_lxc_config {
          $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
      }
  
@@ -967,7 +974,7 @@ index dee073d..186e2a8 100644
      if ($unprivileged && !$features->{force_rw_sys}) {
          # unpriv. CT default to sys:rw, but that doesn't always plays well with
          # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
-@@ -891,6 +953,8 @@ sub update_lxc_config {
+@@ -891,6 +960,8 @@ sub update_lxc_config {
          }
      }
  
@@ -976,7 +983,7 @@ index dee073d..186e2a8 100644
      if (my $env = $conf->{env}) {
          for my $variable (split(/\0+/, $env)) {
              $raw .= "lxc.environment.runtime = $variable\n";
-@@ -1675,11 +1739,75 @@ sub delete_read_restricted_options {
+@@ -1675,11 +1746,75 @@ sub delete_read_restricted_options {
      return $conf;
  }
  
@@ -1053,7 +1060,7 @@ index dee073d..186e2a8 100644
  
      my $check = sub {
          my ($opt, $delete) = @_;
-@@ -1696,6 +1824,8 @@ sub check_ct_modify_config_perm {
+@@ -1696,6 +1831,8 @@ sub check_ct_modify_config_perm {
                  my $sid = $1;
                  $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
              } else {
@@ -1062,7 +1069,7 @@ index dee073d..186e2a8 100644
                  PVE::Storage::check_volume_access(
                      $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                  );
-@@ -1711,51 +1841,68 @@ sub check_ct_modify_config_perm {
+@@ -1711,51 +1848,68 @@ sub check_ct_modify_config_perm {
          } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
          } elsif ($opt eq 'features') {
@@ -1172,7 +1179,7 @@ index dee073d..186e2a8 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2438,6 +2585,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2438,6 +2592,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1345,15 +1352,53 @@ index dee073d..186e2a8 100644
  sub mountpoint_hotplug : prototype($$$$$) {
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
-@@ -3156,6 +3469,8 @@ sub vm_start {
+@@ -3156,6 +3476,9 @@ sub vm_start {
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
++    my $attachment_lock = lock_hostnics_for_start($conf);
 +    check_hostnic_links($conf, '/sys/class/net');
 +
      update_lxc_config($vmid, $conf);
  
      eval {
+@@ -3191,7 +3514,13 @@ sub vm_start {
+     eval {
+         run_command($cmd);
+ 
+-        monitor_start($monitor_socket, $vmid) if defined($monitor_socket);
++        if ($attachment_lock) {
++            # liblxc moves physical interfaces into the namespace before publishing RUNNING.
++            run_command(['/usr/bin/lxc-wait', '-n', $vmid, '-s', 'RUNNING', '-t', '60']);
++            find_lxc_pid($vmid);
++        } elsif (defined($monitor_socket)) {
++            monitor_start($monitor_socket, $vmid);
++        }
+ 
+         # if debug is requested, print the log it also when the start succeeded
+         print_ct_stderr_log($vmid) if $is_debug;
+@@ -3200,8 +3529,21 @@ sub vm_start {
+     print_ct_warn_log($vmid); # always print warn log, if any
+     if ($err) {
+         unlink $skiplock_flag_fn;
++        if ($attachment_lock) {
++            eval {
++                my $unit = "$base_unit\@$vmid.service";
++                run_command(['systemctl', 'stop', $unit]);
++                my $state;
++                run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
++                    outfunc => sub { $state = shift });
++                die "Container unit $unit did not stop.\n"
++                    if !defined($state) || $state !~ /\A(?:inactive|failed)\z/ || check_running($vmid);
++            };
++            die "$err\nCould not finish stopping container $vmid: $@" if $@;
++        }
+         die $err;
+     }
++    undef $attachment_lock;
+     PVE::GuestHelpers::exec_hookscript($conf, $vmid, 'post-start');
+ 
+     my @managed_dhcpv4_interfaces = ();
 diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
 index 3eb1905..47835c7 100644
 --- a/src/PVE/LXC/Config.pm

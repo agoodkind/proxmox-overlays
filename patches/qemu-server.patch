@@ -732,7 +732,7 @@ index c348af75..14c3063a 100644
  .PHONY: install
  install:
 diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
-index f199371d..00edea8c 100644
+index f199371d..0f8e35e5 100644
 --- a/src/PVE/QemuServer.pm
 +++ b/src/PVE/QemuServer.pm
 @@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
@@ -760,11 +760,77 @@ index f199371d..00edea8c 100644
      # add usb controllers
      my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
      push @$devices, @usbcontrollers if @usbcontrollers;
+@@ -5617,6 +5628,15 @@ sub vm_start_nolock {
+     my $vollist = get_current_vm_volumes($storecfg, $conf);
+     push $vollist->@*, $statefile if $statefile_is_a_volume;
+ 
++    my $attachment_lock = PVE::QemuServer::PCI::lock_hostpci_for_start($conf);
++    my $teardown_attachment = sub {
++        if (PVE::QemuServer::Helpers::vm_running_locally($vmid)) {
++            _do_vm_stop($storecfg, $vmid, 1, 1, 10, 0, 1);
++            die "VM $vmid still has a running QEMU process.\n"
++                if PVE::QemuServer::Helpers::vm_running_locally($vmid);
++        }
++        cleanup_pci_devices($vmid, $conf);
++    };
+     my ($cmd, $spice_port, $start_timeout);
+     my $pci_reserve_list = [];
+     eval {
+@@ -5821,19 +5841,36 @@ sub vm_start_nolock {
+     }
+ 
+     if (my $err = $@) {
+-        # deactivate volumes if start fails
++        if ($attachment_lock) {
++            eval { $teardown_attachment->() };
++            die "start failed: $err\nPCI device teardown failed: $@" if $@;
++        }
+         eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
+         warn $@ if $@;
+-        eval { cleanup_pci_devices($vmid, $conf) };
+-        warn $@ if $@;
++        if (!$attachment_lock) {
++            eval { cleanup_pci_devices($vmid, $conf) };
++            warn $@ if $@;
++        }
+ 
+         die "start failed: $err";
+     }
+ 
+     # re-reserve all PCI IDs now that we can know the actual VM PID
+     my $pid = PVE::QemuServer::Helpers::vm_running_locally($vmid);
+-    eval { PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid) };
+-    warn $@ if $@;
++    eval {
++        die "Cannot find the running PID for VM $vmid.\n" if @$pci_reserve_list && !$pid;
++        PVE::QemuServer::PCI::reserve_pci_usage($pci_reserve_list, $vmid, undef, $pid);
++    };
++    if (my $error = $@) {
++        if ($attachment_lock) {
++            eval { $teardown_attachment->() };
++            my $teardown = $@;
++            die "Could not register the PCI devices for VM $vmid: $error"
++                . ($teardown ? "PCI reservations remain protected after teardown failed: $teardown" : '');
++        }
++        warn $error;
++    }
++    undef $attachment_lock;
+ 
+     my $qemu_pkg_string = PVE::QemuServer::QMPHelpers::get_qemu_package_string($vmid);
+     syslog("info", "VM $vmid started with PID $pid using $qemu_pkg_string.");
 diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
-index d7dc6121..084ac259 100644
+index d7dc6121..c8aa3aea 100644
 --- a/src/PVE/QemuServer/PCI.pm
 +++ b/src/PVE/QemuServer/PCI.pm
-@@ -220,6 +220,7 @@ sub get_pci_addr_map {
+@@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
+ use warnings;
+ use strict;
+ 
++use Errno qw(ENOENT);
+ use IO::File;
+ 
+ use PVE::JSONSchema;
+@@ -220,6 +221,7 @@ sub get_pci_addr_map {
          'pci.4' => { bus => 1, addr => 28 },
          'rng0' => { bus => 1, addr => 29 },
          'pci.2-igd' => { bus => 1, addr => 30 }, # replaces pci.2 in case a legacy IGD device is passed through
@@ -772,6 +838,54 @@ index d7dc6121..084ac259 100644
          'virtio6' => { bus => 2, addr => 1 },
          'virtio7' => { bus => 2, addr => 2 },
          'virtio8' => { bus => 2, addr => 3 },
+@@ -412,6 +414,13 @@ my sub print_pcie_root_port {
+     return $res;
+ }
+ 
++sub lock_hostpci_for_start {
++    my ($conf) = @_;
++    return undef if !grep { /\Ahostpci\d+\z/ } keys %$conf;
++    require PVE::SRIOVLock;
++    return PVE::SRIOVLock::lock_attachment();
++}
++
+ # returns the parsed pci config but parses the 'host' part into
+ # a list if lists into the 'id' property like this:
+ #
+@@ -747,6 +756,7 @@ my $PCIID_RESERVATION_LOCK = "${PCIID_RESERVATION_FILE}.lock";
+ # for successfully started VM processes, or a expiration time for the initial time window between
+ # reservation and actual VM process start-up.
+ my $parse_pci_reservation_unlocked = sub {
++    my ($strict) = @_;
+     my $pci_ids = {};
+     if (my $fh = IO::File->new($PCIID_RESERVATION_FILE, "r")) {
+         while (my $line = <$fh>) {
+@@ -755,8 +765,12 @@ my $parse_pci_reservation_unlocked = sub {
+                     vmid => $2,
+                     "$3" => $4,
+                 };
++            } elsif ($strict) {
++                die "Invalid PCI reservation in $PCIID_RESERVATION_FILE.\n";
+             }
+         }
++    } elsif ($strict && $! != ENOENT) {
++        die "Cannot read $PCIID_RESERVATION_FILE: $!\n";
+     }
+     return $pci_ids;
+ };
+@@ -797,6 +811,12 @@ sub remove_pci_reservation {
+     die $@ if $@;
+ }
+ 
++# The reservation exists during startup before QEMU publishes its PID.
++sub get_reservation_owners {
++    my $reservations = $parse_pci_reservation_unlocked->(1);
++    return { map { $_ => $reservations->{$_}->{vmid} } keys %$reservations };
++}
++
+ # return all currently reserved ids from the given vmid
+ sub get_reservations {
+     my ($vmid) = @_;
 diff --git a/src/test/GuestTestRequest.pm b/src/test/GuestTestRequest.pm
 new file mode 100644
 index 00000000..56f56260
