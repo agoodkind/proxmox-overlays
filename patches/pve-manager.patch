@@ -1227,10 +1227,10 @@ index df0b2c2d..c37f3c63 100644
              { name => 'stopall' },
 diff --git a/PVE/API2/SRIOV.pm b/PVE/API2/SRIOV.pm
 new file mode 100644
-index 00000000..3eb92a7a
+index 00000000..eaf9acfa
 --- /dev/null
 +++ b/PVE/API2/SRIOV.pm
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,96 @@
 +package PVE::API2::SRIOV;
 +
 +use strict;
@@ -1262,6 +1262,10 @@ index 00000000..3eb92a7a
 +                    pci => { type => 'string', description => 'PCI domain, bus, slot, and function.' },
 +                    driver => { type => 'string', optional => 1, description => 'Bound PCI driver.' },
 +                    ifname => { type => 'string', optional => 1, description => 'Current Linux interface name in the host or container.' },
++                    in_container => {
++                        type => 'boolean',
++                        description => 'True when Proxmox finds this PCI function in a running container network namespace.',
++                    },
 +                },
 +            },
 +        },
@@ -3758,10 +3762,10 @@ index efcb250d..9f409cf4 100644
  all: pvecfg.pm $(SUBDIRS)
 diff --git a/PVE/SRIOV.pm b/PVE/SRIOV.pm
 new file mode 100644
-index 00000000..b4327b5f
+index 00000000..6bd64253
 --- /dev/null
 +++ b/PVE/SRIOV.pm
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,541 @@
 +package PVE::SRIOV;
 +
 +use strict;
@@ -4038,6 +4042,7 @@ index 00000000..b4327b5f
 +        inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns, $reservations);
 +    }
 +    for my $pci (keys %by_pci) {
++        $by_pci{$pci}->{in_container} = exists($netns{$pci}) ? JSON::true : JSON::false;
 +        $owners{$pci} = "in use by VM $reservations->{$pci}" if defined($reservations->{$pci});
 +    }
 +    return ($state, \%owners, \%netns);
@@ -9681,10 +9686,10 @@ index 2dfd20a4..de723d70 100644
  
 diff --git a/test/SRIOV_hardware_test.pl b/test/SRIOV_hardware_test.pl
 new file mode 100644
-index 00000000..0b49d6c3
+index 00000000..b6639a91
 --- /dev/null
 +++ b/test/SRIOV_hardware_test.pl
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,191 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -9701,7 +9706,7 @@ index 00000000..0b49d6c3
 +my $port = shift // die "Specify the dedicated physical interface.\n";
 +my $path = shift // die "Specify the JSON declaration file.\n";
 +my $desired = decode_json(PVE::File::file_get_contents($path));
-+my $json = JSON->new->canonical;
++my $json = JSON->new->canonical->allow_nonref;
 +my $node = PVE::INotify::nodename();
 +
 +sub request {
@@ -9747,6 +9752,9 @@ index 00000000..0b49d6c3
 +    my $after = request('PUT', $desired);
 +    is_deeply(request('GET'), $after, 'GET reads the enabled VFs and the saved declaration');
 +    check_declared_vfs($after);
++    for my $vf ($after->{vfs}->@*) {
++        is($json->encode($vf->{in_container}), 'false', "VF $vf->{index} reports false on the guest-free node");
++    }
 +    is_deeply(request('PUT', $desired), $after, 'Repeated PUT preserves runtime and desired state');
 +    my $pci = $after->{vfs}->[$desired->{vfs}->[0]->{index}]->{pci};
 +    PVE::QemuServer::PCI::reserve_pci_usage($pci, $reserve_id, 30);
@@ -9788,6 +9796,9 @@ index 00000000..0b49d6c3
 +    if ($vf->{driver} ne 'vfio-pci') {
 +        die "Specify the interface name in the running container.\n" if !defined($guest_name);
 +        is($before->{vfs}->[$index]->{ifname}, $guest_name, 'GET locates the moved VF in the container');
++        is($json->encode($before->{vfs}->[$index]->{in_container}), 'true', 'GET reports a VF in the container namespace');
++    } else {
++        is($json->encode($before->{vfs}->[$index]->{in_container}), 'false', 'GET reports false for a VM passthrough VF');
 +    }
 +    is_deeply(request('PUT', $desired), $before, 'A running guest permits an identical PUT');
 +    my $class = $vf->{driver} eq 'vfio-pci' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';
@@ -10029,10 +10040,10 @@ index 00000000..9d75a339
 +done_testing();
 diff --git a/test/SRIOV_test.pl b/test/SRIOV_test.pl
 new file mode 100644
-index 00000000..e487f47b
+index 00000000..eea80f2a
 --- /dev/null
 +++ b/test/SRIOV_test.pl
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,91 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -10052,6 +10063,13 @@ index 00000000..e487f47b
 +    return $handler->handle($info, $param, 1);
 +}
 +
++for my $method (qw(GET PUT)) {
++    my (undef, $info) = PVE::API2::SRIOV->find_handler($method, 'lo', { node => 'localhost' });
++    my $field = $info->{returns}->{properties}->{vfs}->{items}->{properties}->{in_container};
++    is($field->{type}, 'boolean', "$method exposes a Boolean container location for each runtime VF");
++    ok(!$field->{optional}, "$method requires the container location in the response");
++}
++
 +for my $method (qw(GET PUT DELETE)) {
 +    my $body = $method eq 'PUT' ? { numvfs => 1, vfs => [] } : {};
 +    eval { request($method, 'lo', $body) };
@@ -10066,6 +10084,10 @@ index 00000000..e487f47b
 +like("$@", qr/mac/, 'PUT rejects an invalid VF MAC address');
 +eval { request('PUT', 'lo', { numvfs => 1, vfs => [{ index => 0, mac => '02:00:00:00:00:01', driver => 'iavf', vmid => 100 }] }) };
 +like("$@", qr/vmid/, 'PUT rejects a guest attachment field');
++eval { request('PUT', 'lo', {
++    numvfs => 1, vfs => [{ index => 0, mac => '02:00:00:00:00:01', driver => 'iavf', in_container => 1 }],
++}) };
++like("$@", qr/in_container/, 'PUT rejects the computed container location in a declaration');
 +for my $case (
 +    ['QEMU', \&PVE::QemuServer::PCI::lock_hostpci_for_start, { hostpci0 => 'mapping=test-vf' }],
 +    ['LXC', \&PVE::LXC::lock_hostnics_for_start, { hostnic0 => 'link=test-vf' }],
