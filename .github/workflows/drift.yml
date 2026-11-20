@@ -77,7 +77,7 @@ jobs:
       - name: Check out pve-manager source at the upstream base commit
         uses: actions/checkout@v4
         with:
-          repository: agoodkind/pve-manager
+          repository: proxmox/pve-manager
           ref: ${{ env.PVE_MANAGER_BASE }}
           path: pve-manager
       - name: Apply pve-manager patches
