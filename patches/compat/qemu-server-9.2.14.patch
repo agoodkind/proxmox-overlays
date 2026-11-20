@@ -824,7 +824,7 @@ index f199371d..b4e37a9e 100644
      my $qemu_pkg_string = PVE::QemuServer::QMPHelpers::get_qemu_package_string($vmid);
      syslog("info", "VM $vmid started with PID $pid using $qemu_pkg_string.");
 diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
-index d7dc6121..ab936af8 100644
+index d7dc6121..dff34d0f 100644
 --- a/src/PVE/QemuServer/PCI.pm
 +++ b/src/PVE/QemuServer/PCI.pm
 @@ -3,6 +3,7 @@ package PVE::QemuServer::PCI;
@@ -903,7 +903,7 @@ index d7dc6121..ab936af8 100644
  # return all currently reserved ids from the given vmid
  sub get_reservations {
      my ($vmid) = @_;
-@@ -828,22 +860,13 @@ sub reserve_pci_usage {
+@@ -828,22 +860,14 @@ sub reserve_pci_usage {
              for my $id ($requested_ids->@*) {
                  my $reservation = $reservation_list->{$id};
                  if ($reservation && $reservation->{vmid} != $vmid) {
@@ -923,7 +923,8 @@ index d7dc6121..ab936af8 100644
 -                            warn "leftover PCI reservation found for $id, lets take it...\n";
 -                        }
 +                    if ($reservation_is_active->($reservation, $ctime)) {
-+                        die "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
++                        die
++                            "PCI device '$id' is currently reserved for use by VMID '$reservation->{vmid}'\n"
 +                            if defined($reservation->{time});
 +                        die "PCI device '$id' already in use by VMID '$reservation->{vmid}'\n";
                      }
@@ -932,7 +933,7 @@ index d7dc6121..ab936af8 100644
                  } elsif ($reservation) {
                      # already reserved by the same vmid
                      if (my $reserved_time = $reservation->{time}) {
-@@ -852,19 +875,11 @@ sub reserve_pci_usage {
+@@ -852,19 +876,12 @@ sub reserve_pci_usage {
                              my $old_timeout = $reservation->{time} - 5 - $ctime;
                              $timeout = $old_timeout if $old_timeout > $timeout;
                          }
@@ -950,7 +951,8 @@ index d7dc6121..ab936af8 100644
 -                            }
 -                        }
 +                    } elsif ($reservation_is_active->($reservation, $ctime)) {
-+                        die "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n"
++                        die
++                            "PCI device '$id' already in use by running VMID '$reservation->{vmid}'\n"
 +                            if defined($pid);
 +                        # qm showcmd can request a timed reservation for a running VM.
 +                        return if defined($timeout);

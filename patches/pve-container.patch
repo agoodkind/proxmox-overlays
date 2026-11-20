@@ -887,7 +887,7 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index e403bbd..1389285 100644
+index e403bbd..678674e 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -670,6 +670,73 @@ sub make_apparmor_config {
@@ -1410,7 +1410,7 @@ index e403bbd..1389285 100644
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3201,8 +3529,21 @@ sub vm_start {
+@@ -3201,8 +3529,25 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
@@ -1419,10 +1419,14 @@ index e403bbd..1389285 100644
 +                my $unit = "$base_unit\@$vmid.service";
 +                run_command(['systemctl', 'stop', $unit]);
 +                my $state;
-+                run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
-+                    outfunc => sub { $state = shift });
++                run_command(
++                    ['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
++                    outfunc => sub { $state = shift },
++                );
 +                die "Container unit $unit did not stop.\n"
-+                    if !defined($state) || $state !~ /\A(?:inactive|failed)\z/ || check_running($vmid);
++                    if !defined($state)
++                    || $state !~ /\A(?:inactive|failed)\z/
++                    || check_running($vmid);
 +            };
 +            die "$err\nCould not finish stopping container $vmid: $@" if $@;
 +        }
@@ -2204,10 +2208,10 @@ index 0000000..ff63547
 +exec "$@"
 diff --git a/src/test/hostnic-monitor-storage-test.pl b/src/test/hostnic-monitor-storage-test.pl
 new file mode 100644
-index 0000000..4d9c824
+index 0000000..73ad473
 --- /dev/null
 +++ b/src/test/hostnic-monitor-storage-test.pl
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,54 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -2225,39 +2229,49 @@ index 0000000..4d9c824
 +die "Specify a numeric VMID.\n" if $vmid !~ /\A\d+\z/;
 +die "The LXC monitor is running.\n" if eval { PVE::LXC::Monitor::get_monitor_socket() };
 +
-+PVE::LXC::Config->lock_config($vmid, sub {
-+    my $conf = PVE::LXC::Config->load_config($vmid);
-+    die "The test container is running.\n" if PVE::LXC::check_running($vmid);
-+    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
-+    die "The test requires a hostnic device.\n" if !keys %$hostnics;
-+    my $mount = PVE::LXC::Config->parse_volume('rootfs', $conf->{rootfs});
-+    my $volume = $mount->{volume};
-+    my ($storeid) = PVE::Storage::parse_volume_id($volume);
-+    my $storecfg = PVE::Storage::config();
-+    my $storage = PVE::Storage::storage_config($storecfg, $storeid);
-+    die "The test requires an existing directory storage.\n"
-+        if $storage->{type} ne 'dir' || !-d $storage->{path};
-+    die "The test rootfs file must be missing.\n" if -e PVE::Storage::path($storecfg, $volume);
-+    die "The skiplock flag already exists.\n" if -e "/run/lxc/skiplock-$vmid";
++PVE::LXC::Config->lock_config(
++    $vmid,
++    sub {
++        my $conf = PVE::LXC::Config->load_config($vmid);
++        die "The test container is running.\n" if PVE::LXC::check_running($vmid);
++        my $hostnics = PVE::LXC::Config->get_hostnics($conf);
++        die "The test requires a hostnic device.\n" if !keys %$hostnics;
++        my $mount = PVE::LXC::Config->parse_volume('rootfs', $conf->{rootfs});
++        my $volume = $mount->{volume};
++        my ($storeid) = PVE::Storage::parse_volume_id($volume);
++        my $storecfg = PVE::Storage::config();
++        my $storage = PVE::Storage::storage_config($storecfg, $storeid);
++        die "The test requires an existing directory storage.\n"
++            if $storage->{type} ne 'dir' || !-d $storage->{path};
++        die "The test rootfs file must be missing.\n"
++            if -e PVE::Storage::path($storecfg, $volume);
++        die "The skiplock flag already exists.\n" if -e "/run/lxc/skiplock-$vmid";
 +
-+    my %ordinary = %$conf;
-+    delete @ordinary{keys %$hostnics};
-+    eval { PVE::LXC::vm_start($vmid, \%ordinary) };
-+    like($@, qr/volume '\Q$volume\E' does not exist/,
-+        'Without hostnic, startup continues to the real storage activation error');
++        my %ordinary = %$conf;
++        delete @ordinary{ keys %$hostnics };
++        eval { PVE::LXC::vm_start($vmid, \%ordinary) };
++        like(
++            $@,
++            qr/volume '\Q$volume\E' does not exist/,
++            'Without hostnic, startup continues to the real storage activation error',
++        );
 +
-+    eval { PVE::LXC::vm_start($vmid, $conf, 1) };
-+    like($@, qr/Cannot monitor startup for container $vmid: failed to connect/,
-+        'With hostnic, startup rejects the missing monitor before storage activation');
-+    ok(!-e "/run/lxc/skiplock-$vmid", 'The rejected start does not leave a skiplock flag');
-+});
++        eval { PVE::LXC::vm_start($vmid, $conf, 1) };
++        like(
++            $@,
++            qr/Cannot monitor startup for container $vmid: failed to connect/,
++            'With hostnic, startup rejects the missing monitor before storage activation',
++        );
++        ok(!-e "/run/lxc/skiplock-$vmid", 'The rejected start does not leave a skiplock flag');
++    },
++);
 +done_testing();
 diff --git a/src/test/hostnic-slow-start-test.pl b/src/test/hostnic-slow-start-test.pl
 new file mode 100644
-index 0000000..68a472e
+index 0000000..c196d8d
 --- /dev/null
 +++ b/src/test/hostnic-slow-start-test.pl
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,105 @@
 +#!/usr/bin/perl
 +
 +use strict;
@@ -2288,14 +2302,18 @@ index 0000000..68a472e
 +my $monitor = PVE::LXC::Monitor::get_monitor_socket();
 +pipe(my $reader, my $writer) or die "Cannot create the startup result pipe: $!\n";
 +my $child = fork() // die "Cannot start the test worker: $!\n";
++
 +if (!$child) {
 +    close($reader);
 +    close($monitor);
 +    eval {
-+        PVE::LXC::Config->lock_config($vmid, sub {
-+            my $conf = PVE::LXC::Config->load_config($vmid);
-+            PVE::LXC::vm_start($vmid, $conf, undef, 0);
-+        });
++        PVE::LXC::Config->lock_config(
++            $vmid,
++            sub {
++                my $conf = PVE::LXC::Config->load_config($vmid);
++                PVE::LXC::vm_start($vmid, $conf, undef, 0);
++            },
++        );
 +    };
 +    my $err = $@;
 +    print {$writer} $err;
@@ -2305,14 +2323,19 @@ index 0000000..68a472e
 +close($writer);
 +
 +eval {
-+    PVE::Tools::run_with_timeout(30, sub {
-+        while (1) {
-+            my ($type, $name, $state) = PVE::LXC::Monitor::read_lxc_message($monitor);
-+            die "The LXC monitor closed before STARTING.\n" if !defined($type);
-+            last if $type eq 'STATE' && $name eq "$vmid"
-+                && $state == PVE::LXC::Monitor::STATE_STARTING;
-+        }
-+    });
++    PVE::Tools::run_with_timeout(
++        30,
++        sub {
++            while (1) {
++                my ($type, $name, $state) = PVE::LXC::Monitor::read_lxc_message($monitor);
++                die "The LXC monitor closed before STARTING.\n" if !defined($type);
++                last
++                    if $type eq 'STATE'
++                    && $name eq "$vmid"
++                    && $state == PVE::LXC::Monitor::STATE_STARTING;
++            }
++        },
++    );
 +    sleep(63);
 +    open(my $lock, '>>', PVE::SRIOVLock::PATH) or die "Cannot open the attachment lock: $!\n";
 +    my $available = flock($lock, LOCK_EX | LOCK_NB);
@@ -2330,8 +2353,10 @@ index 0000000..68a472e
 +my $unit = "pve-container\@$vmid.service";
 +my $unit_state = sub {
 +    my $state;
-+    run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
-+        outfunc => sub { $state = shift });
++    run_command(
++        ['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
++        outfunc => sub { $state = shift },
++    );
 +    return $state;
 +};
 +if ($expected eq 'running') {
@@ -2339,7 +2364,11 @@ index 0000000..68a472e
 +    ok(eval { PVE::LXC::find_lxc_pid($vmid) }, 'The running container has an init PID');
 +} else {
 +    is($status, 256, 'The rejected startup fails');
-+    like($error, qr/startup for container '\Q$vmid\E' failed/, 'The monitor reports the terminal state');
++    like(
++        $error,
++        qr/startup for container '\Q$vmid\E' failed/,
++        'The monitor reports the terminal state',
++    );
 +    like($unit_state->(), qr/\A(?:failed|inactive)\z/, 'The systemd unit has stopped');
 +    ok(!PVE::LXC::check_running($vmid), 'Teardown finishes before vm_start returns');
 +}

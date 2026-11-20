@@ -73,7 +73,8 @@ sub write_file {
 sub host_file_dir_allows {
     my ($relative_path) = @_;
     return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
-    return $sriov_boot_files{$relative_path} || scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
+    return $sriov_boot_files{$relative_path}
+        || scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
 }
 
 # Patch files also include tests, which the installer does not install.
@@ -377,11 +378,13 @@ sub require_sriov_restore {
     return if !grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
     my $lockdir = "$host_root/run/lock";
     make_path($lockdir) if !-d $lockdir;
-    open(my $lock, '>>', "$lockdir/pve-overlay-sriov.lock") or die "Cannot open the SR-IOV lock: $!\n";
+    open(my $lock, '>>', "$lockdir/pve-overlay-sriov.lock")
+        or die "Cannot open the SR-IOV lock: $!\n";
     {
         local $SIG{ALRM} = sub { die "Timed out waiting for the SR-IOV configuration lock.\n" };
         alarm(60);
-        my $ok = eval { flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n"; 1 };
+        my $ok =
+            eval { flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n"; 1 };
         my $error = $@;
         alarm(0);
         die $error if !$ok;
@@ -391,13 +394,16 @@ sub require_sriov_restore {
     opendir(my $handle, $dir) or die "Cannot inspect $dir: $!\n";
     my @saved = sort grep { /\.json\z/ } readdir($handle);
     closedir($handle) or die "Cannot close $dir: $!\n";
-    die "pve-overlay: remove the saved SR-IOV declarations through the node API before removing boot restoration: @saved\n" if @saved;
+    die
+        "pve-overlay: remove the saved SR-IOV declarations through the node API before removing boot restoration: @saved\n"
+        if @saved;
     return $lock;
 }
 
 sub reload_systemd {
     return if !$system_mode;
-    system('systemctl', 'daemon-reload') == 0 or die "pve-overlay: systemctl daemon-reload failed\n";
+    system('systemctl', 'daemon-reload') == 0
+        or die "pve-overlay: systemctl daemon-reload failed\n";
 }
 
 # Delete all recorded and currently produced paths.
@@ -416,7 +422,8 @@ sub remove_copies {
     }
     unlink(state_path()) if -e state_path();
     undef $sriov_lock;
-    reload_systemd() if $removed_count && grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
+    reload_systemd()
+        if $removed_count && grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
     return $removed_count;
 }
 
@@ -466,7 +473,9 @@ sub command_apply {
     }
     write_state($produced);
     undef $sriov_lock;
-    reload_systemd() if grep { exists($produced->{"$host_root/$_"}) || exists($obsolete{"$host_root/$_"}) } keys %sriov_boot_files;
+    reload_systemd()
+        if grep { exists($produced->{"$host_root/$_"}) || exists($obsolete{"$host_root/$_"}) }
+        keys %sriov_boot_files;
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
