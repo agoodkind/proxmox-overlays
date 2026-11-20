@@ -71,11 +71,11 @@ The workflow installs the packages in a container image in GHCR and builds the i
 | Package | Version or package check | Patch |
 | --- | --- | --- |
 | pve-manager | 9.2.24 checks `Sys.Modify` at `/nodes/{node}` | [Compatibility certificate patch](patches/compat/pve-manager-acme-node.patch) |
-| pve-manager | 9.2.26 checks `Sys.Modify` at `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |
+| pve-manager | 9.2.26, 9.2.28, 9.2.31, and 9.2.33 check `Sys.Modify` at `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |
 | pve-container | 6.1.15 through 6.1.21 | [Compatibility container patch](patches/compat/pve-container-6.1.21.patch) |
-| pve-container | 6.1.22 through 6.1.24 | [Default container patch](patches/pve-container.patch) |
+| pve-container | 6.1.22 through 6.1.25 | [Default container patch](patches/pve-container.patch) |
 | qemu-server | 9.2.10 through 9.2.14 | [Compatibility QEMU patch](patches/compat/qemu-server-9.2.14.patch) |
-| qemu-server | 9.2.15 through 9.2.20 | [Default QEMU patch](patches/qemu-server.patch) |
+| qemu-server | 9.2.15 through 9.2.21 | [Default QEMU patch](patches/qemu-server.patch) |
 
 ## Regenerate an overlay patch
 
@@ -111,5 +111,7 @@ Reconstruct the source from a public upstream repository and the patch committed
    ```
 
    Reconstruct the manager and certificate patches separately. The certificate patches contain only `PVE/API2/ACME.pm`. For access control, omit the final context line for `/nodes/{node}/certificates` from the `check_path` hunk and subtract one from both hunk line counts. That line differs across supported packages.
+
+   For the default container patch, omit the first context line from the hunk that imports `PVE::GuestExecResult` in `src/PVE/API2/LXC.pm` and from the hunk that adds `verify_bpf_delegate_list` before `$confdesc` in `src/PVE/LXC/Config.pm`. For each hunk, add one to both starting line numbers and subtract one from both line counts. The omitted lines are the `PVE::JSONSchema` import and the closing `},` before the final `};`.
 
 5. Apply the regenerated patch to a fresh copy of the same base. Review the diff and replace the committed patch. In a disposable Proxmox package environment, select the matching distribution patches and run `/path/to/proxmox-overlays/pve-overlay verify --no-system`. Repeat verification for each affected variant. Commit the patch in this repository.

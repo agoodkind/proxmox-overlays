@@ -14,8 +14,7 @@ index 64aba6b..026d461 100644
  use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
  use IO::Socket::UNIX;
  use Socket qw(SOCK_STREAM);
-@@ -20,6 +25,7 @@ use PVE::INotify;
- use PVE::JSONSchema qw(get_standard_option);
+@@ -21,5 +26,6 @@ use PVE::INotify;
  use PVE::RESTHandler;
  use PVE::RPCEnvironment;
 +use PVE::GuestExecResult;
@@ -1448,8 +1447,7 @@ index b6eaf0b..9e3d888 100644
  use PVE::Cluster qw(cfs_register_file);
  use PVE::DataCenterConfig;
  use PVE::GuestHelpers;
-@@ -505,6 +506,119 @@ my $features_desc = {
-     },
+@@ -506,5 +507,118 @@ my $features_desc = {
  };
  
 +sub verify_bpf_delegate_list {
