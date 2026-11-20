@@ -1,8 +1,8 @@
 diff --git a/README b/README
-index 1e64786..b8fa21b 100644
+index 1e64786..d39afea 100644
 --- a/README
 +++ b/README
-@@ -90,9 +90,32 @@ privileges:
+@@ -90,11 +90,36 @@ privileges:
  	Realm.Allocate: create/modify/remove authentication realms
  	SDN.Allocate: manage SDN configuration
  	SDN.Audit: view SDN configuration
@@ -34,8 +34,12 @@ index 1e64786..b8fa21b 100644
 +	Sys.KernelModules.Modify: set the persistent kernel module list of a node
  	Sys.Modify: create/modify/remove node network parameters
  	Sys.PowerMgmt: node power management (start, stop, reset, shutdown, ...)
++	Sys.SRIOV.Audit: view SR-IOV virtual functions on a node
++	Sys.SRIOV.Modify: configure SR-IOV virtual functions on a node
  	Sys.Syslog: view syslog
-@@ -105,15 +128,26 @@ privileges:
+ 	User.Modify: create/modify/remove user access and details.
+ 
+@@ -105,15 +130,26 @@ privileges:
  	VM.Audit: view VM config
  	VM.Backup: backup/restore VMs
  	VM.Clone: clone/copy a VM
@@ -63,7 +67,7 @@ index 1e64786..b8fa21b 100644
  	VM.GuestAgent.FileRead: read files from the guest via QEMU guest agent
  	VM.GuestAgent.FileSystemMgmt: freeze/thaw/trim file systems via QEMU guest gent
 diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
-index a4e1c36..3232890 100644
+index a4e1c36..298409d 100644
 --- a/src/PVE/AccessControl.pm
 +++ b/src/PVE/AccessControl.pm
 @@ -1093,6 +1093,113 @@ sub delete_pool_acl {
@@ -198,7 +202,7 @@ index a4e1c36..3232890 100644
          admin => [
              'VM.Config.Disk',
              'VM.Config.CPU',
-@@ -1136,6 +1252,29 @@ my $privgroups = {
+@@ -1136,6 +1252,31 @@ my $privgroups = {
              'Sys.Modify', # edit/change node settings
              'Sys.Incoming', # incoming storage/guest migrations
              'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
@@ -222,13 +226,15 @@ index a4e1c36..3232890 100644
 +            'Sys.KernelModules.Audit',
 +            'Sys.KernelModules.Modify',
 +            'Sys.HostNIC.Use',
++            'Sys.SRIOV.Audit',
++            'Sys.SRIOV.Modify',
 +            'Sys.HostArtifacts.Audit',
 +            'Sys.HostArtifacts.Modify',
 +            'Sys.HostSecrets.Modify',
          ],
          admin => [
              'Sys.Console', 'Sys.Syslog',
-@@ -1326,10 +1465,17 @@ sub check_path {
+@@ -1326,10 +1467,17 @@ sub check_path {
      my ($path) = @_;
      return $path =~ m!^(
  	/
@@ -261,10 +267,10 @@ index 53f2da7..3759b7f 100644
  	perl -I.. api-tests.pl
 diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
 new file mode 100755
-index 0000000..439310e
+index 0000000..6963239
 --- /dev/null
 +++ b/src/test/bpf-delegate-test.pl
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,62 @@
 +#!/usr/bin/perl -w
 +
 +use strict;
@@ -316,10 +322,9 @@ index 0000000..439310e
 +    die "name '$rejected' was accepted\n" if !$@;
 +}
 +
-+for my $privilege (
-+    qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite
-+    Sys.KernelModules.Audit Sys.KernelModules.Modify)
-+) {
++for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite
++    Sys.KernelModules.Audit Sys.KernelModules.Modify Sys.SRIOV.Audit Sys.SRIOV.Modify))
++{
 +    die "privilege '$privilege' is not registered\n"
 +        if !PVE::AccessControl::verify_privname($privilege, 1);
 +    print "OK:registered:$privilege\n";
@@ -518,54 +523,60 @@ index 0000000..440a9d9
 +
 +exit(0);
 diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
-index d323447..51ae9a1 100755
+index d323447..afe4801 100755
 --- a/src/test/perm-test1.pl
 +++ b/src/test/perm-test1.pl
-@@ -70,10 +70,8 @@ check_permission(
+@@ -70,24 +70,39 @@ check_permission(
          . 'VM.Snapshot,VM.Snapshot.Rollback',
  );
  # Administrator -> Permissions.Modify!
--check_permission(
--    'alex@pve',
--    '/vms/400',
--    '' # sorted, comma-separated expected privilege string, loosely grouped by prefix
-+my $administrator_privileges =
-+    '' # comma-separated expected privileges without the BPFDelegate ones, loosely grouped by prefix
-         . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
-         . 'Group.Allocate,'
-         . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
-@@ -81,13 +79,31 @@ check_permission(
-         . 'Pool.Allocate,Pool.Audit,'
-         . 'Realm.Allocate,Realm.AllocateUser,'
-         . 'SDN.Allocate,SDN.Audit,SDN.Use,'
--        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
-+        . 'Sys.ACME.Account.Audit,Sys.ACME.Account.Create,Sys.ACME.Account.Modify,'
-+        . 'Sys.ACME.Account.Remove,'
-+        . 'Sys.ACME.Certificate.Order,Sys.ACME.Certificate.Renew,Sys.ACME.Certificate.Revoke,'
-+        . 'Sys.ACME.Config.Account.Modify,Sys.ACME.Config.Audit,Sys.ACME.Config.Domain.Modify,'
-+        . 'Sys.ACME.Config.Domain.Remove,'
-+        . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
-+        . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
-+        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
-+        . 'Sys.HostArtifacts.Audit,Sys.HostArtifacts.Modify,Sys.HostSecrets.Modify,'
-+        . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
-         . 'User.Modify,'
-         . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
--        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'
--        . 'VM.Console,VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
-+        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.HostNIC,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'
-+        . 'VM.Config.Network,VM.Config.Options,VM.Config.Vsock,'
-+        . 'VM.Console,VM.Guest.Exec,VM.Guest.FileRead,VM.Guest.FileWrite,'
-+        . 'VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
-         . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
--        . 'VM.Snapshot,VM.Snapshot.Rollback',
-+        . 'VM.Snapshot,VM.Snapshot.Rollback';
++my $administrator_privileges = '' # comma-separated expected privileges without the BPFDelegate ones, loosely grouped by prefix
++    . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
++    . 'Group.Allocate,'
++    . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
++    . 'Permissions.Modify,'
++    . 'Pool.Allocate,Pool.Audit,'
++    . 'Realm.Allocate,Realm.AllocateUser,'
++    . 'SDN.Allocate,SDN.Audit,SDN.Use,'
++    . 'Sys.ACME.Account.Audit,Sys.ACME.Account.Create,Sys.ACME.Account.Modify,'
++    . 'Sys.ACME.Account.Remove,'
++    . 'Sys.ACME.Certificate.Order,Sys.ACME.Certificate.Renew,Sys.ACME.Certificate.Revoke,'
++    . 'Sys.ACME.Config.Account.Modify,Sys.ACME.Config.Audit,Sys.ACME.Config.Domain.Modify,'
++    . 'Sys.ACME.Config.Domain.Remove,'
++    . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
++    . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
++    . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
++    . 'Sys.HostArtifacts.Audit,Sys.HostArtifacts.Modify,Sys.HostSecrets.Modify,'
++    . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.SRIOV.Audit,Sys.SRIOV.Modify,Sys.Syslog,'
++    . 'User.Modify,'
++    . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
++    . 'VM.Config.Disk,VM.Config.HWType,VM.Config.HostNIC,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'
++    . 'VM.Config.Network,VM.Config.Options,VM.Config.Vsock,'
++    . 'VM.Console,VM.Guest.Exec,VM.Guest.FileRead,VM.Guest.FileWrite,'
++    . 'VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
++    . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
++    . 'VM.Snapshot,VM.Snapshot.Rollback';
 +
 +my @expected_administrator_privileges = split(/,/, $administrator_privileges);
 +push @expected_administrator_privileges, @{ PVE::AccessControl::bpf_delegate_privileges() };
-+check_permission(
-+    'alex@pve',
-+    '/vms/400',
+ check_permission(
+     'alex@pve',
+     '/vms/400',
+-    '' # sorted, comma-separated expected privilege string, loosely grouped by prefix
+-        . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
+-        . 'Group.Allocate,'
+-        . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
+-        . 'Permissions.Modify,'
+-        . 'Pool.Allocate,Pool.Audit,'
+-        . 'Realm.Allocate,Realm.AllocateUser,'
+-        . 'SDN.Allocate,SDN.Audit,SDN.Use,'
+-        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
+-        . 'User.Modify,'
+-        . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
+-        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'
+-        . 'VM.Console,VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
+-        . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
+-        . 'VM.Snapshot,VM.Snapshot.Rollback',
 +    join(',', sort @expected_administrator_privileges),
  );
  

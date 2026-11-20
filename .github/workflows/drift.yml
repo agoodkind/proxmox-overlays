@@ -70,10 +70,14 @@ jobs:
         env:
           TAG: ${{ steps.index.outputs.tag }}
         run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" /overlay/pve-overlay verify --no-system
+      - name: Verify SR-IOV boot file installation and removal
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" perl /overlay/image/test-sriov-overlay.pl /overlay/pve-overlay
       - name: Check out pve-manager source at the upstream base commit
         uses: actions/checkout@v4
         with:
-          repository: agoodkind/pve-manager
+          repository: proxmox/pve-manager
           ref: ${{ env.PVE_MANAGER_BASE }}
           path: pve-manager
       - name: Apply pve-manager patches
@@ -130,6 +134,7 @@ jobs:
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
           docker exec "$id" make -k -C /src/pve-manager/test \
+            SRIOV_TEST_VMID=299999998 test-sriov-api test-sriov-start \
             test-host-artifacts test-host-secrets test-host-units \
             test-host-artifacts-attestation test-host-artifacts-installed-source
       - name: Print container diagnostics after a failure

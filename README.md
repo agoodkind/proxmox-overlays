@@ -17,6 +17,7 @@ Stock Proxmox VE restricts these operations to `root@pam`. The overlay adds a pr
 - `Sys.ACME.Certificate.Order`, `Renew`, and `Revoke` manage the certificate of one node.
 - Four `Sys.ACME.Config` privileges read and change only the ACME options of one node.
 - `Sys.KernelModules.Audit` reads one node's persistent kernel module list. `Sys.KernelModules.Modify` sets the list and loads allowlisted modules.
+- `Sys.SRIOV.Audit` reads a node's SR-IOV configuration and current virtual functions. `Sys.SRIOV.Modify` declares and removes virtual functions.
 - Host configuration methods verify trusted builds and install files within a target policy. Separate secret fields support rotation without rebuilding the configuration archive.
 
 The [permission reference](docs/permissions.md) lists the ACL path and the API method for each privilege.
@@ -29,7 +30,7 @@ The API proxy removes backend connection headers before it builds a public respo
 
 `pve-overlay` records every installed path in `/var/lib/pve-overlay/installed`. `apply` deletes a recorded path that the current patches do not produce, for example after a rollback to an older patch set, unloads a deleted AppArmor profile, and restarts the units. `remove` deletes every recorded path, and `status` prints `orphan` for a recorded path that the current patches do not produce.
 
-`pve-overlay` installs `overlay-root/<path>` at `/<path>`. It rejects host files outside `etc/apparmor.d/` and loads installed profiles with `apparmor_parser`.
+`pve-overlay` installs AppArmor profiles and the SR-IOV boot files from `overlay-root/<path>` at `/<path>`. It loads installed profiles with `apparmor_parser` and reloads systemd after installing or removing the SR-IOV service and its dependencies. Remove saved SR-IOV declarations through the node API before removing boot restoration.
 
 A dpkg hook runs `pve-overlay apply` after each package operation. The hook builds new copies from the upgraded modules. When a patch does not apply to an upgraded module, the hook deletes all patched copies and Proxmox runs the packaged modules.
 
@@ -59,24 +60,58 @@ Both grants are required. The token cannot change another option or another gues
 
 ## Drift check
 
-The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. A failed run means a patch needs a rebase in its fork. The job also runs `test-host-artifacts`, `test-host-secrets`, `test-host-units`, `test-host-artifacts-attestation`, and `test-host-artifacts-installed-source` against reconstructed pve-manager source in a disposable container, then removes that container.
+The `drift` workflow runs daily, on each pull request, and on each push to `main`. It runs `pve-overlay verify` against the newest published Proxmox VE packages from the stable and test repositories. `verify` applies the patches and loads each patched module in a taint-mode Perl process. The job also runs `test-host-artifacts`, `test-host-secrets`, `test-host-units`, `test-host-artifacts-attestation`, and `test-host-artifacts-installed-source` against reconstructed pve-manager source in a disposable container, then removes that container. If a patch fails to apply, update it here against the upstream source for the affected package.
 
 The workflow installs the packages in a container image in GHCR and builds the image from `image/Dockerfile`. The image tag is `<component>-<hash of the Proxmox package index>-<hash of image/Dockerfile>`. The workflow builds a new image when Proxmox publishes a package or when `image/Dockerfile` changes. Otherwise, the workflow pulls the existing image from GHCR.
 
-Generate each patch from its upstream base and reviewed fork commit. Generate the two default pve-manager patches with separate file scopes:
+## Select a compatibility patch
 
-1. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager-acme.patch -- PVE/API2/ACME.pm`.
-2. Run `git -C <fork-checkout> diff <upstream-base> <overlay-commit> --output=<overlay-checkout>/patches/pve-manager.patch -- . ':!PVE/API2/ACME.pm'`.
+`pve-overlay` reads the top level of the [patches directory](patches/). Select each compatibility patch independently. Install it under the name of the default patch it replaces.
 
-Regenerate the compatibility patch from the upstream base and reviewed overlay commit for pve-manager 9.2.24.
+| Package | Version or package check | Patch |
+| --- | --- | --- |
+| pve-manager | 9.2.24 checks `Sys.Modify` at `/nodes/{node}` | [Compatibility certificate patch](patches/compat/pve-manager-acme-node.patch) |
+| pve-manager | 9.2.26, 9.2.28, 9.2.31, and 9.2.33 check `Sys.Modify` at `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |
+| pve-container | 6.1.15 through 6.1.21 | [Compatibility container patch](patches/compat/pve-container-6.1.21.patch) |
+| pve-container | 6.1.22 through 6.1.25 | [Default container patch](patches/pve-container.patch) |
+| qemu-server | 9.2.10 through 9.2.14 | [Compatibility QEMU patch](patches/compat/qemu-server-9.2.14.patch) |
+| qemu-server | 9.2.15 through 9.2.21 | [Default QEMU patch](patches/qemu-server.patch) |
 
-```sh
-git -C <fork-checkout> diff <compat-upstream-base> <compat-overlay-commit> --output=<overlay-checkout>/patches/compat/pve-manager-acme-node.patch PVE/API2/ACME.pm
-```
+## Regenerate an overlay patch
 
-`pve-overlay` reads patch files directly in the [patches directory](patches/). Select the certificate patch that matches the package's `Sys.Modify` check:
+Reconstruct the source from a public upstream repository and the patch committed here. Clone the upstream repository into a temporary directory. Run the commands below from that directory.
 
-| pve-manager version | Check path | Selected patch |
-|---|---|---|
-| 9.2.24 | `/nodes/{node}` | [Compatibility patch](patches/compat/pve-manager-acme-node.patch) |
-| 9.2.26 | `/nodes/{node}/certificates` | [Default certificate patch](patches/pve-manager-acme.patch) |
+| Upstream repository | Patch | Upstream revision |
+| --- | --- | --- |
+| [pve-manager](https://github.com/proxmox/pve-manager) | Manager and default certificate | `41a0e2e09b9e6f9da5a19b580a38db2b45ece97b` |
+| pve-manager | Compatibility certificate | `66bc407c6d90a67aa15caed394bb294af174b6e1` |
+| [pve-access-control](https://github.com/proxmox/pve-access-control) | Access control | `dff26b458651b4e1141ff0a41a296d2904b16228` |
+| [pve-http-server](https://github.com/proxmox/pve-http-server) | HTTP server | `5c9e4ea773364bdb7ae0e2faec5750fe58129a47` |
+| [pve-container](https://github.com/proxmox/pve-container) | Compatibility container | `de0ddd657525ef5c4bb0fd5783d0f585aa9034c1` |
+| pve-container | Default container | `96021ad7dbc4ec8e618de880d59d2a12a9c8c0f1` |
+| [qemu-server](https://github.com/proxmox/qemu-server) | Compatibility QEMU | `a7b4240bba1dd493d6c76daad1e70af62b2ebcc8` |
+| qemu-server | Default QEMU | `91253ed548ea6bf9fbe8a3b0aa691933e52f8ed7` |
+
+1. Run `git switch --detach <upstream-revision>`. For the access control patch, also restore the exact module revision before saving the base tree.
+
+   ```sh
+   git restore --source=eb08cdfc72371c4d63f371d81f8d25232524e711 --staged --worktree src/PVE/AccessControl.pm
+   ```
+
+2. Set `patch` to the absolute path to the committed patch in this repository. Run `git write-tree` and assign the printed tree ID to `base_tree`. Run `git apply --index "$patch"` to apply the patch to the source and index.
+
+3. Edit the reconstructed source. Format new Perl files with [proxmox-perltidy](https://git.proxmox.com/?p=proxmox-perltidy.git). For existing Perl files, run it on a temporary copy and transfer the formatter changes for the edited blocks. Format changes shared by the default and compatibility variants against each base.
+
+4. Stage the edits and regenerate the patch.
+
+   ```sh
+   git add -A
+   git diff --cached --check "$base_tree"
+   git diff --cached --binary --output="${patch}.new" "$base_tree"
+   ```
+
+   Reconstruct the manager and certificate patches separately. The certificate patches contain only `PVE/API2/ACME.pm`. For access control, omit the final context line for `/nodes/{node}/certificates` from the `check_path` hunk and subtract one from both hunk line counts. That line differs across supported packages.
+
+   For the default container patch, omit the first context line from the hunk that imports `PVE::GuestExecResult` in `src/PVE/API2/LXC.pm` and from the hunk that adds `verify_bpf_delegate_list` before `$confdesc` in `src/PVE/LXC/Config.pm`. For each hunk, add one to both starting line numbers and subtract one from both line counts. The omitted lines are the `PVE::JSONSchema` import and the closing `},` before the final `};`.
+
+5. Apply the regenerated patch to a fresh copy of the same base. Review the diff and replace the committed patch. In a disposable Proxmox package environment, select the matching distribution patches and run `/path/to/proxmox-overlays/pve-overlay verify --no-system`. Repeat verification for each affected variant. Commit the patch in this repository.
