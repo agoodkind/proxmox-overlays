@@ -652,10 +652,10 @@ index 805eac0..3f4fafa 100644
  __PACKAGE__->register_method({
 diff --git a/src/PVE/GuestExecResult.pm b/src/PVE/GuestExecResult.pm
 new file mode 100644
-index 0000000..96ae9b3
+index 0000000..d6a7b00
 --- /dev/null
 +++ b/src/PVE/GuestExecResult.pm
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,285 @@
 +package PVE::GuestExecResult;
 +
 +use strict;
@@ -827,7 +827,7 @@ index 0000000..96ae9b3
 +    my $sigchld = POSIX::SigSet->new(SIGCHLD);
 +    my $previous_signals = POSIX::SigSet->new();
 +    sigprocmask(SIG_BLOCK, $sigchld, $previous_signals) or die "unable to block SIGCHLD: $!\n";
-+    my $reply = eval {
++    eval {
 +        $rpcenv->fork_worker(
 +            $task,
 +            $vmid,
@@ -852,18 +852,27 @@ index 0000000..96ae9b3
 +            },
 +            1, # CLI callers also need the identifier before the guest command completes.
 +        );
-+        close($writer);
-+        my ($message, $timed_out) = PVE::Tools::run_with_timeout(
++    };
++    my $fork_error = $@;
++
++    # The worker can report a successful start after fork_worker throws in the parent.
++    close($writer);
++    my ($reply, $timed_out) = eval {
++        PVE::Tools::run_with_timeout(
 +            $STARTUP_TIMEOUT,
 +            sub { PVE::Tools::safe_read_from($reader, $STARTUP_MESSAGE_LIMIT) },
 +        );
-+        die "command worker startup timed out; do not replay the command\n" if $timed_out;
-+        $message;
 +    };
-+    my $error = $@;
-+    my $restored = sigprocmask(SIG_SETMASK, $previous_signals);
-+    die $error if $error;
-+    die "unable to restore command signal mask: $!\n" if !$restored;
++    my $read_error = $@;
++    sigprocmask(SIG_SETMASK, $previous_signals)
++        or die "unable to restore command signal mask: $!; do not replay the command\n";
++    if ($read_error) {
++        chomp $read_error;
++        die "unable to read command worker startup reply: $read_error; do not replay the command\n";
++    }
++    die "command worker startup timed out; do not replay the command\n" if $timed_out;
++    die $fork_error if $fork_error && !length($reply);
++    warn $fork_error if $fork_error;
 +    die "worker exited before reserving command result storage\n" if !length($reply);
 +    die $reply if $reply !~ m/\A([1-9]\d*)\z/;
 +    return 0 + $1;
@@ -933,14 +942,15 @@ index 0000000..96ae9b3
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index e403bbd..244a7fc 100644
+index e403bbd..d79e491 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -670,6 +670,73 @@ sub make_apparmor_config {
+@@ -670,6 +670,74 @@ sub make_apparmor_config {
      return $raw;
  }
  
-+# Generates the lxc.hook.start-host entry, which Proxmox rejects in a raw container config.
++# make_bpf_delegate_hook_config generates the lxc.hook.start-host entry.
++# Proxmox rejects this entry in a raw container config.
 +# LXC splits the hook line like a shell and appends the container name, 'lxc', and
 +# 'start-host' to the arguments.
 +sub make_bpf_delegate_hook_config {
@@ -1010,7 +1020,7 @@ index e403bbd..244a7fc 100644
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -731,6 +798,8 @@ sub update_lxc_config {
+@@ -731,6 +799,8 @@ sub update_lxc_config {
          $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
      }
  
@@ -1019,7 +1029,7 @@ index e403bbd..244a7fc 100644
      if ($unprivileged && !$features->{force_rw_sys}) {
          # unpriv. CT default to sys:rw, but that doesn't always plays well with
          # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
-@@ -867,6 +936,8 @@ sub update_lxc_config {
+@@ -867,6 +937,8 @@ sub update_lxc_config {
          }
      }
  
@@ -1028,7 +1038,7 @@ index e403bbd..244a7fc 100644
      if (my $env = $conf->{env}) {
          for my $variable (split(/\0+/, $env)) {
              $raw .= "lxc.environment.runtime = $variable\n";
-@@ -1623,11 +1694,75 @@ sub delete_read_restricted_options {
+@@ -1623,11 +1695,75 @@ sub delete_read_restricted_options {
      return $conf;
  }
  
@@ -1105,7 +1115,7 @@ index e403bbd..244a7fc 100644
  
      my $check = sub {
          my ($opt, $delete) = @_;
-@@ -1644,6 +1779,8 @@ sub check_ct_modify_config_perm {
+@@ -1644,6 +1780,8 @@ sub check_ct_modify_config_perm {
                  my $sid = $1;
                  $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
              } else {
@@ -1114,7 +1124,7 @@ index e403bbd..244a7fc 100644
                  PVE::Storage::check_volume_access(
                      $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                  );
-@@ -1659,51 +1796,68 @@ sub check_ct_modify_config_perm {
+@@ -1659,51 +1797,68 @@ sub check_ct_modify_config_perm {
          } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
          } elsif ($opt eq 'features') {
@@ -1224,7 +1234,7 @@ index e403bbd..244a7fc 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2441,6 +2595,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2441,6 +2596,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  
@@ -1397,7 +1407,7 @@ index e403bbd..244a7fc 100644
  sub mountpoint_hotplug : prototype($$$$$) {
      my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
  
-@@ -3133,12 +3453,13 @@ my sub monitor_state_change($$) {
+@@ -3133,12 +3454,13 @@ my sub monitor_state_change($$) {
          }
      }
  }
@@ -1413,7 +1423,7 @@ index e403bbd..244a7fc 100644
          warn "problem with monitor socket, but continuing anyway: $err\n";
      } elsif (!$success) {
          print_ct_stderr_log($vmid);
-@@ -3157,6 +3478,9 @@ sub vm_start {
+@@ -3157,6 +3479,9 @@ sub vm_start {
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
@@ -1423,7 +1433,7 @@ index e403bbd..244a7fc 100644
      update_lxc_config($vmid, $conf);
  
      eval {
-@@ -3165,6 +3489,12 @@ sub vm_start {
+@@ -3165,6 +3490,12 @@ sub vm_start {
      };
      warn "lxc.idmap: $@" if $@;
  
@@ -1436,7 +1446,7 @@ index e403bbd..244a7fc 100644
      my $skiplock_flag_fn = "/run/lxc/skiplock-$vmid";
  
      if ($skiplock) {
-@@ -3178,9 +3508,6 @@ sub vm_start {
+@@ -3178,9 +3509,6 @@ sub vm_start {
  
      PVE::Storage::activate_volumes($storage_cfg, $vollist);
  
@@ -1446,7 +1456,7 @@ index e403bbd..244a7fc 100644
      unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
  
      my $is_debug = $debug || (!defined($debug) && $conf->{debug});
-@@ -3192,7 +3519,8 @@ sub vm_start {
+@@ -3192,7 +3520,8 @@ sub vm_start {
      eval {
          run_command($cmd);
  
@@ -1456,7 +1466,7 @@ index e403bbd..244a7fc 100644
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3201,8 +3529,25 @@ sub vm_start {
+@@ -3201,8 +3530,25 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
@@ -2251,10 +2261,10 @@ index 0000000..77d212b
 +exec "$@"
 diff --git a/src/test/exec-worker-test.pl b/src/test/exec-worker-test.pl
 new file mode 100755
-index 0000000..73ae487
+index 0000000..84cf3e8
 --- /dev/null
 +++ b/src/test/exec-worker-test.pl
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,222 @@
 +#!/usr/bin/perl -T
 +
 +use strict;
@@ -2362,31 +2372,23 @@ index 0000000..73ae487
 +};
 +
 +subtest 'the parent fails after releasing the worker' => sub {
-+    my %before = map { $_ => 1 } records();
++    my $started;
 +    {
 +        no warnings 'redefine';
 +        local *PVE::RPCEnvironment::log_cluster_msg = sub { die "test cluster log failure\n" };
-+        eval { $exec->({ vmid => $vmid, command => ['true'] }); };
-+        is($@, "test cluster log failure\n", 'exec preserves the parent exception');
++        $started = eval { $exec->({ vmid => $vmid, command => ['true'] }) };
++        return
++            unless ok($started && $started->{pid}, 'exec returns the released worker identifier');
 +    }
-+    my $completed;
++    my $result;
 +    ok(
 +        wait_for(sub {
-+            for my $record (records()) {
-+                $completed = $record if !$before{$record} && -f "$record/status";
-+            }
-+            return defined($completed);
++            $result = $status->({ vmid => $vmid, pid => $started->{pid} });
++            return $result->{exited};
 +        }),
-+        'the released worker saves its result',
++        'exec-status reports completion for the returned identifier',
 +    );
-+    if ($completed) {
-+        my ($id) = $completed =~ m!/(\d+)\z!;
-+        is(
-+            $status->({ vmid => $vmid, pid => $id })->{exitcode},
-+            0,
-+            'exec-status reads the result',
-+        );
-+    }
++    is($result->{exitcode}, 0, 'the released command exits successfully');
 +};
 +
 +subtest 'a storage error prevents execution' => sub {
