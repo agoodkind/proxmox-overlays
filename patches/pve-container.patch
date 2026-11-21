@@ -652,10 +652,10 @@ index 805eac0..3f4fafa 100644
  __PACKAGE__->register_method({
 diff --git a/src/PVE/GuestExecResult.pm b/src/PVE/GuestExecResult.pm
 new file mode 100644
-index 0000000..255e766
+index 0000000..96ae9b3
 --- /dev/null
 +++ b/src/PVE/GuestExecResult.pm
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,276 @@
 +package PVE::GuestExecResult;
 +
 +use strict;
@@ -850,6 +850,7 @@ index 0000000..255e766
 +                die $error if $error;
 +                $run->($exec_id);
 +            },
++            1, # CLI callers also need the identifier before the guest command completes.
 +        );
 +        close($writer);
 +        my ($message, $timed_out) = PVE::Tools::run_with_timeout(
@@ -2250,10 +2251,10 @@ index 0000000..77d212b
 +exec "$@"
 diff --git a/src/test/exec-worker-test.pl b/src/test/exec-worker-test.pl
 new file mode 100755
-index 0000000..ddb7e81
+index 0000000..53d75f3
 --- /dev/null
 +++ b/src/test/exec-worker-test.pl
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,224 @@
 +#!/usr/bin/perl -T
 +
 +use strict;
@@ -2310,7 +2311,7 @@ index 0000000..ddb7e81
 +}
 +AnyEvent::detect();
 +make_path('/var/log/pve/tasks');
-+my $rpcenv = PVE::RPCEnvironment->init('priv');
++my $rpcenv = PVE::RPCEnvironment->init('cli');
 +$rpcenv->set_credentials({ userid => 'root@pam' });
 +my $exec = PVE::API2::LXC->map_method_by_name('exec')->{code};
 +my $status = PVE::API2::LXC->map_method_by_name('exec_status')->{code};
@@ -2401,11 +2402,15 @@ index 0000000..ddb7e81
 +    ok(!-e "$bin/ran", 'the refused command did not run');
 +};
 +
-+subtest 'expiry verifies the worker PID and start time' => sub {
++subtest 'CLI exec returns while the worker awaits input and preserves the live result' => sub {
 +    my $age = time() - 3 * 3600;
 +    my $gate = "$bin/input";
 +    POSIX::mkfifo($gate, 0600) or die "unable to create test FIFO: $!\n";
-+    my $id = $exec->({ vmid => $vmid, command => ['cat', $gate] })->{pid};
++    my $id = $exec->({ vmid => $vmid, command => ['cat', $gate], timeout => 10 })->{pid};
++    my $pending = $status->({ vmid => $vmid, pid => $id });
++    return
++        unless is_deeply($pending, { exited => 0 },
++            'CLI exec returns before the command receives input');
 +    is(sigchld_blocked(), $original_mask, 'exec restores the signal mask after success');
 +    my $record = "$directory/$id";
 +    ok(wait_for(sub { -f "$record/worker" }), 'the command worker records its identity');
