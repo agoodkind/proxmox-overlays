@@ -173,16 +173,19 @@ sub parse_hunks {
 sub apply_diff {
     my ($original, $diff, $label) = @_;
 
-    my @lines = split(/\n/, $original, -1);
+    my @lines = $original eq '' ? ('') : split(/\n/, $original, -1);
     my @hunks = parse_hunks($diff);
     die "$label: the patch has no hunks\n" if !@hunks;
 
     my $line_shift = 0;
     for my $hunk (@hunks) {
-        my $index = find_block(\@lines, $hunk->{old}, $hunk->{start} - 1 + $line_shift);
+        my $old_count = scalar(@{ $hunk->{old} });
+        my $expected_index = $hunk->{start} + $line_shift;
+        $expected_index-- if $old_count;
+        my $index = find_block(\@lines, $hunk->{old}, $expected_index);
         die "$label: the hunk at line $hunk->{start} does not apply\n" if !defined($index);
-        splice(@lines, $index, scalar(@{ $hunk->{old} }), @{ $hunk->{new} });
-        $line_shift += scalar(@{ $hunk->{new} }) - scalar(@{ $hunk->{old} });
+        splice(@lines, $index, $old_count, @{ $hunk->{new} });
+        $line_shift += scalar(@{ $hunk->{new} }) - $old_count;
     }
     return join("\n", @lines);
 }
@@ -199,14 +202,19 @@ sub build_patched_files {
     my %patched;
     for my $entry (read_file_diffs()) {
         my $relative_path = $entry->{relative_path};
+        my $target_path = $entry->{target_path};
+        my $source_path = $entry->{source_path};
         if ($entry->{is_new}) {
+            die "$relative_path: more than one patch adds this file\n"
+                if exists($patched{$target_path});
             # A newly packaged module requires a patch against the package version.
             die "$relative_path: the patch adds a module that a package now ships\n"
-                if defined($entry->{source_path}) && -e $entry->{source_path};
-            $patched{ $entry->{target_path} } = new_file_text($entry->{diff}, $relative_path);
+                if defined($source_path) && -e $source_path;
+            $patched{$target_path} = new_file_text($entry->{diff}, $relative_path);
         } else {
-            $patched{ $entry->{target_path} } =
-                apply_diff(read_file($entry->{source_path}), $entry->{diff}, $relative_path);
+            my $original =
+                exists($patched{$target_path}) ? $patched{$target_path} : read_file($source_path);
+            $patched{$target_path} = apply_diff($original, $entry->{diff}, $relative_path);
         }
     }
     return \%patched;
@@ -532,9 +540,11 @@ sub command_status {
 # Loads each module in a taint-mode Perl process and confirms that Perl
 # compiled the patched copy, not the packaged module.
 sub command_compile {
+    my %seen;
     for my $module (grep { $_->{kind} eq 'module' } read_file_diffs()) {
         my $relative_path = $module->{relative_path};
         my $target_path = $module->{target_path};
+        next if $seen{$target_path}++;
         # Taint mode rejects a module path from the command line. The program
         # text includes the path instead.
         my $program = "require q{$relative_path}; print \$INC{q{$relative_path}}";

@@ -1,8 +1,8 @@
 PERLTIDY ?= perltidy
 PERLTIDY_PROFILE := .perltidyrc
-PERL_SCRIPTS := pve-overlay image/prepare-installed-source.pl image/test-sriov-overlay.pl
+PERL_SCRIPTS := pve-overlay image/prepare-installed-source.pl image/test-sriov-overlay.pl test/patch-series.t
 
-.PHONY: tidy tidy-check
+.PHONY: tidy tidy-check test
 
 tidy: $(PERLTIDY_PROFILE) $(PERL_SCRIPTS)
 	$(PERLTIDY) --profile=$(PERLTIDY_PROFILE) $(PERL_SCRIPTS)
@@ -12,3 +12,6 @@ tidy-check: $(PERLTIDY_PROFILE) $(PERL_SCRIPTS)
 		$(PERLTIDY) --profile=$(PERLTIDY_PROFILE) --assert-tidy --nobackup-and-modify-in-place \
 			--standard-output "$$script" > /dev/null; \
 	done
+
+test:
+	prove test/patch-series.t
