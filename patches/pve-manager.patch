@@ -1178,15 +1178,12 @@ diff --git a/PVE/API2/Nodes.pm b/PVE/API2/Nodes.pm
 index df0b2c2d..283795ca 100644
 --- a/PVE/API2/Nodes.pm
 +++ b/PVE/API2/Nodes.pm
-@@ -50,6 +50,8 @@ use PVE::API2::Certificates;
+@@ -50,3 +50,5 @@ use PVE::API2::Certificates;
  use PVE::API2::Disks;
  use PVE::API2::Firewall::Host;
  use PVE::API2::Hardware;
 +use PVE::API2::HostArtifacts;
 +use PVE::API2::KernelModules;
- use PVE::API2::LXC::Status;
- use PVE::API2::LXC;
- use PVE::API2::Network;
 @@ -200,6 +202,16 @@ __PACKAGE__->register_method({
      path => 'config',
  });
