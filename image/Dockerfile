@@ -22,5 +22,5 @@ ADD --checksum=sha256:30463d8e1fdce73f178f76b0082b7ab0657b0740b87274890e831def64
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod 0755 /usr/sbin/policy-rc.d \
     && apt-get update \
-    && apt-get install --yes --no-install-recommends pve-manager make /tmp/gh.deb \
+    && apt-get install --yes --no-install-recommends pve-manager qemu-guest-agent make /tmp/gh.deb \
     && rm -rf /var/lib/apt/lists/* /tmp/gh.deb

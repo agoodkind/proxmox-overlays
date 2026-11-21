@@ -130,6 +130,19 @@ jobs:
           docker exec "$id" timeout 120 systemctl start pve-cluster
           docker exec "$id" timeout 5 mountpoint /etc/pve
           docker exec "$id" timeout 5 /usr/bin/pvesh get /version --output-format json
+      - name: Test LXC and QEMU guest command workers
+        run: |
+          tests="$RUNNER_TEMP/guest-command-tests"
+          mkdir "$tests"
+          git -C "$tests" apply --include=src/test/exec-worker-test.pl \
+            --include=src/test/exec-fake-lxc-attach "$PWD/patches/pve-container.patch"
+          git -C "$tests" apply --include=src/test/guest-agent-test.pl \
+            --include=src/test/GuestTestRequest.pm --include=src/test/guest-permission-test.cfg \
+            "$PWD/patches/qemu-server.patch"
+          id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
+          docker cp "$tests/src/test" "$id:/tmp/guest-command-tests"
+          docker exec -w /tmp/guest-command-tests "$id" perl -T exec-worker-test.pl
+          docker exec -w /tmp/guest-command-tests "$id" perl -T guest-agent-test.pl --result-retention
       - name: Run the pve-manager host API tests
         run: |
           id="$(cat "$RUNNER_TEMP/host-api-test.cid")"
