@@ -2254,10 +2254,10 @@ index 0000000..77d212b
 +exec "$@"
 diff --git a/src/test/exec-worker-test.pl b/src/test/exec-worker-test.pl
 new file mode 100755
-index 0000000..53d75f3
+index 0000000..73ae487
 --- /dev/null
 +++ b/src/test/exec-worker-test.pl
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,230 @@
 +#!/usr/bin/perl -T
 +
 +use strict;
@@ -2424,7 +2424,13 @@ index 0000000..53d75f3
 +        { exited => 0 },
 +        'polling preserves a live reservation past the orphan TTL',
 +    );
-+    open(my $release, '>', $gate) or die "unable to open the command FIFO: $!\n";
++    my $release;
++    PVE::Tools::run_with_timeout(
++        5,
++        sub {
++            open($release, '>', $gate) or die "unable to open the command FIFO: $!\n";
++        },
++    );
 +    print {$release} 'complete';
 +    close($release) or die "unable to release the command: $!\n";
 +
