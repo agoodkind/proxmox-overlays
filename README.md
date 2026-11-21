@@ -77,6 +77,17 @@ The workflow installs the packages in a container image in GHCR and builds the i
 | qemu-server | 9.2.10 through 9.2.14 | [Compatibility QEMU patch](patches/compat/qemu-server-9.2.14.patch) |
 | qemu-server | 9.2.15 through 9.2.21 | [Default QEMU patch](patches/qemu-server.patch) |
 
+## Format the Perl scripts
+
+Install Perl::Tidy with `brew install perltidy` on macOS or `cpan Perl::Tidy`
+on Linux. This repository uses version `20260826` for formatting. Run `make tidy`
+to format the standalone Perl scripts or `make tidy-check` to check their
+formatting without changing them.
+
+The [.perltidyrc](.perltidyrc) copies the [Proxmox formatter profile](https://git.proxmox.com/?p=proxmox-perltidy.git;a=blob;f=src/perltidyrc;hb=ba5df00add5bfd70245ae1cbd8eb9d9f55c723f4).
+Copyright 2025 Thomas Lamprecht, Proxmox Support Team <support@proxmox.com>.
+The [GNU General Public License version 3 or later](LICENSES/GPL-3.0-or-later.txt) applies to the profile.
+
 ## Regenerate an overlay patch
 
 Reconstruct the source from a public upstream repository and the patch committed here. Clone the upstream repository into a temporary directory. Run the commands below from that directory.
@@ -100,7 +111,7 @@ Reconstruct the source from a public upstream repository and the patch committed
 
 2. Set `patch` to the absolute path to the committed patch in this repository. Run `git write-tree` and assign the printed tree ID to `base_tree`. Run `git apply --index "$patch"` to apply the patch to the source and index.
 
-3. Edit the reconstructed source. Format new Perl files with [proxmox-perltidy](https://git.proxmox.com/?p=proxmox-perltidy.git). For existing Perl files, run it on a temporary copy and transfer the formatter changes for the edited blocks. Format changes shared by the default and compatibility variants against each base.
+3. Edit the reconstructed source. Format new Perl files with `perltidy --profile=/path/to/proxmox-overlays/.perltidyrc <file>`. For existing Perl files, format a temporary copy and transfer the formatter changes for the edited blocks. Format changes shared by the default and compatibility variants against each base.
 
 4. Stage the edits and regenerate the patch.
 

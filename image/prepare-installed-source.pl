@@ -69,19 +69,33 @@ my $tofu_version = field('tofu', 'release_tag', qr/\Av[0-9]+\.[0-9]+\.[0-9]+\z/)
 $tofu_version =~ s/\Av//;
 field('tofu', 'asset', qr/\Atofu_\Q$tofu_version\E_linux_amd64\.zip\z/);
 my $tofu_digest = field('tofu', 'member_sha256', qr/\A[0-9a-f]{64}\z/);
+
 for my $case (@cases) {
     download($case, 'agoodkind/configs', 'asset', 'sha256');
     download($case, 'agoodkind/configs', 'bundle_asset', 'bundle_sha256');
 }
 my $archive = download($program, 'agoodkind/configsctl', 'asset', 'sha256');
-gh('attestation', 'verify', $archive, '--repo', 'agoodkind/configsctl',
-    '--cert-identity', 'https://github.com/agoodkind/go-makefile/.github/workflows/_package.yml@refs/heads/main',
-    '--source-ref', 'refs/heads/main', '--source-digest', $revision,
-    '--signer-digest', $signer, '--deny-self-hosted-runners');
+gh(
+    'attestation',
+    'verify',
+    $archive,
+    '--repo',
+    'agoodkind/configsctl',
+    '--cert-identity',
+    'https://github.com/agoodkind/go-makefile/.github/workflows/_package.yml@refs/heads/main',
+    '--source-ref',
+    'refs/heads/main',
+    '--source-digest',
+    $revision,
+    '--signer-digest',
+    $signer,
+    '--deny-self-hosted-runners',
+);
 my $tar = Archive::Tar->new;
 $tar->read($archive, 1) or die "cannot read $archive\n";
 my $member = $tar->get_content($program) // die "the release lacks its $program executable\n";
-die "$program executable differs from the pinned SHA-256\n" unless sha256_hex($member) eq $member_digest;
+die "$program executable differs from the pinned SHA-256\n"
+    unless sha256_hex($member) eq $member_digest;
 make_path("$work/bin");
 open(my $output, '>:raw', "$work/bin/$program") or die "cannot create $program: $!\n";
 print {$output} $member or die "cannot write $program: $!\n";
@@ -92,6 +106,7 @@ system('unzip', '-q', $tofu_archive, 'tofu', '-d', "$work/bin") == 0
 verify_file("$work/bin/tofu", $tofu_digest);
 chmod(0755, "$work/bin/$program", "$work/bin/tofu") == 2 or die "cannot set executable modes: $!\n";
 open(my $receipt, '>:raw', "$work/pins.json") or die "cannot create the verified pins: $!\n";
-print {$receipt} JSON::PP->new->canonical->encode($pins) or die "cannot write the verified pins: $!\n";
+print {$receipt} JSON::PP->new->canonical->encode($pins)
+    or die "cannot write the verified pins: $!\n";
 close($receipt) or die "cannot finish writing the verified pins: $!\n";
 rename($work, $destination) or die "cannot install fixtures in $destination: $!\n";

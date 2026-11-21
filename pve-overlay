@@ -18,8 +18,7 @@ use Getopt::Long qw(GetOptions);
 # them as flat files in a directory that Debian creates, because the OpenTofu
 # file resource writes a file only into an existing directory.
 my @PATCH_GLOBS = (
-    dirname(abs_path($0)) . '/patches/*.patch',
-    '/usr/local/share/pve-overlay-*.patch',
+    dirname(abs_path($0)) . '/patches/*.patch', '/usr/local/share/pve-overlay-*.patch',
 );
 my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
@@ -90,28 +89,30 @@ sub read_file_diffs {
         for my $file_diff (split(/^(?=diff --git )/m, read_file($patch_path))) {
             my $is_new = $file_diff =~ /^new file mode /m ? 1 : 0;
             if ($file_diff =~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/}) {
-                push @entries, {
-                    kind => 'module',
-                    relative_path => $1,
-                    source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
-                    target_path => "$target_dir/$1",
-                    diff => $file_diff,
-                    is_new => $is_new,
-                };
+                push @entries,
+                    {
+                        kind => 'module',
+                        relative_path => $1,
+                        source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
+                        target_path => "$target_dir/$1",
+                        diff => $file_diff,
+                        is_new => $is_new,
+                    };
             } elsif ($file_diff =~ m{^diff --git a/(?:src/)?overlay-root/(\S+) b/}) {
                 my $relative_path = $1;
                 die "pve-overlay: $patch_path adds $relative_path outside @HOST_FILE_DIRS\n"
                     if !host_file_dir_allows($relative_path);
                 die "pve-overlay: $patch_path changes $relative_path, and a host file must be new\n"
                     if !$is_new;
-                push @entries, {
-                    kind => 'host',
-                    relative_path => $relative_path,
-                    source_path => undef,
-                    target_path => "$host_root/$relative_path",
-                    diff => $file_diff,
-                    is_new => 1,
-                };
+                push @entries,
+                    {
+                        kind => 'host',
+                        relative_path => $relative_path,
+                        source_path => undef,
+                        target_path => "$host_root/$relative_path",
+                        diff => $file_diff,
+                        is_new => 1,
+                    };
             }
         }
     }
@@ -156,11 +157,11 @@ sub parse_hunks {
         $line = ' ' if $line eq '';
         my ($kind, $text) = (substr($line, 0, 1), substr($line, 1));
         if ($kind eq ' ' || $kind eq '-') {
-            push @{ $hunks[-1]{old} }, $text;
+            push @{ $hunks[-1]->{old} }, $text;
             $old_remaining--;
         }
         if ($kind eq ' ' || $kind eq '+') {
-            push @{ $hunks[-1]{new} }, $text;
+            push @{ $hunks[-1]->{new} }, $text;
             $new_remaining--;
         }
     }
@@ -190,8 +191,8 @@ sub new_file_text {
     my ($diff, $label) = @_;
     my @hunks = parse_hunks($diff);
     die "$label: the patch of a new file needs exactly one hunk\n" if scalar(@hunks) != 1;
-    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]{old} };
-    return join("\n", @{ $hunks[0]{new} }) . "\n";
+    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]->{old} };
+    return join("\n", @{ $hunks[0]->{new} }) . "\n";
 }
 
 sub build_patched_files {
@@ -228,7 +229,8 @@ sub load_apparmor_profiles {
     my @paths = apparmor_paths();
     return if !@paths;
     if (!$apparmor_enabled) {
-        warn "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
+        warn
+            "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
         return;
     }
     for my $path (@paths) {
@@ -268,12 +270,19 @@ sub parse_unit_active_since {
 sub unit_active_since {
     my ($unit) = @_;
     open(
-        my $handle, '-|', 'systemctl', 'show', "$unit.service",
-        '--property=ActiveState', '--property=ActiveEnterTimestamp', '--timestamp=unix',
-    ) or do {
-        warn "pve-overlay: systemctl show $unit.service failed\n";
-        return 0;
-    };
+        my $handle,
+        '-|',
+        'systemctl',
+        'show',
+        "$unit.service",
+        '--property=ActiveState',
+        '--property=ActiveEnterTimestamp',
+        '--timestamp=unix',
+        )
+        or do {
+            warn "pve-overlay: systemctl show $unit.service failed\n";
+            return 0;
+        };
     my @lines = <$handle>;
     if (!close($handle)) {
         warn "pve-overlay: systemctl show $unit.service failed\n";
