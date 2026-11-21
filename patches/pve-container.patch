@@ -1,5 +1,5 @@
 diff --git a/src/PVE/API2/LXC.pm b/src/PVE/API2/LXC.pm
-index 64aba6b..026d461 100644
+index 64aba6b..5e631f2 100644
 --- a/src/PVE/API2/LXC.pm
 +++ b/src/PVE/API2/LXC.pm
 @@ -3,6 +3,11 @@ package PVE::API2::LXC;
@@ -8,7 +8,7 @@ index 64aba6b..026d461 100644
  
 +use IO::Select;
 +use MIME::Base64 qw(decode_base64 encode_base64);
-+use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
++use POSIX qw(WNOHANG);
 +use Time::HiRes (); # Guest exec also runs on packages that do not import usleep.
 +
  use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
@@ -33,7 +33,7 @@ index 64aba6b..026d461 100644
          ];
  
          return $res;
-@@ -3156,6 +3167,618 @@ __PACKAGE__->register_method({
+@@ -3156,6 +3167,601 @@ __PACKAGE__->register_method({
      },
  });
  
@@ -97,8 +97,8 @@ index 64aba6b..026d461 100644
 +    die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
 +};
 +
-+# Sends TERM, then KILL after the grace period, to the process group of lxc-attach. A command
-+# that calls setsid itself leaves the group and keeps running.
++# This helper sends TERM to the lxc-attach process group and sends KILL if the group still
++# exists after the grace period. A command that calls setsid leaves the group.
 +my $terminate_attach_process = sub {
 +    my ($pid) = @_;
 +
@@ -116,9 +116,8 @@ index 64aba6b..026d461 100644
 +    waitpid($pid, 0) if !$reaped;
 +};
 +
-+# Starts lxc-attach as the leader of a new process group. A timeout then signals the command
-+# and the processes that it forks. Returns the process ID and the handles for the standard
-+# input, output, and error of the process.
++# This helper starts lxc-attach in a new process group so a timeout can stop the group.
++# It returns the child PID and the handles for standard input, output, and error.
 +my $start_attach_process = sub {
 +    my ($attach_command) = @_;
 +
@@ -207,7 +206,9 @@ index 64aba6b..026d461 100644
 +            } elsif ($!{EAGAIN} || $!{EINTR}) {
 +                next;
 +            } else {
-+                $pending_input = '';
++                my $error = "writing command input in container '$vmid' failed: $!\n";
++                $terminate_attach_process->($pid);
++                die $error;
 +            }
 +            if (!length($pending_input)) {
 +                $write_select->remove($handle);
@@ -274,7 +275,6 @@ index 64aba6b..026d461 100644
 +my $run_exec_worker = sub {
 +    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 +
-+    PVE::GuestExecResult::worker_started('lxc', $vmid, $exec_id);
 +    my $status = {};
 +    my $captured = { stdout => '', stderr => '' };
 +    eval {
@@ -305,8 +305,9 @@ index 64aba6b..026d461 100644
 +    permissions => {
 +        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
 +    },
-+    description => 'Start a command as root in a running container and return its identifier at'
-+        . ' once. Poll exec-status for the result.',
++    description =>
++        'Start a command as root in a running container. The API returns its identifier'
++        . ' when the worker reserves result storage. Poll exec-status for the result.',
 +    parameters => {
 +        additionalProperties => 0,
 +        properties => {
@@ -327,7 +328,7 @@ index 64aba6b..026d461 100644
 +            'input-data' => {
 +                type => 'string',
 +                maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                description => 'Base64 encoded data for the standard input of the command.',
++                description => 'This field supplies standard input for the command in base64.',
 +                optional => 1,
 +            },
 +            timeout => {
@@ -352,8 +353,8 @@ index 64aba6b..026d461 100644
 +        properties => {
 +            pid => {
 +                type => 'integer',
-+                description => 'The identifier of the command for exec-status. It is a random'
-+                    . ' number, not a process ID.',
++                description => 'This random number identifies the command for exec-status.'
++                    . ' It does not refer to an operating system process.',
 +            },
 +        },
 +    },
@@ -380,32 +381,14 @@ index 64aba6b..026d461 100644
 +        my $command = $untaint_command->($param->{command});
 +
 +        $assert_container_running->($vmid);
-+        my $exec_id = PVE::GuestExecResult::reserve('lxc', $vmid);
-+
-+        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
-+        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
-+        # fork_worker returns, and the signal arrives afterwards.
-+        my $sigchld = POSIX::SigSet->new(SIGCHLD);
-+        my $previous_signals = POSIX::SigSet->new();
-+        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
-+            or die "unable to block SIGCHLD: $!\n";
-+        eval {
-+            $rpcenv->fork_worker(
-+                'lxcexec',
-+                $vmid,
-+                $authuser,
-+                sub {
-+                    # The worker inherits the blocked signal and unblocks it before starting
-+                    # lxc-attach.
-+                    sigprocmask(SIG_UNBLOCK, $sigchld);
-+                    $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-+                },
-+            );
-+        };
-+        my $fork_error = $@;
-+        sigprocmask(SIG_SETMASK, $previous_signals);
-+        die $fork_error if $fork_error;
-+
++        my $exec_id = PVE::GuestExecResult::start_worker(
++            $rpcenv,
++            'lxc',
++            'lxcexec',
++            $vmid,
++            $authuser,
++            sub { $run_exec_worker->($vmid, $_[0], $command, $input, $timeout) },
++        );
 +        return { pid => 0 + $exec_id };
 +    },
 +});
@@ -549,7 +532,7 @@ index 64aba6b..026d461 100644
 +            content => {
 +                type => 'string',
 +                maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                description => 'The base64 encoded content of the file.',
++                description => 'This field contains the file contents in base64.',
 +            },
 +        },
 +    },
@@ -608,7 +591,7 @@ index 64aba6b..026d461 100644
 +        properties => {
 +            content => {
 +                type => 'string',
-+                description => 'The base64 encoded content of the file.',
++                description => 'This field contains the file contents in base64.',
 +            },
 +            truncated => {
 +                type => 'boolean',
@@ -669,10 +652,10 @@ index 805eac0..3f4fafa 100644
  __PACKAGE__->register_method({
 diff --git a/src/PVE/GuestExecResult.pm b/src/PVE/GuestExecResult.pm
 new file mode 100644
-index 0000000..6e30c1a
+index 0000000..255e766
 --- /dev/null
 +++ b/src/PVE/GuestExecResult.pm
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,275 @@
 +package PVE::GuestExecResult;
 +
 +use strict;
@@ -682,6 +665,7 @@ index 0000000..6e30c1a
 +use File::Path qw(make_path remove_tree);
 +use JSON;
 +use MIME::Base64 qw(encode_base64);
++use POSIX qw(SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 +
 +use PVE::ProcFSTools;
 +use PVE::Tools;
@@ -696,6 +680,8 @@ index 0000000..6e30c1a
 +my $RESERVED_BYTES = 2 * $OUTPUT_LIMIT;
 +my $ID_BYTES = 6;
 +my $ID_ATTEMPTS = 10;
++my $STARTUP_TIMEOUT = 15; # Reserving result storage can wait ten seconds for the host lock.
++my $STARTUP_MESSAGE_LIMIT = 4096; # Linux guarantees atomic pipe writes up to PIPE_BUF.
 +
 +sub output_limit {
 +    return $OUTPUT_LIMIT;
@@ -726,6 +712,15 @@ index 0000000..6e30c1a
 +    die "unable to delete the saved command result\n" if @$errors;
 +}
 +
++sub worker_running {
++    my ($directory) = @_;
++
++    return undef if !-e "$directory/worker";
++    my $worker = PVE::Tools::file_get_contents("$directory/worker");
++    return 0 if $worker !~ m/\A([1-9]\d*) ([1-9]\d*)\z/;
++    return PVE::ProcFSTools::check_process_running($1, $2) ? 1 : 0;
++}
++
 +# Every operation uses the host lock while inspecting or changing result storage.
 +sub expire_and_measure {
 +    my ($record_count, $payload_bytes) = (0, 0);
@@ -750,7 +745,10 @@ index 0000000..6e30c1a
 +                }
 +                die "unable to inspect command result storage: $!\n"
 +                    if !defined($reference_time);
-+                if ($now - $reference_time > $time_to_live) {
++                if (
++                    $now - $reference_time > $time_to_live
++                    && (-e "$directory/status" || !worker_running($directory))
++                ) {
 +                    remove_result($directory);
 +                    next;
 +                }
@@ -774,7 +772,7 @@ index 0000000..6e30c1a
 +}
 +
 +sub reserve {
-+    my ($kind, $vmid) = @_;
++    my ($kind, $vmid, $starttime) = @_;
 +
 +    return with_lock(sub {
 +        my ($record_count, $payload_bytes) = expire_and_measure();
@@ -800,22 +798,74 @@ index 0000000..6e30c1a
 +            $exec_id = $1;
 +            next if $exec_id < 1;
 +            my $result_directory = result_directory($kind, $vmid, $exec_id);
-+            return 0 + $exec_id if mkdir($result_directory, 0700);
++            if (mkdir($result_directory, 0700)) {
++                if (defined($starttime)) {
++                    eval {
++                        PVE::Tools::file_set_contents(
++                            "$result_directory/worker", "$$ $starttime", 0600,
++                        );
++                    };
++                    if (my $error = $@) {
++                        remove_result($result_directory);
++                        die $error;
++                    }
++                }
++                return 0 + $exec_id;
++            }
 +            die "unable to reserve command result storage: $!\n" if !$!{EEXIST};
 +        }
 +        die "unable to allocate a command identifier\n";
 +    });
 +}
 +
-+sub worker_started {
-+    my ($kind, $vmid, $exec_id) = @_;
++sub start_worker {
++    my ($rpcenv, $kind, $task, $vmid, $authuser, $run) = @_;
 +
-+    with_lock(sub {
-+        my $directory = result_directory($kind, $vmid, $exec_id);
-+        my $starttime = PVE::ProcFSTools::read_proc_starttime($$);
-+        die "unable to read the command worker start time\n" if !$starttime;
-+        PVE::Tools::file_set_contents("$directory/worker", "$$ $starttime", 0600);
-+    });
++    pipe(my $reader, my $writer) or die "unable to open command startup pipe: $!\n";
++
++    # SIGCHLD can interrupt the read that fork_worker uses to verify the worker UPID.
++    my $sigchld = POSIX::SigSet->new(SIGCHLD);
++    my $previous_signals = POSIX::SigSet->new();
++    sigprocmask(SIG_BLOCK, $sigchld, $previous_signals) or die "unable to block SIGCHLD: $!\n";
++    my $reply = eval {
++        $rpcenv->fork_worker(
++            $task,
++            $vmid,
++            $authuser,
++            sub {
++                my $exec_id = eval {
++                    sigprocmask(SIG_UNBLOCK, $sigchld) or die "unable to unblock SIGCHLD: $!\n";
++                    my $starttime = PVE::ProcFSTools::read_proc_starttime($$)
++                        or die "unable to read the command worker start time\n";
++                    reserve($kind, $vmid, $starttime);
++                };
++                my $error = $@;
++                my $message = $error ? substr($error, 0, $STARTUP_MESSAGE_LIMIT) : "$exec_id";
++
++                # fork_worker can release the worker and then throw in the parent. The worker keeps
++                # a reader until it writes its bounded reply, even if the parent has already exited.
++                PVE::Tools::safe_print('command startup pipe', $writer, $message);
++                close($writer) or die "unable to send command startup reply: $!\n";
++                close($reader);
++                die $error if $error;
++                $run->($exec_id);
++            },
++        );
++        close($writer);
++        my ($message, $timed_out) = PVE::Tools::run_with_timeout(
++            $STARTUP_TIMEOUT,
++            sub { PVE::Tools::safe_read_from($reader, $STARTUP_MESSAGE_LIMIT) },
++        );
++        die "command worker startup timed out; do not replay the command\n" if $timed_out;
++        $message;
++    };
++    my $error = $@;
++    my $restored = sigprocmask(SIG_SETMASK, $previous_signals);
++    die $error if $error;
++    die "unable to restore command signal mask: $!\n" if !$restored;
++    die "worker exited before reserving command result storage\n" if !length($reply);
++    die $reply if $reply !~ m/\A([1-9]\d*)\z/;
++    return 0 + $1;
 +}
 +
 +sub complete {
@@ -843,14 +893,10 @@ index 0000000..6e30c1a
 +        $guest_label = "VM $vmid" if $kind eq 'qemu';
 +        die "no stored result for command $exec_id in $guest_label\n" if !-d $directory;
 +        if (!-e "$directory/status") {
-+            if (-e "$directory/worker") {
-+                my $worker = PVE::Tools::file_get_contents("$directory/worker");
-+                die "invalid command worker record\n" if $worker !~ m/\A(\d+) (\d+)\z/;
-+                my ($pid, $starttime) = ($1, $2);
-+                my $running = PVE::ProcFSTools::check_process_running($pid, $starttime);
-+                die "command outcome is uncertain after worker interruption; do not replay the command\n"
-+                    if !$running;
-+            }
++            my $running = worker_running($directory);
++            die
++                "command outcome is uncertain after worker interruption; do not replay the command\n"
++                if defined($running) && !$running;
 +            return { exited => 0 };
 +        }
 +
@@ -886,7 +932,7 @@ index 0000000..6e30c1a
 +
 +1;
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index e403bbd..678674e 100644
+index e403bbd..244a7fc 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
 @@ -670,6 +670,73 @@ sub make_apparmor_config {
@@ -991,7 +1037,7 @@ index e403bbd..678674e 100644
 +    keyctl => 1,
 +};
 +
-+# feature flags with a boolean value, where an absent flag equals 0
++# These flags take boolean values. An absent flag equals 0.
 +my $boolean_feature_flags = {
 +    nesting => 1,
 +    keyctl => 1,
@@ -1009,8 +1055,8 @@ index e403bbd..678674e 100644
 +    return $value // '';
 +}
 +
-+# Returns the names of all feature flags with a different semantic value in the two parsed
-+# feature hashes. An absent flag and a flag set to 0 are equal.
++# This function lists the flags with different values in the old and new feature sets.
++# An absent boolean flag equals 0.
 +sub get_changed_feature_flags {
 +    my ($old_features, $new_features) = @_;
 +
@@ -1026,8 +1072,8 @@ index e403bbd..678674e 100644
 +    return $changed;
 +}
 +
-+# Returns the VM.Config.BPFDelegate privilege of every name that is in only one of the two
-+# parsed bpfdelegate hashes.
++# This function lists the VM.Config.BPFDelegate privileges for BPF settings that the new
++# configuration adds or removes.
 +sub get_changed_bpf_delegate_privileges {
 +    my ($old_delegate, $new_delegate) = @_;
 +
@@ -1750,7 +1796,7 @@ index 0000000..2e13592
 +  mount options=(move),
 +}
 diff --git a/src/test/Makefile b/src/test/Makefile
-index c1ff506..04a917e 100644
+index c1ff506..8d7ad39 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -2,7 +2,7 @@ RUN_USERNS := lxc-usernsexec -m "u:0:`id -u`:1" -m "g:0:`id -g`:1" --
@@ -1762,15 +1808,16 @@ index c1ff506..04a917e 100644
  
  test_setup: run_setup_tests.pl
  	if test -e /run/lock/sbuild; then \
-@@ -30,5 +30,14 @@ test_config: config_tests.pl
+@@ -30,5 +30,15 @@ test_config: config_tests.pl
  test_raw_config_write: raw_config_write_test.pl
  	./raw_config_write_test.pl
  
 +test_bpfdelegate: bpfdelegate-test.pl
 +	./bpfdelegate-test.pl
 +
-+test_exec_concurrency: exec-concurrency-test.pl
++test_exec_concurrency: exec-concurrency-test.pl exec-worker-test.pl
 +	./exec-concurrency-test.pl
++	./exec-worker-test.pl
 +
 +test_hostnic: hostnic-test.pl
 +	./hostnic-test.pl
@@ -2002,17 +2049,16 @@ index 0000000..9012dcd
 +exit(0);
 diff --git a/src/test/exec-concurrency-test.pl b/src/test/exec-concurrency-test.pl
 new file mode 100755
-index 0000000..5661f4d
+index 0000000..e1e4354
 --- /dev/null
 +++ b/src/test/exec-concurrency-test.pl
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,181 @@
 +#!/usr/bin/perl -T
 +
-+# Starts commands through the exec method of PVE::API2::LXC from several processes at the same
-+# time, as the workers of pvedaemon do, and requires every start to return a pid.
-+# Each process runs the production code of exec and PVE::RESTEnvironment::fork_worker. The test
-+# replaces the container lookup and lxc-attach, which need a node, and the process start time
-+# check, which fails under the emulation of the amd64 test image.
++# The test calls PVE::API2::LXC exec from concurrent processes and checks that each call
++# returns a command identifier.
++# Each process uses PVE::RESTEnvironment::fork_worker. The test replaces the container lookup
++# and lxc-attach to run the commands on the test host.
 +
 +use strict;
 +use warnings;
@@ -2032,7 +2078,6 @@ index 0000000..5661f4d
 +use PVE::API2::LXC;
 +use PVE::LXC;
 +use PVE::LXC::Config;
-+use PVE::ProcFSTools;
 +use PVE::RPCEnvironment;
 +use PVE::UPID;
 +
@@ -2046,7 +2091,6 @@ index 0000000..5661f4d
 +    no warnings 'redefine';
 +    *PVE::LXC::Config::load_config = sub { return {} };
 +    *PVE::LXC::check_running = sub { return 1 };
-+    *PVE::ProcFSTools::read_proc_starttime = sub { return 1 };
 +}
 +
 +my $fake_attach = abs_path('exec-fake-lxc-attach');
@@ -2192,18 +2236,244 @@ index 0000000..5661f4d
 +exit(0);
 diff --git a/src/test/exec-fake-lxc-attach b/src/test/exec-fake-lxc-attach
 new file mode 100755
-index 0000000..ff63547
+index 0000000..77d212b
 --- /dev/null
 +++ b/src/test/exec-fake-lxc-attach
 @@ -0,0 +1,8 @@
 +#!/bin/bash
-+# Test replacement for lxc-attach on a host without containers. It runs the arguments that
-+# follow the double dash on the test host.
++# This script replaces lxc-attach in tests. It runs the command after the double dash on
++# the test host.
 +while [[ "$1" != "--" ]]; do
 +    shift
 +done
 +shift
 +exec "$@"
+diff --git a/src/test/exec-worker-test.pl b/src/test/exec-worker-test.pl
+new file mode 100755
+index 0000000..ddb7e81
+--- /dev/null
++++ b/src/test/exec-worker-test.pl
+@@ -0,0 +1,220 @@
++#!/usr/bin/perl -T
++
++use strict;
++use warnings;
++
++use AnyEvent;
++use Cwd qw(abs_path);
++use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
++use File::Path qw(make_path remove_tree);
++use File::Temp qw(tempdir);
++use MIME::Base64 qw(decode_base64 encode_base64);
++use POSIX;
++use Test::More;
++use Time::HiRes qw();
++
++use lib qw(..);
++use PVE::API2::LXC;
++use PVE::GuestExecResult;
++use PVE::ProcFSTools;
++use PVE::RPCEnvironment;
++
++# This command reads one byte and closes its input while it is still running.
++if (@ARGV == 1) {
++    my ($path) = $ARGV[0] =~ m!\A(/[\w/.-]+)\z! or die "invalid test output path\n";
++    sysread(STDIN, my $byte, 1) == 1 or die "unable to read test input: $!\n";
++    open(my $file, '>', $path) or die "unable to save the test PID: $!\n";
++    print {$file} "$$\n";
++    close($file) or die "unable to close the test PID file: $!\n";
++    close(STDIN);
++    sleep(3);
++    POSIX::_exit(0);
++}
++
++my $vmid = 290_000_000 + $$;
++my $directory = "/run/pve/lxc-exec/$vmid";
++die "test guest already has results\n" if -e $directory;
++my $test_pid = $$;
++END { remove_tree($directory) if defined($test_pid) && $$ == $test_pid && -d $directory; }
++
++my $bin = tempdir(CLEANUP => 1);
++($bin) = $bin =~ m!\A(/[\w/.-]+)\z! or die "invalid test directory\n";
++my ($attach) = abs_path('exec-fake-lxc-attach') =~ m!\A(/[\w/.-]+)\z!
++    or die "invalid test executable\n";
++symlink($attach, "$bin/lxc-attach") or die "unable to install test lxc-attach: $!\n";
++$ENV{PATH} = "$bin:/usr/sbin:/usr/bin:/sbin:/bin";
++delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
++
++# These checks run the command against the test host without requiring an LXC guest.
++my $starttime = \&PVE::ProcFSTools::read_proc_starttime;
++{
++    no warnings qw(once redefine);
++    *PVE::LXC::Config::load_config = sub { return {} };
++    *PVE::LXC::check_running = sub { return 1 };
++}
++AnyEvent::detect();
++make_path('/var/log/pve/tasks');
++my $rpcenv = PVE::RPCEnvironment->init('priv');
++$rpcenv->set_credentials({ userid => 'root@pam' });
++my $exec = PVE::API2::LXC->map_method_by_name('exec')->{code};
++my $status = PVE::API2::LXC->map_method_by_name('exec_status')->{code};
++my $write = PVE::API2::LXC->map_method_by_name('file_write')->{code};
++
++sub records {
++    return glob("$directory/[0-9]*");
++}
++
++sub wait_for {
++    my ($check) = @_;
++    my $deadline = Time::HiRes::time() + 12;
++    while (Time::HiRes::time() < $deadline) {
++        return 1 if $check->();
++        Time::HiRes::sleep(0.02);
++    }
++    return 0;
++}
++
++sub sigchld_blocked {
++    my $current = POSIX::SigSet->new();
++    POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new(), $current)
++        or die "unable to read the signal mask: $!\n";
++    return $current->ismember(POSIX::SIGCHLD());
++}
++
++my $original_mask = sigchld_blocked();
++
++subtest 'worker setup exits before the Proxmox startup handshake' => sub {
++    local $rpcenv->{atfork} = sub { POSIX::_exit(1) };
++    my @before = records();
++    eval { $exec->({ vmid => $vmid, command => ['true'] }); };
++    like($@, qr/got no worker upid/, 'exec returns the original fork_worker error');
++    is_deeply([records()], \@before, 'the failed call does not consume a result record');
++    is(sigchld_blocked(), $original_mask, 'exec restores the signal mask after failure');
++};
++
++subtest 'the worker exits before recording its identity' => sub {
++    my @before = records();
++    no warnings 'redefine';
++    local *PVE::ProcFSTools::read_proc_starttime = sub {
++        POSIX::_exit(1) if caller eq 'PVE::GuestExecResult';
++        return $starttime->(@_);
++    };
++    eval { $exec->({ vmid => $vmid, command => ['true'] }); };
++    like($@, qr/worker exited before reserving/, 'exec reports that the startup pipe closed');
++    is_deeply([records()], \@before, 'the interrupted worker did not allocate a record');
++};
++
++subtest 'the parent fails after releasing the worker' => sub {
++    my %before = map { $_ => 1 } records();
++    {
++        no warnings 'redefine';
++        local *PVE::RPCEnvironment::log_cluster_msg = sub { die "test cluster log failure\n" };
++        eval { $exec->({ vmid => $vmid, command => ['true'] }); };
++        is($@, "test cluster log failure\n", 'exec preserves the parent exception');
++    }
++    my $completed;
++    ok(
++        wait_for(sub {
++            for my $record (records()) {
++                $completed = $record if !$before{$record} && -f "$record/status";
++            }
++            return defined($completed);
++        }),
++        'the released worker saves its result',
++    );
++    if ($completed) {
++        my ($id) = $completed =~ m!/(\d+)\z!;
++        is(
++            $status->({ vmid => $vmid, pid => $id })->{exitcode},
++            0,
++            'exec-status reads the result',
++        );
++    }
++};
++
++subtest 'a storage error prevents execution' => sub {
++    my $blocked_vmid = $vmid + 1_000_000;
++    my $blocker = "/run/pve/lxc-exec/$blocked_vmid";
++    sysopen(my $handle, $blocker, O_CREAT | O_EXCL | O_WRONLY, 0600)
++        or die "unable to create the result storage fixture: $!\n";
++    close($handle);
++    eval { $exec->({ vmid => $blocked_vmid, command => ['mkdir', "$bin/ran"] }); };
++    my $error = $@;
++    unlink($blocker) or die "unable to remove the result storage fixture: $!\n";
++    like($error, qr/unable to read guest result storage/, 'exec returns the storage error');
++    ok(!-e "$bin/ran", 'the refused command did not run');
++};
++
++subtest 'expiry verifies the worker PID and start time' => sub {
++    my $age = time() - 3 * 3600;
++    my $gate = "$bin/input";
++    POSIX::mkfifo($gate, 0600) or die "unable to create test FIFO: $!\n";
++    my $id = $exec->({ vmid => $vmid, command => ['cat', $gate] })->{pid};
++    is(sigchld_blocked(), $original_mask, 'exec restores the signal mask after success');
++    my $record = "$directory/$id";
++    ok(wait_for(sub { -f "$record/worker" }), 'the command worker records its identity');
++    utime($age, $age, $record) or die "unable to age the live reservation: $!\n";
++    my $result = eval { $status->({ vmid => $vmid, pid => $id }) };
++    is_deeply(
++        $result,
++        { exited => 0 },
++        'polling preserves a live reservation past the orphan TTL',
++    );
++    open(my $release, '>', $gate) or die "unable to open the command FIFO: $!\n";
++    print {$release} 'complete';
++    close($release) or die "unable to release the command: $!\n";
++
++    if ($result) {
++        ok(wait_for(sub { -f "$record/status" }), 'the aged worker completes');
++        my $saved = $status->({ vmid => $vmid, pid => $id });
++        is(
++            decode_base64($saved->{'out-data'}),
++            'complete',
++            'polling returns the actual command output',
++        );
++    }
++
++    my $started = $starttime->($$) or die "unable to read test process start time\n";
++    for my $case (['reused PID', $started + 1], ['abandoned', undef]) {
++        my ($label, $stamp) = @$case;
++        my $stale = PVE::GuestExecResult::reserve('lxc', $vmid);
++        my $path = "$directory/$stale";
++        if (defined($stamp)) {
++            PVE::Tools::file_set_contents("$path/worker", "$$ $stamp", 0600);
++        }
++        utime($age, $age, $path) or die "unable to age an abandoned reservation: $!\n";
++        eval { $status->({ vmid => $vmid, pid => $stale }); };
++        like($@, qr/no stored result/, "$label expires after the orphan TTL");
++    }
++};
++
++subtest 'the command closes its input while data remains' => sub {
++    my $content = encode_base64('x' x (96 * 1024), '');
++    my $pidfile = "$bin/partial-reader";
++    my $result = $exec->({
++        vmid => $vmid,
++        command => ['/usr/bin/perl', '-T', abs_path($0), $pidfile],
++        'input-data' => $content,
++    });
++    my $id = $result->{pid};
++    ok(
++        wait_for(sub { return -e "$directory/$id/status" }),
++        'the worker reports a command outcome',
++    );
++    eval { $status->({ vmid => $vmid, pid => $id }); };
++    like($@, qr/writing command input.*Broken pipe/, 'exec-status rejects partial input');
++    my ($pid) = PVE::Tools::file_get_contents($pidfile) =~ m/\A(\d+)\n\z/;
++    ok(!-e "/proc/$pid", 'the worker reaps the command');
++
++    # The real true program exits successfully without reading the file-write request.
++    symlink('/usr/bin/true', "$bin/tee")
++        or die "unable to install the early exit fixture: $!\n";
++    eval { $write->({ vmid => $vmid, file => "$bin/output", content => $content }); };
++    like(
++        $@,
++        qr/writing command input.*Broken pipe/,
++        'file-write reports its failed input delivery',
++    );
++};
++
++done_testing();
 diff --git a/src/test/hostnic-monitor-storage-test.pl b/src/test/hostnic-monitor-storage-test.pl
 new file mode 100644
 index 0000000..73ad473

@@ -62,17 +62,16 @@ index e0661738..4892a042 100644
  ];
 diff --git a/src/PVE/API2/Qemu/Guest.pm b/src/PVE/API2/Qemu/Guest.pm
 new file mode 100644
-index 00000000..958e06ee
+index 00000000..e086b2f5
 --- /dev/null
 +++ b/src/PVE/API2/Qemu/Guest.pm
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,635 @@
 +package PVE::API2::Qemu::Guest;
 +
 +use strict;
 +use warnings;
 +
 +use MIME::Base64 qw(decode_base64 encode_base64);
-+use POSIX qw(SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 +use Time::HiRes qw();
 +
 +use PVE::JSONSchema qw(get_standard_option);
@@ -278,7 +277,6 @@ index 00000000..958e06ee
 +my $run_exec_worker = sub {
 +    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 +
-+    PVE::GuestExecResult::worker_started('qemu', $vmid, $exec_id);
 +    my $status = {};
 +    my $captured = { stdout => '', stderr => '' };
 +    eval {
@@ -360,7 +358,8 @@ index 00000000..958e06ee
 +                'input-data' => {
 +                    type => 'string',
 +                    maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                    description => 'Base64 encoded data for the standard input of the command.',
++                    description =>
++                        'This field supplies standard input for the command in base64.',
 +                    optional => 1,
 +                },
 +                timeout => {
@@ -385,8 +384,8 @@ index 00000000..958e06ee
 +            properties => {
 +                pid => {
 +                    type => 'integer',
-+                    description => 'The identifier of the command for exec-status. It is a'
-+                        . ' random number, not a process ID.',
++                    description => 'This random number identifies the command for exec-status.'
++                        . ' It does not refer to an operating system process.',
 +                },
 +            },
 +        },
@@ -413,30 +412,14 @@ index 00000000..958e06ee
 +            my $command = $untaint_command->($param->{command});
 +
 +            $assert_guest_agent->($vmid);
-+            my $exec_id = PVE::GuestExecResult::reserve('qemu', $vmid);
-+
-+            # fork_worker waits for the worker with a read that a SIGCHLD from an earlier
-+            # worker interrupts, and then fails with "got no worker upid". SIGCHLD stays
-+            # blocked until fork_worker returns, and the signal arrives afterwards.
-+            my $sigchld = POSIX::SigSet->new(SIGCHLD);
-+            my $previous_signals = POSIX::SigSet->new();
-+            sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
-+                or die "unable to block SIGCHLD: $!\n";
-+            eval {
-+                $rpcenv->fork_worker(
-+                    'qmexec',
-+                    $vmid,
-+                    $authuser,
-+                    sub {
-+                        sigprocmask(SIG_UNBLOCK, $sigchld);
-+                        $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-+                    },
-+                );
-+            };
-+            my $fork_error = $@;
-+            sigprocmask(SIG_SETMASK, $previous_signals);
-+            die $fork_error if $fork_error;
-+
++            my $exec_id = PVE::GuestExecResult::start_worker(
++                $rpcenv,
++                'qemu',
++                'qmexec',
++                $vmid,
++                $authuser,
++                sub { $run_exec_worker->($vmid, $_[0], $command, $input, $timeout) },
++            );
 +            return { pid => 0 + $exec_id };
 +        },
 +    });
@@ -581,7 +564,7 @@ index 00000000..958e06ee
 +                content => {
 +                    type => 'string',
 +                    maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                    description => 'The base64 encoded content of the file.',
++                    description => 'This field contains the file contents in base64.',
 +                },
 +            },
 +        },
@@ -655,7 +638,7 @@ index 00000000..958e06ee
 +            properties => {
 +                content => {
 +                    type => 'string',
-+                    description => 'The base64 encoded content of the file.',
++                    description => 'This field contains the file contents in base64.',
 +                },
 +                truncated => {
 +                    type => 'boolean',
