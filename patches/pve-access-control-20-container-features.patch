@@ -1,0 +1,43 @@
+diff --git a/README b/README
+index 787db78..0649320 100644
+--- a/README
++++ b/README
+@@ -127,7 +127,9 @@ privileges:
+ 	VM.Config.Cloudinit: modify Cloud-init parameters
+ 	VM.Config.Disk: add/modify/remove disks
+ 	VM.Config.HWType: modify emulated hardware types
++	VM.Config.Keyctl: change the container keyctl feature flag
+ 	VM.Config.Memory: modify memory settings
++	VM.Config.Nesting: change the container nesting feature flag
+ 	VM.Config.Network: add/modify/remove network devices
+ 	VM.Config.Options: modify any other VM configuration
+ 	VM.Console: console access to VM
+diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
+index 096986d..b7ea424 100644
+--- a/src/PVE/AccessControl.pm
++++ b/src/PVE/AccessControl.pm
+@@ -1100,7 +1100,10 @@ sub delete_pool_acl {
+ # user: a normal user/customer can to that
+ my $privgroups = {
+     VM => {
+-        root => [],
++        root => [
++            'VM.Config.Nesting',
++            'VM.Config.Keyctl',
++        ],
+         admin => [
+             'VM.Config.Disk',
+             'VM.Config.CPU',
+diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
+index 283abe3..b7e8402 100755
+--- a/src/test/perm-test1.pl
++++ b/src/test/perm-test1.pl
+@@ -89,7 +89,7 @@ my $administrator_privileges = '' # comma-separated expected privileges, loosely
+     . 'Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
+     . 'User.Modify,'
+     . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
+-    . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,'
++    . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'
+     . 'VM.Config.Network,VM.Config.Options,'
+     . 'VM.Console,'
+     . 'VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'

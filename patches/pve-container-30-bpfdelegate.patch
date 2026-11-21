@@ -1,0 +1,663 @@
+diff --git a/src/PVE/API2/LXC/Config.pm b/src/PVE/API2/LXC/Config.pm
+index 6263034..2973b92 100644
+--- a/src/PVE/API2/LXC/Config.pm
++++ b/src/PVE/API2/LXC/Config.pm
+@@ -108,6 +108,7 @@ my $vm_config_perm_list = [
+     'VM.Config.Options',
+     'VM.Config.Nesting',
+     'VM.Config.Keyctl',
++    @{ PVE::AccessControl::bpf_delegate_privileges() },
+ ];
+ 
+ __PACKAGE__->register_method({
+diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
+index 10f4bc5..8627f4f 100644
+--- a/src/PVE/LXC.pm
++++ b/src/PVE/LXC.pm
+@@ -670,6 +670,31 @@ sub make_apparmor_config {
+     return $raw;
+ }
+ 
++# make_bpf_delegate_hook_config generates the lxc.hook.start-host entry.
++# Proxmox rejects this entry in a raw container config.
++# LXC splits the hook line like a shell and appends the container name, 'lxc', and
++# 'start-host' to the arguments.
++sub make_bpf_delegate_hook_config {
++    my ($conf, $vmid, $unprivileged) = @_;
++
++    return '' if !$conf->{bpfdelegate};
++
++    die "bpfdelegate requires an unprivileged container\n" if !$unprivileged;
++
++    my $delegate = PVE::LXC::Config->parse_bpf_delegate($conf->{bpfdelegate});
++
++    my $list_args = [];
++    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
++        next if !$delegate->{$kind};
++        my $kernel_list = join(':', split(/;/, $delegate->{$kind}));
++        push @$list_args, "'$kind=$kernel_list'";
++    }
++    return '' if !@$list_args;
++
++    my $program = 'use PVE::LXC; PVE::LXC::bpf_delegate_start_host(@ARGV)';
++    return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
++}
++
+ sub update_lxc_config {
+     my ($vmid, $conf) = @_;
+ 
+@@ -731,6 +756,8 @@ sub update_lxc_config {
+         $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
+     }
+ 
++    $raw .= make_bpf_delegate_hook_config($conf, $vmid, $unprivileged);
++
+     if ($unprivileged && !$features->{force_rw_sys}) {
+         # unpriv. CT default to sys:rw, but that doesn't always plays well with
+         # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
+@@ -1664,6 +1691,30 @@ sub get_changed_feature_flags {
+     return $changed;
+ }
+ 
++# This function lists the VM.Config.BPFDelegate privileges for BPF settings that the new
++# configuration adds or removes.
++sub get_changed_bpf_delegate_privileges {
++    my ($old_delegate, $new_delegate) = @_;
++
++    my $privileges = [];
++    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
++        my $old_names = {};
++        for my $name (split(/;/, $old_delegate->{$kind} // '')) {
++            $old_names->{$name} = 1;
++        }
++        my $new_names = {};
++        for my $name (split(/;/, $new_delegate->{$kind} // '')) {
++            $new_names->{$name} = 1;
++        }
++
++        for my $name (@{ PVE::AccessControl::bpf_delegate_tokens($kind) }) {
++            next if !!$old_names->{$name} == !!$new_names->{$name};
++            push @$privileges, PVE::AccessControl::bpf_delegate_privilege($kind, $name);
++        }
++    }
++    return $privileges;
++}
++
+ sub check_ct_modify_config_perm {
+     my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
+ 
+@@ -1733,6 +1784,21 @@ sub check_ct_modify_config_perm {
+             my $keyctl_changed = grep { $_ eq 'keyctl' } @$changed_features;
+             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Keyctl'])
+                 if $keyctl_changed;
++        } elsif ($opt eq 'bpfdelegate') {
++            raise_perm_exc("bpfdelegate is only allowed for unprivileged containers")
++                if !$unprivileged && !$delete;
++
++            my $old_delegate = {};
++            if (defined($oldconf) && $oldconf->{$opt}) {
++                $old_delegate = PVE::LXC::Config->parse_bpf_delegate($oldconf->{$opt});
++            }
++            my $new_delegate = {};
++            if (!$delete) {
++                $new_delegate = PVE::LXC::Config->parse_bpf_delegate($newconf->{$opt});
++            }
++
++            my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
++            $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
+         } elsif ($opt eq 'hookscript') {
+             # For now this is restricted to root@pam
+             raise_perm_exc("changing the hookscript is only allowed for root\@pam");
+@@ -2470,6 +2536,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+     ]);
+ }
+ 
++my $CLONE_FS = 0x0000_0200;
++my $SYS_PIDFD_OPEN = 434;
++my $SYS_PIDFD_GETFD = 438;
++my $BPF_DELEGATE_MOUNT_TARGET = '/sys/fs/bpf';
++my $BPF_DELEGATE_MOUNT_OPTIONS = {
++    cmds => 'delegate_cmds',
++    maps => 'delegate_maps',
++    progs => 'delegate_progs',
++    attachs => 'delegate_attachs',
++};
++
++# LXC appends arguments that are not delegation lists. Ignore those arguments.
++sub parse_bpf_delegate_hook_args {
++    my (@args) = @_;
++
++    my $lists = {};
++    for my $arg (@args) {
++        next if $arg !~ m/^(cmds|maps|progs|attachs)=([a-z0-9_:]+)\z/;
++        my ($kind, $kernel_list) = ($1, $2);
++        my $config_list = join(';', split(/:/, $kernel_list));
++        PVE::LXC::Config::verify_bpf_delegate_list($kind, $config_list);
++        $lists->{$kind} = $kernel_list;
++    }
++    return $lists;
++}
++
++# The BPF filesystem context must use the container's user namespace.
++# The child opens that context after entering the container namespaces.
++# The parent duplicates the descriptor with pidfd_getfd, sets delegate_* options,
++# and creates the mount with host privileges. It enters the container's mount
++# namespace after fsmount succeeds.
++sub bpf_delegate_mount {
++    my ($lxc_pid, $lists) = @_;
++
++    sysopen(my $ct_user_ns, "/proc/$lxc_pid/ns/user", O_RDONLY)
++        or die "failed to open user namespace of init process $lxc_pid: $!\n";
++    sysopen(my $ct_mnt_ns, "/proc/$lxc_pid/ns/mnt", O_RDONLY)
++        or die "failed to open mount namespace of init process $lxc_pid: $!\n";
++
++    pipe(my $reply_reader, my $reply_writer) or die "pipe failed: $!\n";
++    pipe(my $release_reader, my $release_writer) or die "pipe failed: $!\n";
++
++    my $child_pid = fork();
++    die "fork failed: $!\n" if !defined($child_pid);
++
++    if ($child_pid == 0) {
++        close($reply_reader);
++        close($release_writer);
++
++        my $exit_code = 1;
++        eval {
++            PVE::Tools::setns(fileno($ct_user_ns), PVE::Tools::CLONE_NEWUSER)
++                or die "failed to enter the container user namespace: $!\n";
++            PVE::Tools::setns(fileno($ct_mnt_ns), PVE::Tools::CLONE_NEWNS)
++                or die "failed to enter the container mount namespace: $!\n";
++            my $fs_context = PVE::Tools::fsopen('bpf', &FSOPEN_CLOEXEC)
++                or die "fsopen of bpf failed: $!\n";
++
++            my $reply = "fd " . fileno($fs_context) . "\n";
++            syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
++
++            # The child must stay alive until the parent duplicates the filesystem context
++            # descriptor.
++            my $unused = <$release_reader>;
++            $exit_code = 0;
++        };
++        if (my $err = $@) {
++            syswrite($reply_writer, "error $err");
++        }
++        POSIX::_exit($exit_code);
++    }
++
++    close($reply_writer);
++    close($release_reader);
++
++    my $result = eval {
++        my $reply = <$reply_reader>;
++        die "the child process exited before it opened the bpf fs context\n"
++            if !defined($reply);
++        chomp($reply);
++        die "child process: $1\n" if $reply =~ m/^error (.*)\z/;
++        die "unexpected reply '$reply' from the child process\n" if $reply !~ m/^fd (\d+)\z/;
++        my $child_fd = int($1);
++
++        my $child_pidfd = PVE::Syscall::file_handle_result(syscall($SYS_PIDFD_OPEN, $child_pid, 0))
++            or die "pidfd_open of child process $child_pid failed: $!\n";
++        my $fs_context = PVE::Syscall::file_handle_result(
++            syscall($SYS_PIDFD_GETFD, fileno($child_pidfd), $child_fd, 0),
++        ) or die "pidfd_getfd of the bpf fs context failed: $!\n";
++
++        for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
++            next if !$lists->{$kind};
++            my $option = $BPF_DELEGATE_MOUNT_OPTIONS->{$kind};
++            my $value = $lists->{$kind};
++            PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_SET_STRING, $option, $value, 0)
++                or die "fsconfig $option=$value failed: $!\n";
++        }
++        PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_CMD_CREATE, 0, 0, 0)
++            or die "fsconfig create of the bpf fs context failed: $!\n";
++        my $mount_fd = PVE::Tools::fsmount(fileno($fs_context), &FSMOUNT_CLOEXEC, 0)
++            or die "fsmount of the bpf fs context failed: $!\n";
++
++        # setns on a mount namespace needs an fs_struct that this process does not share.
++        PVE::Tools::unshare($CLONE_FS) or die "unshare of the fs_struct failed: $!\n";
++
++        # Verify the mount namespace after the helper calls setns.
++        # The helper does not report setns failures.
++        my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
++        opendir(my $host_proc_dir, '/proc/self')
++            or die "failed to open the host process directory: $!\n";
++        # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
++        # The lxc-pve-overlay-mount profile permits the BPF mount operation.
++        $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
++        chdir($host_proc_dir) or die "failed to change to the host process directory: $!\n";
++        my ($current_dev, $current_ino) = (stat('ns/mnt'))[0, 1];
++        chdir('/')
++            or die "failed to change directory within the container mount namespace: $!\n";
++        die "failed to enter the container mount namespace\n"
++            if !defined($current_ino) || $ns_dev != $current_dev || $ns_ino != $current_ino;
++
++        my $target = $BPF_DELEGATE_MOUNT_TARGET;
++        PVE::Tools::move_mount(
++            fileno($mount_fd), '', &AT_FDCWD, $target, &MOVE_MOUNT_F_EMPTY_PATH,
++        ) or die "move_mount to $target failed: $!\n";
++        1;
++    };
++    my $err = $@;
++
++    close($release_writer);
++    waitpid($child_pid, 0);
++    my $child_status = $?;
++
++    die $err if !$result;
++    die "child process exited with status $child_status\n" if $child_status != 0;
++    return;
++}
++
++# lxc.hook.start-host invokes this entry point with the container ID and configured lists.
++# A failure prints to stderr, attempts to append /run/pve/ct-<vmid>.warnings,
++# and exits with status 1.
++sub bpf_delegate_start_host {
++    my ($vmid, @args) = @_;
++
++    eval {
++        my $lxc_pid = $ENV{LXC_PID};
++        die "LXC_PID is not set\n" if !defined($lxc_pid) || $lxc_pid !~ m/^(\d+)\z/;
++        $lxc_pid = int($1);
++
++        my $lists = parse_bpf_delegate_hook_args(@args);
++        bpf_delegate_mount($lxc_pid, $lists);
++    };
++    if (my $err = $@) {
++        chomp($err);
++        my $message = "bpfdelegate: $err\n";
++        print STDERR $message;
++        if (defined($vmid) && $vmid =~ m/^(\d+)\z/) {
++            my $warnings_file = "/run/pve/ct-$1.warnings";
++            if (open(my $fh, '>>', $warnings_file)) {
++                print {$fh} $message;
++                close($fh);
++            }
++        }
++        exit(1);
++    }
++}
++
+ sub mountpoint_hotplug : prototype($$$$$) {
+     my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
+ 
+diff --git a/src/PVE/LXC/Config.pm b/src/PVE/LXC/Config.pm
+index b6eaf0b..713acb2 100644
+--- a/src/PVE/LXC/Config.pm
++++ b/src/PVE/LXC/Config.pm
+@@ -6,6 +6,7 @@ use warnings;
+ use Fcntl qw(O_RDONLY);
+ 
+ use PVE::AbstractConfig;
++use PVE::AccessControl;
+ use PVE::Cluster qw(cfs_register_file);
+ use PVE::DataCenterConfig;
+ use PVE::GuestHelpers;
+@@ -506,5 +507,80 @@ my $features_desc = {
+ };
+ 
++sub verify_bpf_delegate_list {
++    my ($kind, $value, $noerr) = @_;
++
++    my $allowed = {};
++    for my $token (PVE::AccessControl::bpf_delegate_tokens($kind)->@*) {
++        $allowed->{$token} = 1;
++    }
++
++    my $seen = {};
++    for my $token (split(/;/, $value, -1)) {
++        if (!$allowed->{$token}) {
++            return undef if $noerr;
++            die "invalid bpf delegate $kind value '$token'\n";
++        }
++        if ($seen->{$token}++) {
++            return undef if $noerr;
++            die "duplicate bpf delegate $kind value '$token'\n";
++        }
++    }
++
++    return $value;
++}
++
++PVE::JSONSchema::register_format(
++    'pve-lxc-bpf-delegate-cmds',
++    sub { return verify_bpf_delegate_list('cmds', @_) },
++);
++PVE::JSONSchema::register_format(
++    'pve-lxc-bpf-delegate-maps',
++    sub { return verify_bpf_delegate_list('maps', @_) },
++);
++PVE::JSONSchema::register_format(
++    'pve-lxc-bpf-delegate-progs',
++    sub { return verify_bpf_delegate_list('progs', @_) },
++);
++PVE::JSONSchema::register_format(
++    'pve-lxc-bpf-delegate-attachs',
++    sub { return verify_bpf_delegate_list('attachs', @_) },
++);
++
++my $bpf_delegate_desc = {
++    cmds => {
++        optional => 1,
++        type => 'string',
++        format => 'pve-lxc-bpf-delegate-cmds',
++        format_description => 'cmd;cmd;...',
++        description => "The container may execute these BPF commands using a BPF token."
++            . " Use lowercase bpf_cmd constants without the BPF_ prefix.",
++    },
++    maps => {
++        optional => 1,
++        type => 'string',
++        format => 'pve-lxc-bpf-delegate-maps',
++        format_description => 'maptype;maptype;...',
++        description => "The container may create these BPF map types using a BPF token."
++            . " Use lowercase bpf_map_type constants without the BPF_MAP_TYPE_ prefix.",
++    },
++    progs => {
++        optional => 1,
++        type => 'string',
++        format => 'pve-lxc-bpf-delegate-progs',
++        format_description => 'progtype;progtype;...',
++        description => "The container may load these BPF program types using a BPF token."
++            . " Use lowercase bpf_prog_type constants without the BPF_PROG_TYPE_ prefix.",
++    },
++    attachs => {
++        optional => 1,
++        type => 'string',
++        format => 'pve-lxc-bpf-delegate-attachs',
++        format_description => 'attachtype;attachtype;...',
++        description => "The container may use these BPF attach types using a BPF token."
++            . " Use lowercase bpf_attach_type constants without the BPF_ prefix.",
++    },
++};
++
+ my $confdesc = {
+     lock => {
+         optional => 1,
+@@ -689,6 +765,14 @@ my $confdesc = {
+         format => $features_desc,
+         description => "Allow containers access to advanced features.",
+     },
++    bpfdelegate => {
++        optional => 1,
++        type => 'string',
++        format => $bpf_delegate_desc,
++        description => "Configure BPF token delegation for unprivileged containers."
++            . " The start hook mounts bpffs at /sys/fs/bpf. The API requires the corresponding"
++            . " VM.Config.BPFDelegate privilege for each listed name added or removed.",
++    },
+     env => {
+         type => 'string',
+         description => 'The container runtime environment as NUL-separated list.'
+@@ -1600,6 +1684,12 @@ sub parse_features {
+     return PVE::JSONSchema::parse_property_string($features_desc, $data);
+ }
+ 
++sub parse_bpf_delegate {
++    my ($class, $data) = @_;
++    return {} if !$data;
++    return PVE::JSONSchema::parse_property_string($bpf_delegate_desc, $data);
++}
++
+ sub option_exists {
+     my ($class, $name) = @_;
+ 
+diff --git a/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount b/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount
+new file mode 100644
+index 0000000..2e13592
+--- /dev/null
++++ b/src/overlay-root/etc/apparmor.d/lxc-pve-overlay-mount
+@@ -0,0 +1,7 @@
++#include <tunables/global>
++
++profile lxc-pve-overlay-mount flags=(attach_disconnected) {
++  #include <abstractions/lxc/start-container>
++
++  mount options=(move),
++}
+diff --git a/src/test/Makefile b/src/test/Makefile
+index 6f852c1..fa9022f 100644
+--- a/src/test/Makefile
++++ b/src/test/Makefile
+@@ -2,7 +2,7 @@ RUN_USERNS := lxc-usernsexec -m "u:0:`id -u`:1" -m "g:0:`id -g`:1" --
+ 
+ all: test
+ 
+-test: test_setup test_snapshot test_bindmount test_idmap test_config test_raw_config_write test_exec_concurrency
++test: test_setup test_snapshot test_bindmount test_idmap test_config test_raw_config_write test_bpfdelegate test_exec_concurrency
+ 
+ test_setup: run_setup_tests.pl
+ 	if test -e /run/lock/sbuild; then \
+@@ -30,6 +30,9 @@ test_config: config_tests.pl
+ test_raw_config_write: raw_config_write_test.pl
+ 	./raw_config_write_test.pl
+ 
++test_bpfdelegate: bpfdelegate-test.pl
++	./bpfdelegate-test.pl
++
+ test_exec_concurrency: exec-concurrency-test.pl exec-worker-test.pl
+ 	./exec-concurrency-test.pl
+ 	./exec-worker-test.pl
+diff --git a/src/test/bpfdelegate-test.cfg b/src/test/bpfdelegate-test.cfg
+new file mode 100644
+index 0000000..a2fd4cb
+--- /dev/null
++++ b/src/test/bpfdelegate-test.cfg
+@@ -0,0 +1,29 @@
++user:alice@pve:1:
++user:bob@pve:1:
++user:carol@pve:1:
++user:dave@pve:1:
++
++role:bpf_full:VM.Audit,VM.Config.BPFDelegate.Cmd.ProgLoad,VM.Config.BPFDelegate.Cmd.MapCreate,VM.Config.BPFDelegate.Cmd.BtfLoad,VM.Config.BPFDelegate.Map.Hash,VM.Config.BPFDelegate.Prog.SchedCls,VM.Config.BPFDelegate.Prog.SocketFilter,VM.Config.BPFDelegate.Attach.TcxIngress,VM.Config.BPFDelegate.Attach.TcxEgress,VM.Config.BPFDelegate.Attach.CgroupInetIngress:
++role:bpf_prog_load_only:VM.Audit,VM.Config.BPFDelegate.Cmd.ProgLoad:
++role:options_only:VM.Audit,VM.Config.Options:
++role:audit_only:VM.Audit:
++
++acl:1:/vms/100:alice@pve:bpf_full:
++acl:1:/vms/100:bob@pve:bpf_prog_load_only:
++acl:1:/vms/100:carol@pve:options_only:
++acl:1:/vms/100:dave@pve:audit_only:
++
++user:erin@pve:1:
++token:erin@pve!exec::1:
++token:erin@pve!read::1:
++token:erin@pve!write::1:
++
++role:guest_all:VM.Audit,VM.Guest.Exec,VM.Guest.FileRead,VM.Guest.FileWrite:
++role:guest_exec:VM.Audit,VM.Guest.Exec:
++role:guest_read:VM.Audit,VM.Guest.FileRead:
++role:guest_write:VM.Audit,VM.Guest.FileWrite:
++
++acl:1:/vms/100:erin@pve:guest_all:
++acl:1:/vms/100:erin@pve!exec:guest_exec:
++acl:1:/vms/100:erin@pve!read:guest_read:
++acl:1:/vms/100:erin@pve!write:guest_write:
+diff --git a/src/test/bpfdelegate-test.pl b/src/test/bpfdelegate-test.pl
+new file mode 100755
+index 0000000..9012dcd
+--- /dev/null
++++ b/src/test/bpfdelegate-test.pl
+@@ -0,0 +1,182 @@
++#!/usr/bin/perl
++
++use strict;
++use warnings;
++
++use lib qw(..);
++
++use PVE::API2::LXC;
++use PVE::API2::LXC::Config;
++use PVE::LXC;
++use PVE::LXC::Config;
++use PVE::RPCEnvironment;
++
++my $rpcenv = PVE::RPCEnvironment->init('cli');
++$rpcenv->init_request(userconfig => 'bpfdelegate-test.cfg');
++
++my $vmid = 100;
++
++my $full_value = join(
++    ',',
++    'cmds=prog_load;map_create;btf_load',
++    'maps=hash',
++    'progs=sched_cls;socket_filter',
++    'attachs=tcx_ingress;tcx_egress;cgroup_inet_ingress',
++);
++
++sub check_parse_ok {
++    my ($value) = @_;
++
++    my $parsed = eval { PVE::LXC::Config->parse_bpf_delegate($value) };
++    die "value '$value' was rejected: $@" if $@;
++    print "PARSE OK:$value\n";
++    return $parsed;
++}
++
++sub check_parse_rejected {
++    my ($value) = @_;
++
++    eval { PVE::LXC::Config->parse_bpf_delegate($value) };
++    die "value '$value' was accepted\n" if !$@;
++    print "PARSE REJECTED:$value\n";
++}
++
++sub run_perm_check {
++    my ($user, $old_value, $new_value, $unprivileged) = @_;
++
++    my $oldconf = {};
++    $oldconf->{bpfdelegate} = $old_value if defined($old_value);
++    my $newconf = {};
++    my $delete = [];
++    if (defined($new_value)) {
++        $newconf->{bpfdelegate} = $new_value;
++    } else {
++        $delete = ['bpfdelegate'];
++    }
++
++    eval {
++        PVE::LXC::check_ct_modify_config_perm(
++            $rpcenv, $user, $vmid, undef, $oldconf, $newconf, $delete, $unprivileged,
++        );
++    };
++    return $@;
++}
++
++sub check_perm_ok {
++    my ($user, $old_value, $new_value, $unprivileged) = @_;
++
++    my $error = run_perm_check($user, $old_value, $new_value, $unprivileged);
++    die "unexpected permission error for $user: $error" if $error;
++    print "PERM OK:$user\n";
++}
++
++sub check_perm_denied {
++    my ($user, $old_value, $new_value, $unprivileged) = @_;
++
++    my $error = run_perm_check($user, $old_value, $new_value, $unprivileged);
++    die "permission check for $user passed\n" if !$error;
++    print "PERM DENIED:$user:$error";
++}
++
++my $parsed = check_parse_ok($full_value);
++die "unexpected parsed cmds '$parsed->{cmds}'\n"
++    if $parsed->{cmds} ne 'prog_load;map_create;btf_load';
++check_parse_ok('cmds=prog_load');
++check_parse_ok('attachs=cgroup_inet_ingress;tcx_egress');
++check_parse_rejected('cmds=any');
++check_parse_rejected('cmds=prog_load;any');
++check_parse_rejected('cmds=0x4');
++check_parse_rejected('cmds=4');
++check_parse_rejected('cmds=unspec');
++check_parse_rejected('cmds=PROG_LOAD');
++check_parse_rejected('cmds=bpf_prog_load');
++check_parse_rejected('cmds=prog_load;prog_load');
++check_parse_rejected('cmds=prog_load:map_create');
++check_parse_rejected('cmds=');
++check_parse_rejected('maps=prog_load');
++check_parse_rejected('unknown=hash');
++
++my $conf = { bpfdelegate => $full_value };
++my $hook_line = PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 1);
++my $expected_hook_line =
++    "lxc.hook.start-host = /usr/bin/perl"
++    . " -e 'use PVE::LXC; PVE::LXC::bpf_delegate_start_host(\@ARGV)'"
++    . " $vmid 'cmds=prog_load:map_create:btf_load' 'maps=hash'"
++    . " 'progs=sched_cls:socket_filter'"
++    . " 'attachs=tcx_ingress:tcx_egress:cgroup_inet_ingress'\n";
++die "unexpected hook line\nneed '$expected_hook_line'\ngot '$hook_line'\n"
++    if $hook_line ne $expected_hook_line;
++print "HOOK:$hook_line";
++
++die "a container without bpfdelegate got a hook line\n"
++    if PVE::LXC::make_bpf_delegate_hook_config({}, $vmid, 1) ne '';
++eval { PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 0) };
++die "a privileged container got a hook line\n" if !$@;
++
++check_perm_ok('root@pam', undef, $full_value, 1);
++check_perm_ok('alice@pve', undef, $full_value, 1);
++check_perm_denied('bob@pve', undef, $full_value, 1);
++check_perm_denied('carol@pve', undef, $full_value, 1);
++check_perm_denied('alice@pve', undef, $full_value, 0);
++
++check_perm_ok('bob@pve', $full_value, $full_value, 1);
++check_perm_ok('carol@pve', $full_value, $full_value, 1);
++check_perm_ok('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load', 1);
++check_perm_denied('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load;btf_load', 1);
++
++check_perm_denied('bob@pve', 'cmds=prog_load;map_create', 'cmds=prog_load', 1);
++check_perm_ok('alice@pve', $full_value, undef, 1);
++check_perm_denied('bob@pve', $full_value, undef, 1);
++check_perm_ok('bob@pve', 'cmds=prog_load', undef, 1);
++
++my $method_info = PVE::API2::LXC::Config->map_method_by_name('update_vm');
++my $api_privileges = $method_info->{permissions}->{check}->[2];
++for my $user ('bob@pve', 'carol@pve') {
++    my $allowed = $rpcenv->check_vm_perm($user, $vmid, undef, $api_privileges, 1, 1);
++    die "the API level check rejected user $user\n" if !$allowed;
++}
++my $dave_allowed = $rpcenv->check_vm_perm('dave@pve', $vmid, undef, $api_privileges, 1, 1);
++die "the API level check admitted dave\@pve\n" if $dave_allowed;
++print "API level check: " . scalar(@$api_privileges) . " privileges\n";
++
++my $guest_methods = {
++    exec => 'VM.Guest.Exec',
++    exec_status => 'VM.Guest.Exec',
++    exec_ack => 'VM.Guest.Exec',
++    file_write => 'VM.Guest.FileWrite',
++    file_read => 'VM.Guest.FileRead',
++};
++
++# Each token role has one guest privilege. The owning user has all three.
++my $guest_tokens = {
++    'erin@pve!exec' => 'VM.Guest.Exec',
++    'erin@pve!read' => 'VM.Guest.FileRead',
++    'erin@pve!write' => 'VM.Guest.FileWrite',
++};
++
++for my $name (sort keys %$guest_methods) {
++    my $info = PVE::API2::LXC->map_method_by_name($name);
++    die "method $name is not registered\n" if !$info;
++    my $check = $info->{permissions}->{check};
++
++    for my $token (sort keys %$guest_tokens) {
++        my $allowed = $rpcenv->check_vm_perm($token, $vmid, undef, $check->[2], 0, 1);
++        my $should_pass = $guest_tokens->{$token} eq $guest_methods->{$name};
++        die "token $token was rejected for $name\n" if $should_pass && !$allowed;
++        die "token $token passed for $name\n" if !$should_pass && $allowed;
++        print "GUEST PERM:$name:$token:" . ($allowed ? 'allowed' : 'denied') . "\n";
++    }
++
++    for my $user ('erin@pve', 'root@pam') {
++        die "user $user was rejected for $name\n"
++            if !$rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
++    }
++    for my $user ('alice@pve', 'dave@pve') {
++        die "user $user passed for $name\n"
++            if $rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
++    }
++}
++
++print "all tests passed\n";
++
++exit(0);
