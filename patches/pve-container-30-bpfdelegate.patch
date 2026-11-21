@@ -11,14 +11,13 @@ index 6263034..2973b92 100644
  
  __PACKAGE__->register_method({
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index 10f4bc5..8627f4f 100644
+index 10f4bc5..7beabaa 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -670,6 +670,31 @@ sub make_apparmor_config {
+@@ -670,6 +670,30 @@ sub make_apparmor_config {
      return $raw;
  }
  
-+# make_bpf_delegate_hook_config generates the lxc.hook.start-host entry.
 +# Proxmox rejects this entry in a raw container config.
 +# LXC splits the hook line like a shell and appends the container name, 'lxc', and
 +# 'start-host' to the arguments.
@@ -46,7 +45,7 @@ index 10f4bc5..8627f4f 100644
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -731,6 +756,8 @@ sub update_lxc_config {
+@@ -731,6 +755,8 @@ sub update_lxc_config {
          $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
      }
  
@@ -55,7 +54,7 @@ index 10f4bc5..8627f4f 100644
      if ($unprivileged && !$features->{force_rw_sys}) {
          # unpriv. CT default to sys:rw, but that doesn't always plays well with
          # systemd, e.g., systemd-networkd https://systemd.io/CONTAINER_INTERFACE/
-@@ -1664,6 +1691,30 @@ sub get_changed_feature_flags {
+@@ -1664,6 +1690,30 @@ sub get_changed_feature_flags {
      return $changed;
  }
  
@@ -86,7 +85,7 @@ index 10f4bc5..8627f4f 100644
  sub check_ct_modify_config_perm {
      my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
  
-@@ -1733,6 +1784,21 @@ sub check_ct_modify_config_perm {
+@@ -1733,6 +1783,21 @@ sub check_ct_modify_config_perm {
              my $keyctl_changed = grep { $_ eq 'keyctl' } @$changed_features;
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Keyctl'])
                  if $keyctl_changed;
@@ -108,7 +107,7 @@ index 10f4bc5..8627f4f 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -2470,6 +2536,172 @@ sub device_passthrough_hotplug : prototype($$$) {
+@@ -2470,6 +2535,172 @@ sub device_passthrough_hotplug : prototype($$$) {
      ]);
  }
  

@@ -11,10 +11,10 @@ index 2973b92..3f4fafa 100644
  ];
  
 diff --git a/src/PVE/LXC.pm b/src/PVE/LXC.pm
-index 8627f4f..d79e491 100644
+index 7beabaa..2bb04fa 100644
 --- a/src/PVE/LXC.pm
 +++ b/src/PVE/LXC.pm
-@@ -695,6 +695,49 @@ sub make_bpf_delegate_hook_config {
+@@ -694,6 +694,49 @@ sub make_bpf_delegate_hook_config {
      return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
  }
  
@@ -64,7 +64,7 @@ index 8627f4f..d79e491 100644
  sub update_lxc_config {
      my ($vmid, $conf) = @_;
  
-@@ -894,6 +937,8 @@ sub update_lxc_config {
+@@ -893,6 +936,8 @@ sub update_lxc_config {
          }
      }
  
@@ -73,7 +73,7 @@ index 8627f4f..d79e491 100644
      if (my $env = $conf->{env}) {
          for my $variable (split(/\0+/, $env)) {
              $raw .= "lxc.environment.runtime = $variable\n";
-@@ -1799,6 +1844,21 @@ sub check_ct_modify_config_perm {
+@@ -1798,6 +1843,21 @@ sub check_ct_modify_config_perm {
  
              my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
              $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
@@ -95,7 +95,7 @@ index 8627f4f..d79e491 100644
          } elsif ($opt eq 'hookscript') {
              # For now this is restricted to root@pam
              raise_perm_exc("changing the hookscript is only allowed for root\@pam");
-@@ -3394,12 +3454,13 @@ my sub monitor_state_change($$) {
+@@ -3393,12 +3453,13 @@ my sub monitor_state_change($$) {
          }
      }
  }
@@ -111,7 +111,7 @@ index 8627f4f..d79e491 100644
          warn "problem with monitor socket, but continuing anyway: $err\n";
      } elsif (!$success) {
          print_ct_stderr_log($vmid);
-@@ -3418,6 +3479,9 @@ sub vm_start {
+@@ -3417,6 +3478,9 @@ sub vm_start {
          $conf = PVE::LXC::Config->load_config($vmid); # update/reload
      }
  
@@ -121,7 +121,7 @@ index 8627f4f..d79e491 100644
      update_lxc_config($vmid, $conf);
  
      eval {
-@@ -3426,6 +3490,12 @@ sub vm_start {
+@@ -3425,6 +3489,12 @@ sub vm_start {
      };
      warn "lxc.idmap: $@" if $@;
  
@@ -134,7 +134,7 @@ index 8627f4f..d79e491 100644
      my $skiplock_flag_fn = "/run/lxc/skiplock-$vmid";
  
      if ($skiplock) {
-@@ -3439,9 +3509,6 @@ sub vm_start {
+@@ -3438,9 +3508,6 @@ sub vm_start {
  
      PVE::Storage::activate_volumes($storage_cfg, $vollist);
  
@@ -144,7 +144,7 @@ index 8627f4f..d79e491 100644
      unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
  
      my $is_debug = $debug || (!defined($debug) && $conf->{debug});
-@@ -3453,7 +3520,8 @@ sub vm_start {
+@@ -3452,7 +3519,8 @@ sub vm_start {
      eval {
          run_command($cmd);
  
@@ -154,7 +154,7 @@ index 8627f4f..d79e491 100644
  
          # if debug is requested, print the log it also when the start succeeded
          print_ct_stderr_log($vmid) if $is_debug;
-@@ -3462,8 +3530,25 @@ sub vm_start {
+@@ -3461,8 +3529,25 @@ sub vm_start {
      print_ct_warn_log($vmid); # always print warn log, if any
      if ($err) {
          unlink $skiplock_flag_fn;
