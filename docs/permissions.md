@@ -37,6 +37,8 @@ Every privilege below belongs to the `root` privilege group. Custom roles can li
 | `Sys.ACME.Config.Domain.Remove` | `/nodes/<node>` | Delete an `acmedomain<n>` option of the node config |
 | `Sys.KernelModules.Audit` | `/nodes/<node>` | Read the node's persistent kernel module list and loaded status |
 | `Sys.KernelModules.Modify` | `/nodes/<node>` | Set the node's persistent kernel module list and load its allowlisted modules |
+| `Sys.SRIOV.Audit` | `/nodes/<node>` | Read the desired configuration and current VF PCI addresses, MACs, drivers, and Linux names with `GET /nodes/<node>/sriov/<ifname>` |
+| `Sys.SRIOV.Modify` | `/nodes/<node>` | Apply and save an SR-IOV declaration with `PUT` or disable the managed VFs and remove the declaration with `DELETE` on the same path |
 | `Sys.HostArtifacts.Audit` | `/nodes/<node>` | Read the installed record and the live file state of a host artifact target on the node |
 | `Sys.HostArtifacts.Modify` | `/nodes/<node>` | Stage and install a host artifact on the node |
 | `Sys.HostSecrets.Modify` | `/nodes/<node>` | Set a secret field of a host artifact target on the node |

@@ -1,0 +1,125 @@
+diff --git a/README b/README
+index 1e64786..787db78 100644
+--- a/README
++++ b/README
+@@ -90,6 +90,23 @@ privileges:
+ 	Realm.Allocate: create/modify/remove authentication realms
+ 	SDN.Allocate: manage SDN configuration
+ 	SDN.Audit: view SDN configuration
++	Sys.ACME.Account.Audit: view ACME accounts
++	Sys.ACME.Account.Create: register ACME accounts
++	Sys.ACME.Account.Modify: update ACME accounts
++	Sys.ACME.Account.Remove: deactivate ACME accounts
++	Sys.ACME.Certificate.Order: order a node certificate
++	Sys.ACME.Certificate.Renew: renew a node certificate
++	Sys.ACME.Certificate.Revoke: revoke a node certificate
++	Sys.ACME.Config.Account.Modify: change the ACME account option of a node
++	Sys.ACME.Config.Audit: view the ACME options of a node
++	Sys.ACME.Config.Domain.Modify: set an ACME domain option of a node
++	Sys.ACME.Config.Domain.Remove: delete an ACME domain option of a node
++	Sys.ACME.Plugin.Audit: view ACME plugins without credentials
++	Sys.ACME.Plugin.Create: add ACME plugins
++	Sys.ACME.Plugin.Modify: change ACME plugin options except credentials
++	Sys.ACME.Plugin.Remove: delete ACME plugins
++	Sys.ACME.Plugin.Secret.Audit: view ACME plugin credentials
++	Sys.ACME.Plugin.Secret.Modify: set ACME plugin credentials
+ 	Sys.Audit: view node status/config, Corosync cluster config, and HA config
+ 	Sys.Console: console access to node
+ 	Sys.Incoming: allow incoming data streams from other clusters (experimental)
+diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
+index a4e1c36..096986d 100644
+--- a/src/PVE/AccessControl.pm
++++ b/src/PVE/AccessControl.pm
+@@ -1136,6 +1136,23 @@ my $privgroups = {
+             'Sys.Modify', # edit/change node settings
+             'Sys.Incoming', # incoming storage/guest migrations
+             'Sys.AccessNetwork', # for, e.g., downloading ISOs from any URL
++            'Sys.ACME.Account.Audit',
++            'Sys.ACME.Account.Create',
++            'Sys.ACME.Account.Modify',
++            'Sys.ACME.Account.Remove',
++            'Sys.ACME.Plugin.Audit',
++            'Sys.ACME.Plugin.Secret.Audit',
++            'Sys.ACME.Plugin.Create',
++            'Sys.ACME.Plugin.Modify',
++            'Sys.ACME.Plugin.Secret.Modify',
++            'Sys.ACME.Plugin.Remove',
++            'Sys.ACME.Certificate.Order',
++            'Sys.ACME.Certificate.Renew',
++            'Sys.ACME.Certificate.Revoke',
++            'Sys.ACME.Config.Audit',
++            'Sys.ACME.Config.Account.Modify',
++            'Sys.ACME.Config.Domain.Modify',
++            'Sys.ACME.Config.Domain.Remove',
+         ],
+         admin => [
+             'Sys.Console', 'Sys.Syslog',
+@@ -1326,6 +1343,11 @@ sub check_path {
+     my ($path) = @_;
+     return $path =~ m!^(
+ 	/
++	|/acme
++	|/acme/accounts
++	|/acme/accounts/[A-Za-z][A-Za-z0-9_\-]+
++	|/acme/plugins
++	|/acme/plugins/[A-Za-z][A-Za-z0-9_\-]+
+ 	|/access
+ 	|/access/groups
+ 	|/access/groups/[[:alnum:]\.\-\_]+
+diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
+index d323447..283abe3 100755
+--- a/src/test/perm-test1.pl
++++ b/src/test/perm-test1.pl
+@@ -70,24 +70,37 @@ check_permission(
+         . 'VM.Snapshot,VM.Snapshot.Rollback',
+ );
+ # Administrator -> Permissions.Modify!
++my $administrator_privileges = '' # comma-separated expected privileges, loosely grouped by prefix
++    . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
++    . 'Group.Allocate,'
++    . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
++    . 'Permissions.Modify,'
++    . 'Pool.Allocate,Pool.Audit,'
++    . 'Realm.Allocate,Realm.AllocateUser,'
++    . 'SDN.Allocate,SDN.Audit,SDN.Use,'
++    . 'Sys.ACME.Account.Audit,Sys.ACME.Account.Create,Sys.ACME.Account.Modify,'
++    . 'Sys.ACME.Account.Remove,'
++    . 'Sys.ACME.Certificate.Order,Sys.ACME.Certificate.Renew,Sys.ACME.Certificate.Revoke,'
++    . 'Sys.ACME.Config.Account.Modify,Sys.ACME.Config.Audit,Sys.ACME.Config.Domain.Modify,'
++    . 'Sys.ACME.Config.Domain.Remove,'
++    . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
++    . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
++    . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
++    . 'Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
++    . 'User.Modify,'
++    . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
++    . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,'
++    . 'VM.Config.Network,VM.Config.Options,'
++    . 'VM.Console,'
++    . 'VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
++    . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
++    . 'VM.Snapshot,VM.Snapshot.Rollback';
++
++my @expected_administrator_privileges = split(/,/, $administrator_privileges);
+ check_permission(
+     'alex@pve',
+     '/vms/400',
+-    '' # sorted, comma-separated expected privilege string, loosely grouped by prefix
+-        . 'Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,'
+-        . 'Group.Allocate,'
+-        . 'Mapping.Audit,Mapping.Modify,Mapping.Use,'
+-        . 'Permissions.Modify,'
+-        . 'Pool.Allocate,Pool.Audit,'
+-        . 'Realm.Allocate,Realm.AllocateUser,'
+-        . 'SDN.Allocate,SDN.Audit,SDN.Use,'
+-        . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
+-        . 'User.Modify,'
+-        . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
+-        . 'VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,'
+-        . 'VM.Console,VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileSystemMgmt,'
+-        . 'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted,VM.Migrate,VM.PowerMgmt,VM.Replicate,'
+-        . 'VM.Snapshot,VM.Snapshot.Rollback',
++    join(',', sort @expected_administrator_privileges),
+ );
+ 
+ check_roles('max@pve', '/vms/200', 'storage_manager');

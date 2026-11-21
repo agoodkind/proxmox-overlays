@@ -1,0 +1,52 @@
+diff --git a/README b/README
+index b8fa21b..d39afea 100644
+--- a/README
++++ b/README
+@@ -118,6 +118,8 @@ privileges:
+ 	Sys.KernelModules.Modify: set the persistent kernel module list of a node
+ 	Sys.Modify: create/modify/remove node network parameters
+ 	Sys.PowerMgmt: node power management (start, stop, reset, shutdown, ...)
++	Sys.SRIOV.Audit: view SR-IOV virtual functions on a node
++	Sys.SRIOV.Modify: configure SR-IOV virtual functions on a node
+ 	Sys.Syslog: view syslog
+ 	User.Modify: create/modify/remove user access and details.
+ 
+diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
+index 3232890..298409d 100644
+--- a/src/PVE/AccessControl.pm
++++ b/src/PVE/AccessControl.pm
+@@ -1272,6 +1272,8 @@ my $privgroups = {
+             'Sys.KernelModules.Audit',
+             'Sys.KernelModules.Modify',
+             'Sys.HostNIC.Use',
++            'Sys.SRIOV.Audit',
++            'Sys.SRIOV.Modify',
+             'Sys.HostArtifacts.Audit',
+             'Sys.HostArtifacts.Modify',
+             'Sys.HostSecrets.Modify',
+diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
+index d722f39..6963239 100755
+--- a/src/test/bpf-delegate-test.pl
++++ b/src/test/bpf-delegate-test.pl
+@@ -50,7 +50,7 @@ for my $rejected ('any', '0x4', 'unspec', 'prog_run', 'PROG_LOAD', 'bpf_prog_loa
+ }
+ 
+ for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite
+-    Sys.KernelModules.Audit Sys.KernelModules.Modify))
++    Sys.KernelModules.Audit Sys.KernelModules.Modify Sys.SRIOV.Audit Sys.SRIOV.Modify))
+ {
+     die "privilege '$privilege' is not registered\n"
+         if !PVE::AccessControl::verify_privname($privilege, 1);
+diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
+index 54d83bc..afe4801 100755
+--- a/src/test/perm-test1.pl
++++ b/src/test/perm-test1.pl
+@@ -87,7 +87,7 @@ my $administrator_privileges = '' # comma-separated expected privileges without
+     . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
+     . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
+     . 'Sys.HostArtifacts.Audit,Sys.HostArtifacts.Modify,Sys.HostSecrets.Modify,'
+-    . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
++    . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.SRIOV.Audit,Sys.SRIOV.Modify,Sys.Syslog,'
+     . 'User.Modify,'
+     . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
+     . 'VM.Config.Disk,VM.Config.HWType,VM.Config.HostNIC,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'

@@ -1,0 +1,53 @@
+diff --git a/README b/README
+index 07cd580..8e8e4e6 100644
+--- a/README
++++ b/README
+@@ -111,6 +111,8 @@ privileges:
+ 	Sys.Console: console access to node
+ 	Sys.HostNIC.Use: use a host network interface in a container
+ 	Sys.Incoming: allow incoming data streams from other clusters (experimental)
++	Sys.KernelModules.Audit: view the persistent kernel module list of a node
++	Sys.KernelModules.Modify: set the persistent kernel module list of a node
+ 	Sys.Modify: create/modify/remove node network parameters
+ 	Sys.PowerMgmt: node power management (start, stop, reset, shutdown, ...)
+ 	Sys.Syslog: view syslog
+diff --git a/src/PVE/AccessControl.pm b/src/PVE/AccessControl.pm
+index af48ef8..97fad33 100644
+--- a/src/PVE/AccessControl.pm
++++ b/src/PVE/AccessControl.pm
+@@ -1269,6 +1269,8 @@ my $privgroups = {
+             'Sys.ACME.Config.Account.Modify',
+             'Sys.ACME.Config.Domain.Modify',
+             'Sys.ACME.Config.Domain.Remove',
++            'Sys.KernelModules.Audit',
++            'Sys.KernelModules.Modify',
+             'Sys.HostNIC.Use',
+         ],
+         admin => [
+diff --git a/src/test/bpf-delegate-test.pl b/src/test/bpf-delegate-test.pl
+index 56631d6..d722f39 100755
+--- a/src/test/bpf-delegate-test.pl
++++ b/src/test/bpf-delegate-test.pl
+@@ -49,7 +49,8 @@ for my $rejected ('any', '0x4', 'unspec', 'prog_run', 'PROG_LOAD', 'bpf_prog_loa
+     die "name '$rejected' was accepted\n" if !$@;
+ }
+ 
+-for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite))
++for my $privilege (qw(VM.Guest.Exec VM.Guest.FileRead VM.Guest.FileWrite
++    Sys.KernelModules.Audit Sys.KernelModules.Modify))
+ {
+     die "privilege '$privilege' is not registered\n"
+         if !PVE::AccessControl::verify_privname($privilege, 1);
+diff --git a/src/test/perm-test1.pl b/src/test/perm-test1.pl
+index 9e15eda..5f44a22 100755
+--- a/src/test/perm-test1.pl
++++ b/src/test/perm-test1.pl
+@@ -86,7 +86,7 @@ my $administrator_privileges = '' # comma-separated expected privileges without
+     . 'Sys.ACME.Plugin.Audit,Sys.ACME.Plugin.Create,Sys.ACME.Plugin.Modify,'
+     . 'Sys.ACME.Plugin.Remove,Sys.ACME.Plugin.Secret.Audit,Sys.ACME.Plugin.Secret.Modify,'
+     . 'Sys.AccessNetwork,Sys.Audit,Sys.Console,'
+-    . 'Sys.HostNIC.Use,Sys.Incoming,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
++    . 'Sys.HostNIC.Use,Sys.Incoming,Sys.KernelModules.Audit,Sys.KernelModules.Modify,Sys.Modify,Sys.PowerMgmt,Sys.Syslog,'
+     . 'User.Modify,'
+     . 'VM.Allocate,VM.Audit,VM.Backup,VM.Clone,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,'
+     . 'VM.Config.Disk,VM.Config.HWType,VM.Config.HostNIC,VM.Config.Keyctl,VM.Config.Memory,VM.Config.Nesting,'

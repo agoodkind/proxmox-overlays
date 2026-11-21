@@ -9,6 +9,7 @@ use strict;
 use warnings;
 
 use Cwd qw(abs_path);
+use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Getopt::Long qw(GetOptions);
@@ -17,8 +18,7 @@ use Getopt::Long qw(GetOptions);
 # them as flat files in a directory that Debian creates, because the OpenTofu
 # file resource writes a file only into an existing directory.
 my @PATCH_GLOBS = (
-    dirname(abs_path($0)) . '/patches/*.patch',
-    '/usr/local/share/pve-overlay-*.patch',
+    dirname(abs_path($0)) . '/patches/*.patch', '/usr/local/share/pve-overlay-*.patch',
 );
 my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
@@ -32,6 +32,12 @@ my $STATE_FILE = 'var/lib/pve-overlay/installed';
 # A patch adds a host file as overlay-root/<path>, and pve-overlay installs it
 # at /<path>. Only a path below one of these directories is installed.
 my @HOST_FILE_DIRS = qw(etc/apparmor.d/);
+my %sriov_boot_files = map { $_ => 1 } qw(
+    etc/systemd/system/pve-overlay-sriov.service
+    etc/systemd/system/pve-guests.service.d/50-pve-overlay-sriov.conf
+    etc/systemd/system/pve-ha-lrm.service.d/50-pve-overlay-sriov.conf
+    usr/share/pve-overlay/sriov-restore
+);
 my $APPARMOR_DIR = 'etc/apparmor.d/';
 my $APPARMOR_ENABLED_FILE = '/sys/module/apparmor/parameters/enabled';
 
@@ -66,7 +72,8 @@ sub write_file {
 sub host_file_dir_allows {
     my ($relative_path) = @_;
     return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
-    return scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
+    return $sriov_boot_files{$relative_path}
+        || scalar(grep { index($relative_path, $_) == 0 } @HOST_FILE_DIRS);
 }
 
 # Patch files also include tests, which the installer does not install.
@@ -82,28 +89,30 @@ sub read_file_diffs {
         for my $file_diff (split(/^(?=diff --git )/m, read_file($patch_path))) {
             my $is_new = $file_diff =~ /^new file mode /m ? 1 : 0;
             if ($file_diff =~ m{^diff --git a/(?:src/)?(PVE/\S+\.pm) b/}) {
-                push @entries, {
-                    kind => 'module',
-                    relative_path => $1,
-                    source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
-                    target_path => "$target_dir/$1",
-                    diff => $file_diff,
-                    is_new => $is_new,
-                };
+                push @entries,
+                    {
+                        kind => 'module',
+                        relative_path => $1,
+                        source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
+                        target_path => "$target_dir/$1",
+                        diff => $file_diff,
+                        is_new => $is_new,
+                    };
             } elsif ($file_diff =~ m{^diff --git a/(?:src/)?overlay-root/(\S+) b/}) {
                 my $relative_path = $1;
                 die "pve-overlay: $patch_path adds $relative_path outside @HOST_FILE_DIRS\n"
                     if !host_file_dir_allows($relative_path);
                 die "pve-overlay: $patch_path changes $relative_path, and a host file must be new\n"
                     if !$is_new;
-                push @entries, {
-                    kind => 'host',
-                    relative_path => $relative_path,
-                    source_path => undef,
-                    target_path => "$host_root/$relative_path",
-                    diff => $file_diff,
-                    is_new => 1,
-                };
+                push @entries,
+                    {
+                        kind => 'host',
+                        relative_path => $relative_path,
+                        source_path => undef,
+                        target_path => "$host_root/$relative_path",
+                        diff => $file_diff,
+                        is_new => 1,
+                    };
             }
         }
     }
@@ -148,11 +157,11 @@ sub parse_hunks {
         $line = ' ' if $line eq '';
         my ($kind, $text) = (substr($line, 0, 1), substr($line, 1));
         if ($kind eq ' ' || $kind eq '-') {
-            push @{ $hunks[-1]{old} }, $text;
+            push @{ $hunks[-1]->{old} }, $text;
             $old_remaining--;
         }
         if ($kind eq ' ' || $kind eq '+') {
-            push @{ $hunks[-1]{new} }, $text;
+            push @{ $hunks[-1]->{new} }, $text;
             $new_remaining--;
         }
     }
@@ -164,16 +173,19 @@ sub parse_hunks {
 sub apply_diff {
     my ($original, $diff, $label) = @_;
 
-    my @lines = split(/\n/, $original, -1);
+    my @lines = $original eq '' ? ('') : split(/\n/, $original, -1);
     my @hunks = parse_hunks($diff);
     die "$label: the patch has no hunks\n" if !@hunks;
 
     my $line_shift = 0;
     for my $hunk (@hunks) {
-        my $index = find_block(\@lines, $hunk->{old}, $hunk->{start} - 1 + $line_shift);
+        my $old_count = scalar(@{ $hunk->{old} });
+        my $expected_index = $hunk->{start} + $line_shift;
+        $expected_index-- if $old_count;
+        my $index = find_block(\@lines, $hunk->{old}, $expected_index);
         die "$label: the hunk at line $hunk->{start} does not apply\n" if !defined($index);
-        splice(@lines, $index, scalar(@{ $hunk->{old} }), @{ $hunk->{new} });
-        $line_shift += scalar(@{ $hunk->{new} }) - scalar(@{ $hunk->{old} });
+        splice(@lines, $index, $old_count, @{ $hunk->{new} });
+        $line_shift += scalar(@{ $hunk->{new} }) - $old_count;
     }
     return join("\n", @lines);
 }
@@ -182,22 +194,27 @@ sub new_file_text {
     my ($diff, $label) = @_;
     my @hunks = parse_hunks($diff);
     die "$label: the patch of a new file needs exactly one hunk\n" if scalar(@hunks) != 1;
-    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]{old} };
-    return join("\n", @{ $hunks[0]{new} }) . "\n";
+    die "$label: the patch of a new file has old lines\n" if @{ $hunks[0]->{old} };
+    return join("\n", @{ $hunks[0]->{new} }) . "\n";
 }
 
 sub build_patched_files {
     my %patched;
     for my $entry (read_file_diffs()) {
         my $relative_path = $entry->{relative_path};
+        my $target_path = $entry->{target_path};
+        my $source_path = $entry->{source_path};
         if ($entry->{is_new}) {
+            die "$relative_path: more than one patch adds this file\n"
+                if exists($patched{$target_path});
             # A newly packaged module requires a patch against the package version.
             die "$relative_path: the patch adds a module that a package now ships\n"
-                if defined($entry->{source_path}) && -e $entry->{source_path};
-            $patched{ $entry->{target_path} } = new_file_text($entry->{diff}, $relative_path);
+                if defined($source_path) && -e $source_path;
+            $patched{$target_path} = new_file_text($entry->{diff}, $relative_path);
         } else {
-            $patched{ $entry->{target_path} } =
-                apply_diff(read_file($entry->{source_path}), $entry->{diff}, $relative_path);
+            my $original =
+                exists($patched{$target_path}) ? $patched{$target_path} : read_file($source_path);
+            $patched{$target_path} = apply_diff($original, $entry->{diff}, $relative_path);
         }
     }
     return \%patched;
@@ -220,7 +237,8 @@ sub load_apparmor_profiles {
     my @paths = apparmor_paths();
     return if !@paths;
     if (!$apparmor_enabled) {
-        warn "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
+        warn
+            "pve-overlay: The script did not load AppArmor profiles because AppArmor is disabled\n";
         return;
     }
     for my $path (@paths) {
@@ -260,12 +278,19 @@ sub parse_unit_active_since {
 sub unit_active_since {
     my ($unit) = @_;
     open(
-        my $handle, '-|', 'systemctl', 'show', "$unit.service",
-        '--property=ActiveState', '--property=ActiveEnterTimestamp', '--timestamp=unix',
-    ) or do {
-        warn "pve-overlay: systemctl show $unit.service failed\n";
-        return 0;
-    };
+        my $handle,
+        '-|',
+        'systemctl',
+        'show',
+        "$unit.service",
+        '--property=ActiveState',
+        '--property=ActiveEnterTimestamp',
+        '--timestamp=unix',
+        )
+        or do {
+            warn "pve-overlay: systemctl show $unit.service failed\n";
+            return 0;
+        };
     my @lines = <$handle>;
     if (!close($handle)) {
         warn "pve-overlay: systemctl show $unit.service failed\n";
@@ -338,6 +363,7 @@ sub is_installable_path {
     my ($path, $kind) = @_;
     return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
     return index($path, "$target_dir/PVE/") == 0 if $kind eq 'module';
+    return 1 if grep { $path eq "$host_root/$_" } keys %sriov_boot_files;
     for my $host_dir (@HOST_FILE_DIRS) {
         return 1 if index($path, "$host_root/$host_dir") == 0;
     }
@@ -364,7 +390,40 @@ sub remove_installed_path {
     return 1;
 }
 
-# Deletes every recorded path and every path that the current patches produce.
+sub require_sriov_restore {
+    my ($paths) = @_;
+    return if !grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
+    my $lockdir = "$host_root/run/lock";
+    make_path($lockdir) if !-d $lockdir;
+    open(my $lock, '>>', "$lockdir/pve-overlay-sriov.lock")
+        or die "Cannot open the SR-IOV lock: $!\n";
+    {
+        local $SIG{ALRM} = sub { die "Timed out waiting for the SR-IOV configuration lock.\n" };
+        alarm(60);
+        my $ok =
+            eval { flock($lock, LOCK_EX) or die "Cannot lock the SR-IOV configuration: $!\n"; 1 };
+        my $error = $@;
+        alarm(0);
+        die $error if !$ok;
+    }
+    my $dir = "$host_root/etc/pve-overlay/sriov";
+    return $lock if !-d $dir;
+    opendir(my $handle, $dir) or die "Cannot inspect $dir: $!\n";
+    my @saved = sort grep { /\.json\z/ } readdir($handle);
+    closedir($handle) or die "Cannot close $dir: $!\n";
+    die
+        "pve-overlay: remove the saved SR-IOV declarations through the node API before removing boot restoration: @saved\n"
+        if @saved;
+    return $lock;
+}
+
+sub reload_systemd {
+    return if !$system_mode;
+    system('systemctl', 'daemon-reload') == 0
+        or die "pve-overlay: systemctl daemon-reload failed\n";
+}
+
+# Delete all recorded and currently produced paths.
 sub remove_copies {
     my ($apparmor_enabled) = @_;
     my $paths = read_state();
@@ -373,11 +432,15 @@ sub remove_copies {
         $paths->{$path} = $produced->{$path};
     }
 
+    my $sriov_lock = require_sriov_restore($paths);
     my $removed_count = 0;
     for my $path (sort keys %$paths) {
         $removed_count += remove_installed_path($path, $paths->{$path}, $apparmor_enabled);
     }
     unlink(state_path()) if -e state_path();
+    undef $sriov_lock;
+    reload_systemd()
+        if $removed_count && grep { exists($paths->{"$host_root/$_"}) } keys %sriov_boot_files;
     return $removed_count;
 }
 
@@ -391,7 +454,8 @@ sub command_apply {
     my $patched = eval { build_patched_files() };
     if (my $error = $@) {
         # A patched copy of an older module must not shadow a newer package.
-        my $removed_count = remove_copies($apparmor_enabled);
+        my $removed_count = eval { remove_copies($apparmor_enabled) };
+        die "pve-overlay: could not apply patches: $error" . "Cleanup failed: $@" if $@;
         restart_units() if $removed_count;
         die "pve-overlay: removed the patched copies, Proxmox runs packaged modules: $error";
     }
@@ -399,6 +463,8 @@ sub command_apply {
     my $produced = produced_paths();
     my $recorded = read_state();
 
+    my %obsolete = map { $_ => $recorded->{$_} } grep { !exists($produced->{$_}) } keys %$recorded;
+    my $sriov_lock = require_sriov_restore(\%obsolete);
     my $deleted_count = 0;
     for my $path (sort keys %$recorded) {
         next if exists($produced->{$path});
@@ -423,6 +489,10 @@ sub command_apply {
         $changed_count++;
     }
     write_state($produced);
+    undef $sriov_lock;
+    reload_systemd()
+        if grep { exists($produced->{"$host_root/$_"}) || exists($obsolete{"$host_root/$_"}) }
+        keys %sriov_boot_files;
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
@@ -470,9 +540,11 @@ sub command_status {
 # Loads each module in a taint-mode Perl process and confirms that Perl
 # compiled the patched copy, not the packaged module.
 sub command_compile {
+    my %seen;
     for my $module (grep { $_->{kind} eq 'module' } read_file_diffs()) {
         my $relative_path = $module->{relative_path};
         my $target_path = $module->{target_path};
+        next if $seen{$target_path}++;
         # Taint mode rejects a module path from the command line. The program
         # text includes the path instead.
         my $program = "require q{$relative_path}; print \$INC{q{$relative_path}}";

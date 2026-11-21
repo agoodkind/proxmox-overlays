@@ -1,0 +1,89 @@
+# Proxmox Perl Style Guide perltidy configuration
+
+--standard-error-output # avoid .ERR file and send all error messages to standard error
+
+--backup-and-modify-in-place # use backup file for old and write changes in place
+--backup-file-extension='/' # skip backup file if there are no errors
+
+--converge # re-exec perltidy up to 4 times or until the output stays the same, whatever happens earlier.
+
+--maximum-level-errors=100 # avoid stopping early just because of indentation errors
+
+# Line length & Indentation
+--maximum-line-length=100    # Max line width before a break occurs
+--output-line-ending=unix # force sane line-endings
+--add-terminal-newline # always add a newline at end of file
+
+--indent-columns=4    # Indent level is 4 spaces
+--continuation-indentation=4   # Continuation indentation is 4 spaces
+#--entab-leading-whitespace=8   # Replace every 8 leading spaces with one tab
+--entab-leading-whitespace=0   # Do not replace leading spaces with tabs
+--closing-token-indentation=0  # No extra indentation for closing tokens
+
+--extended-continuation-indentation
+--minimize-continuation-indentation # needs perltidy >= 20240511
+
+# Wrapping and brackets
+# --opening-brace-always-on-right # clashes with cuddled-paren-brace-weld and causes oddities.
+--cuddled-paren-brace # needs perltidy >= 20230309
+--cuddled-paren-brace-weld # needs perltidy >= 20250311.05
+--break-open-compact-parens=w # needs perltidy >= 20250305.03
+--comma-arrow-breakpoints=1 # break at all commas after => if container is open, EXCEPT FOR one-line containers
+--maximum-fields-per-table=1 # if a list does not fit a signle line do NOT arrange it as table.
+-novalign # no vertical alignment
+
+# trailing comma options need perltidy >= 20221112
+--want-trailing-commas=b # want trailing commas for bare multi-line lists (no token after list element)
+--add-trailing-commas # actually add new trailing commas
+--delete-trailing-commas # delete those that do not match above wanted style
+--break-at-trailing-comma-types=b # break at bare trailing commas
+
+# below would be done unconditionally, which decreases readability in quite a few cases and adds
+# oddities, so comment out for now. Might be nice if this gets sort of a complexity selector, e.g.,
+# only move the token right if its for the last container in a statement and the rest of the
+# statement before the opening token fits into a single line.
+#--opening-token-right # would move opening (,[,{ directly after a comma
+
+# Spaces around parentheses and braces
+--paren-tightness=2 # no outer surrounding space for parenthesis
+--brace-tightness=1 # just the outer surrounding space for braces, but no inner ones
+--square-bracket-tightness=2 # no outer surrounding space for brackets
+
+--space-signature-paren=0 # avoid a space between the function name and the opening parens.
+
+--nospace-for-semicolon # No space before semicolon in for statements
+--nooutdent-long-quotes # Don't outdent long quotes
+--nooutdent-long-lines # rather they should be broken up over multiple lines
+
+# weld closely nested pairs of opening/closing container symbols (curly braces, brackets, or parens)
+# together. We prefer this over the older stack-opening/closing-tokens
+--weld-nested-containers
+
+--minimum-space-to-comment=1
+--nohanging-side-comments
+--noblanks-before-comments
+--ignore-side-comment-lengths # perltidy does not breaks comments, so it would also move the semicolon
+
+--nological-padding
+
+--keep-old-blank-lines=1 # keep old blank lines if the amount is smaller than max. consecutive below
+--maximum-consecutive-blank-lines=1 # hard-code the default
+
+# Control structure formatting
+--cuddled-blocks # avoid extra line for else, elsif, ...
+--cuddled-block-list=sort,map,grep # also cuddle sort, map and grep over standard else/elsif/...
+
+--keyword-group-blanks-inside
+
+--add-interbracket-arrows # needs perltidy >= 20240511
+
+--trim-pod # remove trailing whitespace from POD.
+
+# --novalign-signed-numbers # vsn is enabled by default in perltidy >= 20240511, evaluate turn off
+
+# We don't use labels a lot, and when we do, they aren't global, but rather "labeled blocks" or
+# "labeled loops" where we use `next <label>;`. Additionally, `Test::More` uses a labeled block for
+# `skip`. There, it does not make sense to outdent the label entirely.
+# If a global label is required, it should manually be outdented with `<<<` / `>>>` comments around
+# it to skip formatting.
+--no-outdent-labels

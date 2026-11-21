@@ -1,8 +1,8 @@
 diff --git a/src/PVE/API2/Qemu.pm b/src/PVE/API2/Qemu.pm
-index 922c6599..3aa2f1e9 100644
+index df4bc506..4892a042 100644
 --- a/src/PVE/API2/Qemu.pm
 +++ b/src/PVE/API2/Qemu.pm
-@@ -58,6 +58,7 @@ use PVE::Network;
+@@ -66,6 +66,7 @@ use PVE::Network;
  use PVE::Firewall;
  use PVE::API2::Firewall::VM;
  use PVE::API2::Qemu::Agent;
@@ -10,16 +10,7 @@ index 922c6599..3aa2f1e9 100644
  use PVE::API2::Qemu::HMPPerms;
  use PVE::VZDump::Plugin;
  use PVE::DataCenterConfig;
-@@ -1011,6 +1012,8 @@ my $check_vm_modify_config_perm = sub {
-             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Memory']);
-         } elsif ($hwtypeoptions->{$opt}) {
-             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HWType']);
-+        } elsif ($opt eq 'vsock') {
-+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Vsock']);
-         } elsif ($generaloptions->{$opt}) {
-             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Options']);
-             # special case for startup since it changes host behaviour
-@@ -1679,6 +1682,11 @@ __PACKAGE__->register_method({
+@@ -1813,6 +1814,11 @@ __PACKAGE__->register_method({
              { subdir => 'firewall' },
              { subdir => 'mtunnel' },
              { subdir => 'remote_migrate' },
@@ -31,7 +22,7 @@ index 922c6599..3aa2f1e9 100644
          ];
  
          return $res;
-@@ -1695,6 +1703,8 @@ __PACKAGE__->register_method({
+@@ -1829,6 +1835,8 @@ __PACKAGE__->register_method({
      path => '{vmid}/agent',
  });
  
@@ -40,39 +31,18 @@ index 922c6599..3aa2f1e9 100644
  __PACKAGE__->register_method({
      name => 'rrd',
      path => '{vmid}/rrd',
-@@ -2199,6 +2209,11 @@ my $update_vm_api = sub {
- 
-     &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [keys %$param]);
- 
-+    # revert copies the current value into $param after this point, so check it here
-+    &$check_vm_modify_config_perm(
-+        $rpcenv, $authuser, $vmid, undef, [grep { $_ eq 'vsock' } keys %$revert],
-+    );
-+
-     &$check_storage_access(
-         $rpcenv, $authuser, $storecfg, $vmid, $param, undef, $extraction_storage,
-     );
-@@ -2649,6 +2664,7 @@ my $vm_config_perm_list = [
-     'VM.Config.Memory',
-     'VM.Config.Network',
-     'VM.Config.HWType',
-+    'VM.Config.Vsock',
-     'VM.Config.Options',
-     'VM.Config.Cloudinit',
- ];
 diff --git a/src/PVE/API2/Qemu/Guest.pm b/src/PVE/API2/Qemu/Guest.pm
 new file mode 100644
-index 00000000..958e06ee
+index 00000000..e086b2f5
 --- /dev/null
 +++ b/src/PVE/API2/Qemu/Guest.pm
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,635 @@
 +package PVE::API2::Qemu::Guest;
 +
 +use strict;
 +use warnings;
 +
 +use MIME::Base64 qw(decode_base64 encode_base64);
-+use POSIX qw(SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 +use Time::HiRes qw();
 +
 +use PVE::JSONSchema qw(get_standard_option);
@@ -278,7 +248,6 @@ index 00000000..958e06ee
 +my $run_exec_worker = sub {
 +    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 +
-+    PVE::GuestExecResult::worker_started('qemu', $vmid, $exec_id);
 +    my $status = {};
 +    my $captured = { stdout => '', stderr => '' };
 +    eval {
@@ -360,7 +329,8 @@ index 00000000..958e06ee
 +                'input-data' => {
 +                    type => 'string',
 +                    maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                    description => 'Base64 encoded data for the standard input of the command.',
++                    description =>
++                        'This field supplies standard input for the command in base64.',
 +                    optional => 1,
 +                },
 +                timeout => {
@@ -385,8 +355,8 @@ index 00000000..958e06ee
 +            properties => {
 +                pid => {
 +                    type => 'integer',
-+                    description => 'The identifier of the command for exec-status. It is a'
-+                        . ' random number, not a process ID.',
++                    description => 'This random number identifies the command for exec-status.'
++                        . ' It does not refer to an operating system process.',
 +                },
 +            },
 +        },
@@ -413,30 +383,14 @@ index 00000000..958e06ee
 +            my $command = $untaint_command->($param->{command});
 +
 +            $assert_guest_agent->($vmid);
-+            my $exec_id = PVE::GuestExecResult::reserve('qemu', $vmid);
-+
-+            # fork_worker waits for the worker with a read that a SIGCHLD from an earlier
-+            # worker interrupts, and then fails with "got no worker upid". SIGCHLD stays
-+            # blocked until fork_worker returns, and the signal arrives afterwards.
-+            my $sigchld = POSIX::SigSet->new(SIGCHLD);
-+            my $previous_signals = POSIX::SigSet->new();
-+            sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
-+                or die "unable to block SIGCHLD: $!\n";
-+            eval {
-+                $rpcenv->fork_worker(
-+                    'qmexec',
-+                    $vmid,
-+                    $authuser,
-+                    sub {
-+                        sigprocmask(SIG_UNBLOCK, $sigchld);
-+                        $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-+                    },
-+                );
-+            };
-+            my $fork_error = $@;
-+            sigprocmask(SIG_SETMASK, $previous_signals);
-+            die $fork_error if $fork_error;
-+
++            my $exec_id = PVE::GuestExecResult::start_worker(
++                $rpcenv,
++                'qemu',
++                'qmexec',
++                $vmid,
++                $authuser,
++                sub { $run_exec_worker->($vmid, $_[0], $command, $input, $timeout) },
++            );
 +            return { pid => 0 + $exec_id };
 +        },
 +    });
@@ -581,7 +535,7 @@ index 00000000..958e06ee
 +                content => {
 +                    type => 'string',
 +                    maxLength => $GUEST_BASE64_MAX_LENGTH,
-+                    description => 'The base64 encoded content of the file.',
++                    description => 'This field contains the file contents in base64.',
 +                },
 +            },
 +        },
@@ -655,7 +609,7 @@ index 00000000..958e06ee
 +            properties => {
 +                content => {
 +                    type => 'string',
-+                    description => 'The base64 encoded content of the file.',
++                    description => 'This field contains the file contents in base64.',
 +                },
 +                truncated => {
 +                    type => 'boolean',
@@ -731,47 +685,6 @@ index c348af75..14c3063a 100644
  
  .PHONY: install
  install:
-diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
-index f199371d..00edea8c 100644
---- a/src/PVE/QemuServer.pm
-+++ b/src/PVE/QemuServer.pm
-@@ -544,6 +544,12 @@ args: -no-reboot -smbios 'type=0,vendor=FOO'
- NOTE: this option is for experts only.
- EODESCR
-     },
-+    vsock => {
-+        optional => 1,
-+        type => 'boolean',
-+        description => "Enable a virtio vsock device with the VM ID as its guest CID.",
-+        default => 0,
-+    },
-     tablet => {
-         optional => 1,
-         type => 'boolean',
-@@ -3297,6 +3303,11 @@ sub config_to_command {
-         push @$devices, '-device', 'vmgenid,guid=' . $conf->{vmgenid};
-     }
- 
-+    if ($conf->{vsock}) {
-+        push @$devices, '-device',
-+            "vhost-vsock-pci,id=vsock0,guest-cid=$vmid" . print_pci_addr('vsock', $arch);
-+    }
-+
-     # add usb controllers
-     my @usbcontrollers = PVE::QemuServer::USB::get_usb_controllers($conf, $arch, $machine_version);
-     push @$devices, @usbcontrollers if @usbcontrollers;
-diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
-index d7dc6121..084ac259 100644
---- a/src/PVE/QemuServer/PCI.pm
-+++ b/src/PVE/QemuServer/PCI.pm
-@@ -220,6 +220,7 @@ sub get_pci_addr_map {
-         'pci.4' => { bus => 1, addr => 28 },
-         'rng0' => { bus => 1, addr => 29 },
-         'pci.2-igd' => { bus => 1, addr => 30 }, # replaces pci.2 in case a legacy IGD device is passed through
-+        'vsock' => { bus => 1, addr => 31 },
-         'virtio6' => { bus => 2, addr => 1 },
-         'virtio7' => { bus => 2, addr => 2 },
-         'virtio8' => { bus => 2, addr => 3 },
 diff --git a/src/test/GuestTestRequest.pm b/src/test/GuestTestRequest.pm
 new file mode 100644
 index 00000000..56f56260
@@ -801,20 +714,20 @@ index 00000000..56f56260
 +
 +1;
 diff --git a/src/test/Makefile b/src/test/Makefile
-index cf589f41..badd2997 100644
+index fa14908e..bb5a214a 100644
 --- a/src/test/Makefile
 +++ b/src/test/Makefile
 @@ -1,6 +1,6 @@
  all: test
  
--test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config
-+test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_guest_permission test_guest_agent
+-test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_hotplug test_hotplug_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_memory test_agent test_raw_config_write test_api test_api_cloudinit_dump
++test: test_snapshot test_cfg_to_cmd test_cfg_to_cmd_aarch64 test_hotplug test_hotplug_aarch64 test_pci_addr_conflicts test_pci_reservation test_qemu_img_convert test_migration test_restore_config test_parse_config test_memory test_agent test_raw_config_write test_api test_api_cloudinit_dump test_guest_permission test_guest_agent
  
  test_snapshot: run_snapshot_tests.pl
  	./run_snapshot_tests.pl
-@@ -34,6 +34,12 @@ test_restore_config: run_qemu_restore_config_tests.pl
- test_parse_config: run_parse_config_tests.pl
- 	./run_parse_config_tests.pl
+@@ -57,6 +57,12 @@ test_api: run_api_tests.pl
+ test_api_cloudinit_dump: run_api_cloudinit_dump_tests.pl
+ 	./run_api_cloudinit_dump_tests.pl
  
 +test_guest_permission: guest-permission-test.pl
 +	./guest-permission-test.pl
@@ -824,13 +737,13 @@ index cf589f41..badd2997 100644
 +
  .PHONY: clean
  clean:
- 	rm -rf MigrationTest/run parse-config-output
+ 	rm -rf MigrationTest/run
 diff --git a/src/test/guest-agent-test.pl b/src/test/guest-agent-test.pl
 new file mode 100755
-index 00000000..9d842bfa
+index 00000000..545debe9
 --- /dev/null
 +++ b/src/test/guest-agent-test.pl
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,805 @@
 +#!/usr/bin/perl -T
 +
 +# qemu-ga runs commands on the test host as the test user.
@@ -885,18 +798,11 @@ index 00000000..9d842bfa
 +my $FILE_READ_LIMIT = PVE::API2::Qemu::Guest::file_read_limit();
 +
 +my $vm_config = { agent => '1' };
-+my $read_proc_starttime = \&PVE::ProcFSTools::read_proc_starttime;
 +
 +{
 +    no warnings qw(redefine once);
 +    *PVE::QemuConfig::load_config = sub { return $vm_config };
 +    *PVE::QemuServer::Helpers::vm_running_locally = sub { return 1 };
-+    # The amd64 emulator reports different worker start times during fork_worker.
-+    # Result storage reads the actual process information.
-+    *PVE::ProcFSTools::read_proc_starttime = sub {
-+        return 1 if caller eq 'PVE::RESTEnvironment';
-+        return $read_proc_starttime->(@_);
-+    };
 +}
 +
 +# The UTF-8 layer prevents Wide character in print warnings for non-ASCII qemu-ga errors.
