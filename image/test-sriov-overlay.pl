@@ -5,6 +5,7 @@ use warnings;
 
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
+use FindBin;
 use Test::More;
 
 # Use a temporary root to isolate the installed files and skip system service changes.
@@ -33,6 +34,12 @@ for my $path (@installed_paths) {
 }
 is(system($overlay_script, 'status', @overlay_options), 0,
     'Installed files match the distribution');
+
+is(
+    system($^X, '-T', "-I$host_root/etc/perl", "$FindBin::Bin/test-sriov-restore.pl"),
+    0,
+    'Restore the saved SR-IOV settings under Perl taint checks',
+);
 
 # A saved SR-IOV declaration still needs the service to restore virtual functions at boot.
 my $declaration_directory = "$host_root/etc/pve-overlay/sriov";

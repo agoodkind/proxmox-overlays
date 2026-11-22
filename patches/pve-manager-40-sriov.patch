@@ -175,10 +175,10 @@ index 73cf7879..9f409cf4 100644
  all: pvecfg.pm $(SUBDIRS)
 diff --git a/PVE/SRIOV.pm b/PVE/SRIOV.pm
 new file mode 100644
-index 00000000..a9f36d87
+index 00000000..9fdf6a32
 --- /dev/null
 +++ b/PVE/SRIOV.pm
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,647 @@
 +package PVE::SRIOV;
 +
 +use strict;
@@ -271,11 +271,15 @@ index 00000000..a9f36d87
 +    return $text;
 +}
 +
++sub unsigned_integer {
++    my ($value, $source) = @_;
++    die "Invalid integer in $source.\n" if $value !~ /\A([0-9]+)\z/;
++    return int($1);
++}
++
 +sub number {
 +    my ($path) = @_;
-+    my $value = sys_value($path);
-+    die "Invalid integer in $path.\n" if $value !~ /\A(\d+)\z/;
-+    return int($1);
++    return unsigned_integer(sys_value($path), $path);
 +}
 +
 +sub pf_device {
@@ -517,13 +521,13 @@ index 00000000..a9f36d87
 +sub normalize {
 +    my ($name, $request, $total) = @_;
 +    PVE::JSONSchema::validate($request, declaration_schema());
-+    my $count = int($request->{numvfs});
++    my $count = unsigned_integer($request->{numvfs}, 'numvfs');
 +    die "Interface $name supports $total VFs, fewer than the requested $count.\n"
 +        if $count > $total;
 +    my (%indices, %macs, %names);
 +    my @vfs;
 +    for my $item ($request->{vfs}->@*) {
-+        my $index = int($item->{index});
++        my $index = unsigned_integer($item->{index}, 'VF index');
 +        die "VF index $index exceeds the requested count $count.\n" if $index >= $count;
 +        die "Duplicate VF index $index.\n" if $indices{$index}++;
 +        my ($mac) = lc($item->{mac}) =~ /\A((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\z/;
@@ -608,20 +612,31 @@ index 00000000..a9f36d87
 +            },
 +        );
 +    }
-+    return if $driver eq 'vfio-pci';
-+    run_command(['/usr/bin/udevadm', 'settle', '--timeout=10']);
-+    my @devs;
++    settle_vf_interface($path, $current->{pci}, $vf->{ifname}) if $driver ne 'vfio-pci';
++}
++
++sub settle_vf_interface {
++    my ($path, $pci, $ifname) = @_;
 +    wait_until(
-+        "the network interface for $current->{pci}",
++        "the network interface for $pci",
 +        sub {
-+            @devs = entries("$path/net") if -d "$path/net";
++            return 0 if !-d "$path/net";
++            my @devs = entries("$path/net");
 +            return @devs == 1;
 +        },
 +    );
-+    return if !defined($vf->{ifname});
-+    my $old = port_name($devs[0]);
-+    return if $old eq $vf->{ifname};
-+    run_command(['/sbin/ip', 'link', 'set', 'dev', $old, 'name', $vf->{ifname}]);
++    run_command(['/usr/bin/udevadm', 'settle', '--timeout=10']);
++    return if !defined($ifname);
++    for (1 .. 2) {
++        my @devs = entries("$path/net");
++        die "Expected one network interface for $pci after udev settled.\n" if @devs != 1;
++        my $old = port_name($devs[0]);
++        return if $old eq $ifname;
++        run_command(['/sbin/ip', 'link', 'set', 'dev', $old, 'name', $ifname]);
++        run_command(['/usr/bin/udevadm', 'settle', '--timeout=10']);
++        return if -d "$path/net/$ifname";
++    }
++    die "VF $pci does not expose interface '$ifname' after udev settled.\n";
 +}
 +
 +sub differs {

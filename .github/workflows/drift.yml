@@ -54,3 +54,7 @@ jobs:
         env:
           TAG: ${{ steps.index.outputs.tag }}
         run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" /overlay/pve-overlay verify --no-system
+      - name: Test SR-IOV restoration
+        env:
+          TAG: ${{ steps.index.outputs.tag }}
+        run: docker run --rm --volume "$PWD:/overlay:ro" "$IMAGE:$TAG" perl /overlay/image/test-sriov-overlay.pl /overlay/pve-overlay
