@@ -1,6 +1,6 @@
 PERLTIDY ?= perltidy
 PERLTIDY_PROFILE := .perltidyrc
-PERL_SCRIPTS := pve-overlay image/prepare-installed-source.pl image/test-sriov-overlay.pl test/patch-series.t
+PERL_SCRIPTS := pve-overlay image/prepare-installed-source.pl image/test-sriov-overlay.pl image/test-sriov-restore.pl test/patch-series.t
 
 .PHONY: tidy tidy-check test
 
