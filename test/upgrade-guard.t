@@ -52,11 +52,14 @@ sub build_package {
     my ($version, $contents) = @_;
     my $directory = "$root/package-$version";
     make_path("$directory/DEBIAN", "$directory/usr/share/perl5/PVE");
-    write_text(
-        "$directory/DEBIAN/control",
-        "Package: overlay-guard-fixture\nVersion: $version\nArchitecture: all\n"
-            . "Maintainer: Test <test\@example.invalid>\nDescription: Overlay hook fixture\n",
-    );
+    my $control = <<"CONTROL";
+Package: overlay-guard-fixture
+Version: $version
+Architecture: all
+Maintainer: Test <test\@example.invalid>
+Description: Overlay hook fixture
+CONTROL
+    write_text("$directory/DEBIAN/control", $control);
     write_text("$directory/usr/share/perl5/PVE/GuardFixture.pm", $contents)
         if defined($contents);
     my ($status, $output) = run('dpkg-deb', '--build', $directory, "$root/$version.deb");
@@ -70,12 +73,15 @@ my $compatible = build_package('3', "packaged\n");
 my $missing = build_package('4', undef);
 my ($status, $output) = run('dpkg', '-i', $original);
 is($status, 0, 'install the original fixture package') or diag($output);
-write_text(
-    "$root/patches/fixture.patch",
-    "diff --git a/PVE/GuardFixture.pm b/PVE/GuardFixture.pm\n"
-        . "--- a/PVE/GuardFixture.pm\n+++ b/PVE/GuardFixture.pm\n"
-        . "@@ -1 +1 @@\n-packaged\n+overlay\n",
-);
+my $fixture_patch = <<'PATCH';
+diff --git a/PVE/GuardFixture.pm b/PVE/GuardFixture.pm
+--- a/PVE/GuardFixture.pm
++++ b/PVE/GuardFixture.pm
+@@ -1 +1 @@
+-packaged
++overlay
+PATCH
+write_text("$root/patches/fixture.patch", $fixture_patch);
 ($status, $output) = run("$root/pve-overlay", 'apply');
 is($status, 0, 'install the original overlay') or diag($output);
 my $installed = read_text('/etc/perl/PVE/GuardFixture.pm');

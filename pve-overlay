@@ -465,34 +465,38 @@ sub command_output {
 }
 
 sub read_package_actions {
-    my $version = <STDIN> // die "APT did not provide its package transaction.\n";
-    die "Expected APT hook protocol VERSION 3.\n" if $version ne "VERSION 3\n";
-    my $separator = 0;
+    my $protocol_version = <STDIN> // die "APT did not provide its package transaction.\n";
+    die "Expected APT hook protocol VERSION 3.\n" if $protocol_version ne "VERSION 3\n";
+
+    my $configuration_complete = 0;
     while (my $line = <STDIN>) {
         if ($line eq "\n") {
-            $separator = 1;
+            $configuration_complete = 1;
             last;
         }
     }
-    die "APT did not terminate its configuration section.\n" if !$separator;
+    die "APT did not terminate its configuration section.\n" if !$configuration_complete;
+
     my @actions;
     while (my $line = <STDIN>) {
         chomp($line);
         my @fields = split(/ /, $line, 9);
         die "Invalid APT package action: $line\n" if @fields != 9;
-        my ($name, $old, $old_arch, undef, $direction, $new, $new_arch, undef, $action) = @fields;
+        my ($name, $old_version, $old_architecture) = @fields[0, 1, 2];
+        my ($new_version, $new_architecture, $action) = @fields[5, 6, 8];
+
         die "Invalid APT package name or architecture: $line\n"
             if $name !~ /\A[a-z0-9][a-z0-9+.-]*\z/
-            || $old_arch !~ /\A[a-z0-9-]+\z/
-            || $new_arch !~ /\A[a-z0-9-]+\z/;
+            || $old_architecture !~ /\A[a-z0-9-]+\z/
+            || $new_architecture !~ /\A[a-z0-9-]+\z/;
         die "Unknown APT action: $line\n"
             if $action ne '**CONFIGURE**' && $action ne '**REMOVE**' && $action !~ m{\A/};
         push @actions,
             {
                 name => $name,
-                old => $old,
-                old_arch => $old_arch,
-                new => $new,
+                old_version => $old_version,
+                old_architecture => $old_architecture,
+                new_version => $new_version,
                 action => $action,
             };
     }
@@ -501,69 +505,97 @@ sub read_package_actions {
 
 sub check_package_actions {
     my (@actions) = @_;
-    my $staging = tempdir(CLEANUP => 1);
-    my %sources = map { ("$PACKAGED_MODULE_DIR/$_->{relative_path}" => 1) }
-        grep { $_->{kind} eq 'module' } read_file_diffs();
-    for my $path (keys %sources) {
-        next if !-e "$source_root$path";
-        make_path(dirname("$staging$path"));
-        copy("$source_root$path", "$staging$path") or die "Cannot stage $path: $!\n";
+    my $staging_root = tempdir(CLEANUP => 1);
+    my %module_paths;
+    for my $patch (read_file_diffs()) {
+        next if $patch->{kind} ne 'module';
+        $module_paths{"$PACKAGED_MODULE_DIR/$patch->{relative_path}"} = 1;
+    }
+
+    for my $path (keys %module_paths) {
+        my $installed_path = "$source_root$path";
+        my $staged_path = "$staging_root$path";
+        next if !-e $installed_path;
+        make_path(dirname($staged_path));
+        copy($installed_path, $staged_path) or die "Cannot stage $path: $!\n";
     }
 
     # Remove the old package's files first. An upgrade may omit a module that a patch needs.
     for my $entry (@actions) {
-        next if $entry->{action} eq '**CONFIGURE**' || $entry->{old} eq '-';
-        my $package = "$entry->{name}:$entry->{old_arch}";
+        next if $entry->{action} eq '**CONFIGURE**' || $entry->{old_version} eq '-';
+        my $package = "$entry->{name}:$entry->{old_architecture}";
         my $files = command_output('dpkg-query', '--listfiles', $package);
         for my $path (split(/\n/, $files)) {
-            next if !$sources{$path} || !-e "$staging$path";
-            unlink("$staging$path") or die "Cannot remove staged $path: $!\n";
+            my $staged_path = "$staging_root$path";
+            next if !$module_paths{$path} || !-e $staged_path;
+            unlink($staged_path) or die "Cannot remove staged $path: $!\n";
         }
     }
+
     for my $entry (@actions) {
         next if $entry->{action} =~ /\A\*\*/;
-        my $archive = tempdir(CLEANUP => 1);
-        system('dpkg-deb', '--extract', $entry->{action}, $archive) == 0
+        my $archive_root = tempdir(CLEANUP => 1);
+        system('dpkg-deb', '--extract', $entry->{action}, $archive_root) == 0
             or die "Cannot extract $entry->{action}.\n";
-        for my $path (keys %sources) {
-            next if !-e "$archive$path" && !-l "$archive$path";
-            my $resolved = abs_path("$archive$path");
+        for my $path (keys %module_paths) {
+            my $archive_path = "$archive_root$path";
+            my $staged_path = "$staging_root$path";
+            next if !-e $archive_path && !-l $archive_path;
+
+            my $resolved_path = abs_path($archive_path);
             die "Package module $path resolves outside its extracted archive.\n"
-                if !defined($resolved) || index($resolved, "$archive/") != 0;
-            make_path(dirname("$staging$path"));
-            copy("$archive$path", "$staging$path") or die "Cannot stage $path: $!\n";
+                if !defined($resolved_path) || index($resolved_path, "$archive_root/") != 0;
+            make_path(dirname($staged_path));
+            copy($archive_path, $staged_path) or die "Cannot stage $path: $!\n";
         }
     }
+
     my $installed_root = $source_root;
-    $source_root = $staging;
-    my $ok = eval { build_patched_files(); 1 };
+    $source_root = $staging_root;
+    my $patches_apply = eval {
+        build_patched_files();
+        1;
+    };
     my $error = $@;
     $source_root = $installed_root;
-    die $error if !$ok;
+    die $error if !$patches_apply;
 }
 
 sub notify_upgrade_conflict {
     my ($error, $actions) = @_;
     my $host = hostname();
-    my $packages =
-        join("\n", map { "$_->{name}: $_->{old} -> $_->{new} ($_->{action})" } @$actions);
+    my @package_changes;
+    for my $entry (@$actions) {
+        push @package_changes,
+            "$entry->{name}: $entry->{old_version} -> $entry->{new_version} ($entry->{action})";
+    }
+    my $packages = join("\n", @package_changes);
+    my $message = <<"MAIL";
+To: root
+Subject: Proxmox overlay blocked an update on $host
+Content-Type: text/plain; charset=UTF-8
+
+APT stopped before installing packages on $host.
+
+$error
+$packages
+MAIL
+
     # Proxmox forwards mail for root through its configured notification matchers.
     local $SIG{ALRM} = sub { die "Timed out submitting the conflict email.\n" };
     local $SIG{PIPE} = 'IGNORE';
     alarm(30);
-    my $ok = eval {
+    my $mail_submitted = eval {
         open(my $mail, '|-', '/usr/sbin/sendmail', '-oi', '-t')
             or die "Cannot start sendmail: $!\n";
-        print {$mail} "To: root\nSubject: Proxmox overlay blocked an update on $host\n"
-            . "Content-Type: text/plain; charset=UTF-8\n\n"
-            . "APT stopped before installing packages on $host.\n\n$error\n$packages\n"
+        print {$mail} $message
             or die "Cannot write the conflict email: $!\n";
         close($mail) or die "sendmail rejected the conflict email (status $?).\n";
         1;
     };
     my $delivery_error = $@;
     alarm(0);
-    warn "pve-overlay: $delivery_error" if !$ok;
+    warn "pve-overlay: $delivery_error" if !$mail_submitted;
 }
 
 sub command_pre_install {
