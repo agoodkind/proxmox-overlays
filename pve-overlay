@@ -11,8 +11,11 @@ use warnings;
 use Cwd qw(abs_path);
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
+use File::Copy qw(copy);
 use File::Path qw(make_path);
+use File::Temp qw(tempdir);
 use Getopt::Long qw(GetOptions);
+use Sys::Hostname qw(hostname);
 
 # The repository has the patches in a directory beside the script. A host has
 # them as flat files in a directory that Debian creates, because the OpenTofu
@@ -23,6 +26,7 @@ my @PATCH_GLOBS = (
 my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
+my $APT_HOOK_FILE = '/etc/apt/apt.conf.d/80pve-overlay';
 
 # The record lists every installed path, one line per path: "module <path>" or "host <path>".
 # The path of the record is relative to --host-root. A later run deletes a recorded path that
@@ -69,6 +73,19 @@ sub write_file {
     rename($temporary_path, $path) or die "cannot rename $temporary_path: $!\n";
 }
 
+sub render_template {
+    my ($name, $values) = @_;
+    my $script_directory = dirname(abs_path($0));
+    my $directory = '/usr/local/share/pve-overlay/templates';
+    $directory = "$script_directory/templates" if -d "$script_directory/patches";
+
+    my $template = read_file("$directory/$name");
+    $template =~ s/\{\{(\w+)\}\}/
+        $values->{$1} \/\/ die "Missing value $1 for template $name.\n"
+    /gex;
+    return $template;
+}
+
 sub host_file_dir_allows {
     my ($relative_path) = @_;
     return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
@@ -92,6 +109,7 @@ sub read_file_diffs {
                 push @entries,
                     {
                         kind => 'module',
+                        patch_path => $patch_path,
                         relative_path => $1,
                         source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
                         target_path => "$target_dir/$1",
@@ -214,7 +232,8 @@ sub build_patched_files {
         } else {
             my $original =
                 exists($patched{$target_path}) ? $patched{$target_path} : read_file($source_path);
-            $patched{$target_path} = apply_diff($original, $entry->{diff}, $relative_path);
+            $patched{$target_path} =
+                apply_diff($original, $entry->{diff}, "$entry->{patch_path}: $relative_path");
         }
     }
     return \%patched;
@@ -449,7 +468,169 @@ sub command_check {
     print "every patch applies to the modules under $source_root$PACKAGED_MODULE_DIR\n";
 }
 
+sub command_output {
+    my (@command) = @_;
+    open(my $handle, '-|', @command) or die "Cannot run @command: $!\n";
+    local $/;
+    my $output = <$handle>;
+    close($handle) or die "@command failed (status $?).\n";
+    return $output;
+}
+
+sub read_package_actions {
+    my $protocol_version = <STDIN> // die "APT did not provide its package transaction.\n";
+    die "Expected APT hook protocol VERSION 3.\n" if $protocol_version ne "VERSION 3\n";
+
+    my $configuration_complete = 0;
+    while (my $line = <STDIN>) {
+        if ($line eq "\n") {
+            $configuration_complete = 1;
+            last;
+        }
+    }
+    die "APT did not terminate its configuration section.\n" if !$configuration_complete;
+
+    my @actions;
+    while (my $line = <STDIN>) {
+        chomp($line);
+        my @fields = split(/ /, $line, 9);
+        die "Invalid APT package action: $line\n" if @fields != 9;
+        my ($name, $old_version, $old_architecture) = @fields[0, 1, 2];
+        my ($new_version, $new_architecture, $action) = @fields[5, 6, 8];
+
+        die "Invalid APT package name or architecture: $line\n"
+            if $name !~ /\A[a-z0-9][a-z0-9+.-]*\z/
+            || $old_architecture !~ /\A[a-z0-9-]+\z/
+            || $new_architecture !~ /\A[a-z0-9-]+\z/;
+        die "Unknown APT action: $line\n"
+            if $action ne '**CONFIGURE**' && $action ne '**REMOVE**' && $action !~ m{\A/};
+        push @actions,
+            {
+                name => $name,
+                old_version => $old_version,
+                old_architecture => $old_architecture,
+                new_version => $new_version,
+                action => $action,
+            };
+    }
+    return @actions;
+}
+
+sub check_package_actions {
+    my (@actions) = @_;
+    my $staging_root = tempdir(CLEANUP => 1);
+    my %module_paths;
+    for my $patch (read_file_diffs()) {
+        next if $patch->{kind} ne 'module';
+        $module_paths{"$PACKAGED_MODULE_DIR/$patch->{relative_path}"} = 1;
+    }
+
+    for my $path (keys %module_paths) {
+        my $installed_path = "$source_root$path";
+        my $staged_path = "$staging_root$path";
+        next if !-e $installed_path;
+        make_path(dirname($staged_path));
+        copy($installed_path, $staged_path) or die "Cannot stage $path: $!\n";
+    }
+
+    # Remove the old package's files first. An upgrade may omit a module that a patch needs.
+    for my $entry (@actions) {
+        next if $entry->{action} eq '**CONFIGURE**' || $entry->{old_version} eq '-';
+        my $package = "$entry->{name}:$entry->{old_architecture}";
+        my $files = command_output('dpkg-query', '--listfiles', $package);
+        for my $path (split(/\n/, $files)) {
+            my $staged_path = "$staging_root$path";
+            next if !$module_paths{$path} || !-e $staged_path;
+            unlink($staged_path) or die "Cannot remove staged $path: $!\n";
+        }
+    }
+
+    for my $entry (@actions) {
+        next if $entry->{action} =~ /\A\*\*/;
+        my $archive_root = tempdir(CLEANUP => 1);
+        system('dpkg-deb', '--extract', $entry->{action}, $archive_root) == 0
+            or die "Cannot extract $entry->{action}.\n";
+        for my $path (keys %module_paths) {
+            my $archive_path = "$archive_root$path";
+            my $staged_path = "$staging_root$path";
+            next if !-e $archive_path && !-l $archive_path;
+
+            my $resolved_path = abs_path($archive_path);
+            die "Package module $path resolves outside its extracted archive.\n"
+                if !defined($resolved_path) || index($resolved_path, "$archive_root/") != 0;
+            make_path(dirname($staged_path));
+            copy($archive_path, $staged_path) or die "Cannot stage $path: $!\n";
+        }
+    }
+
+    my $installed_root = $source_root;
+    $source_root = $staging_root;
+    my $patches_apply = eval {
+        build_patched_files();
+        1;
+    };
+    my $error = $@;
+    $source_root = $installed_root;
+    die $error if !$patches_apply;
+}
+
+sub notify_upgrade_conflict {
+    my ($error, $actions) = @_;
+    my $host = hostname();
+    my @package_changes;
+    for my $entry (@$actions) {
+        push @package_changes,
+            "$entry->{name}: $entry->{old_version} -> $entry->{new_version} ($entry->{action})";
+    }
+    my $packages = join("\n", @package_changes);
+    my $message = render_template(
+        'upgrade-conflict.eml',
+        { host => $host, error => $error, packages => $packages },
+    );
+
+    # Proxmox forwards mail for root through its configured notification matchers.
+    local $SIG{ALRM} = sub { die "Timed out submitting the conflict email.\n" };
+    local $SIG{PIPE} = 'IGNORE';
+    alarm(30);
+    my $mail_submitted = eval {
+        open(my $mail, '|-', '/usr/sbin/sendmail', '-oi', '-t')
+            or die "Cannot start sendmail: $!\n";
+        print {$mail} $message
+            or die "Cannot write the conflict email: $!\n";
+        close($mail) or die "sendmail rejected the conflict email (status $?).\n";
+        1;
+    };
+    my $delivery_error = $@;
+    alarm(0);
+    warn "pve-overlay: $delivery_error" if !$mail_submitted;
+}
+
+sub command_pre_install {
+    my @actions;
+    my $ok = eval {
+        @actions = read_package_actions();
+        check_package_actions(@actions);
+        1;
+    };
+    if (!$ok) {
+        my $error = $@;
+        warn "pve-overlay: APT upgrade blocked: $error";
+        notify_upgrade_conflict($error, \@actions);
+        die "Resolve the overlay conflict before retrying the APT transaction.\n";
+    }
+    print "pve-overlay: every patch applies to the proposed package transaction\n";
+}
+
 sub command_apply {
+    my $apt_hook;
+    if ($system_mode) {
+        my $script = abs_path($0);
+        die "The overlay executable path must not contain spaces or quotes.\n"
+            if $script !~ m{\A/[A-Za-z0-9_./-]+\z};
+        $apt_hook = render_template('apt-hook.conf', { script => $script });
+        render_template('upgrade-conflict.eml', { host => '', error => '', packages => '' });
+    }
+
     my $apparmor_enabled = apparmor_is_enabled();
     my $patched = eval { build_patched_files() };
     if (my $error = $@) {
@@ -496,6 +677,7 @@ sub command_apply {
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
+        write_file($APT_HOOK_FILE, $apt_hook);
     }
     # apparmor.service loads each profile file at boot. This call loads a new
     # or changed profile before the restarted units use it.
@@ -509,6 +691,9 @@ sub command_apply {
 sub command_remove {
     my $removed_count = remove_copies(apparmor_is_enabled());
     unlink($DPKG_HOOK_FILE) if $system_mode && -e $DPKG_HOOK_FILE;
+    unlink($APT_HOOK_FILE)
+        or die "Cannot remove $APT_HOOK_FILE: $!\n"
+        if $system_mode && -e $APT_HOOK_FILE;
     restart_units() if $removed_count;
     print "removed $removed_count patched copies\n";
 }
@@ -572,6 +757,7 @@ usage: pve-overlay <command> [options]
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process
   verify   run apply, then compile
+  pre-install  check the proposed APT transaction and mail root on a conflict
 
   --source-root DIR  read packaged modules below DIR instead of /
   --target-dir DIR   write patched copies to DIR instead of $DEFAULT_TARGET_DIR
@@ -597,6 +783,7 @@ my %commands = (
     check => \&command_check,
     compile => \&command_compile,
     verify => \&command_verify,
+    'pre-install' => \&command_pre_install,
 );
 my $handler = $commands{$command} or usage();
 
@@ -607,5 +794,5 @@ eval { $handler->() };
 if (my $error = $@) {
     warn $error;
     # dpkg aborts the package operation when a hook exits nonzero.
-    exit($hook_mode ? 0 : 1);
+    exit($hook_mode && $command ne 'pre-install' ? 0 : 1);
 }

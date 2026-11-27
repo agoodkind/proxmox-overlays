@@ -1,0 +1,5 @@
+Package: overlay-guard-fixture
+Version: {{version}}
+Architecture: all
+Maintainer: Test <test@example.invalid>
+Description: Overlay hook fixture

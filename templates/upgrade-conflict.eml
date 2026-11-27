@@ -1,0 +1,8 @@
+To: root
+Subject: Proxmox overlay blocked an update on {{host}}
+Content-Type: text/plain; charset=UTF-8
+
+APT stopped before installing packages on {{host}}.
+
+{{error}}
+{{packages}}
