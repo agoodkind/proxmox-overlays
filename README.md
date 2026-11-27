@@ -32,14 +32,16 @@ The API proxy removes backend connection headers before it builds a public respo
 
 `pve-overlay` installs AppArmor profiles and the SR-IOV boot files from `overlay-root/<path>` at `/<path>`. It loads installed profiles with `apparmor_parser` and reloads systemd after installing or removing the SR-IOV service and its dependencies. Remove saved SR-IOV declarations through the node API before removing boot restoration.
 
-A dpkg hook runs `pve-overlay apply` after each package operation. The hook builds new copies from the upgraded modules. When a patch does not apply to an upgraded module, the hook deletes all patched copies and Proxmox runs the packaged modules.
+An APT hook checks every patch against the proposed package files before installation. It accounts for modules that upgrades or removals delete. A conflict or an incomplete check stops the transaction and submits an email to root with the host, package versions, and error. Proxmox processes root mail through its configured notification matchers. Email delivery requires a working local mail service and an enabled email target.
+
+A dpkg hook rebuilds the overlays after installation. Direct dpkg commands bypass the APT check. If a change bypasses that check and breaks a patch, the dpkg hook removes the incompatible copies. The APT check verifies patch application against archive contents. It does not execute package maintenance scripts or prove runtime compatibility.
 
 ## Use it on a node
 
 Run these commands as `root` from a copy of this repository on the node. The dpkg hook runs the script from that path. Run `./pve-overlay apply` again after moving the copy.
 
 1. Run `./pve-overlay check` to test that every patch applies to the installed packages.
-2. Run `./pve-overlay apply`. The command writes the patched copies, installs the dpkg hook, and restarts `pvedaemon`, `pveproxy`, `pvestatd`, `pvescheduler`, and `pve-ha-lrm`.
+2. Run `./pve-overlay apply`. The command writes the patched copies, installs the APT and dpkg hooks, and restarts `pvedaemon`, `pveproxy`, `pvestatd`, `pvescheduler`, and `pve-ha-lrm`.
 3. Run `./pve-overlay status`. Each line must show `current`.
 
 A host can also have the files without a repository copy: the script at `/usr/local/sbin/pve-overlay` and each patch at `/usr/local/share/pve-overlay-<component>.patch`. The script reads the patches there when no `patches` directory sits beside it. OpenTofu declares the files this way in `agoodkind/configs`.

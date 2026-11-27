@@ -11,8 +11,11 @@ use warnings;
 use Cwd qw(abs_path);
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
+use File::Copy qw(copy);
 use File::Path qw(make_path);
+use File::Temp qw(tempdir);
 use Getopt::Long qw(GetOptions);
+use Sys::Hostname qw(hostname);
 
 # The repository has the patches in a directory beside the script. A host has
 # them as flat files in a directory that Debian creates, because the OpenTofu
@@ -23,6 +26,7 @@ my @PATCH_GLOBS = (
 my $PACKAGED_MODULE_DIR = '/usr/share/perl5';
 my $DEFAULT_TARGET_DIR = '/etc/perl';
 my $DPKG_HOOK_FILE = '/etc/dpkg/dpkg.cfg.d/pve-overlay';
+my $APT_HOOK_FILE = '/etc/apt/apt.conf.d/80pve-overlay';
 
 # The record lists every installed path, one line per path: "module <path>" or "host <path>".
 # The path of the record is relative to --host-root. A later run deletes a recorded path that
@@ -92,6 +96,7 @@ sub read_file_diffs {
                 push @entries,
                     {
                         kind => 'module',
+                        patch_path => $patch_path,
                         relative_path => $1,
                         source_path => "$source_root$PACKAGED_MODULE_DIR/$1",
                         target_path => "$target_dir/$1",
@@ -214,7 +219,8 @@ sub build_patched_files {
         } else {
             my $original =
                 exists($patched{$target_path}) ? $patched{$target_path} : read_file($source_path);
-            $patched{$target_path} = apply_diff($original, $entry->{diff}, $relative_path);
+            $patched{$target_path} =
+                apply_diff($original, $entry->{diff}, "$entry->{patch_path}: $relative_path");
         }
     }
     return \%patched;
@@ -449,6 +455,133 @@ sub command_check {
     print "every patch applies to the modules under $source_root$PACKAGED_MODULE_DIR\n";
 }
 
+sub command_output {
+    my (@command) = @_;
+    open(my $handle, '-|', @command) or die "Cannot run @command: $!\n";
+    local $/;
+    my $output = <$handle>;
+    close($handle) or die "@command failed (status $?).\n";
+    return $output;
+}
+
+sub read_package_actions {
+    my $version = <STDIN> // die "APT did not provide its package transaction.\n";
+    die "Expected APT hook protocol VERSION 3.\n" if $version ne "VERSION 3\n";
+    my $separator = 0;
+    while (my $line = <STDIN>) {
+        if ($line eq "\n") {
+            $separator = 1;
+            last;
+        }
+    }
+    die "APT did not terminate its configuration section.\n" if !$separator;
+    my @actions;
+    while (my $line = <STDIN>) {
+        chomp($line);
+        my @fields = split(/ /, $line, 9);
+        die "Invalid APT package action: $line\n" if @fields != 9;
+        my ($name, $old, $old_arch, undef, $direction, $new, $new_arch, undef, $action) = @fields;
+        die "Invalid APT package name or architecture: $line\n"
+            if $name !~ /\A[a-z0-9][a-z0-9+.-]*\z/
+            || $old_arch !~ /\A[a-z0-9-]+\z/
+            || $new_arch !~ /\A[a-z0-9-]+\z/;
+        die "Unknown APT action: $line\n"
+            if $action ne '**CONFIGURE**' && $action ne '**REMOVE**' && $action !~ m{\A/};
+        push @actions,
+            {
+                name => $name,
+                old => $old,
+                old_arch => $old_arch,
+                new => $new,
+                action => $action,
+            };
+    }
+    return @actions;
+}
+
+sub check_package_actions {
+    my (@actions) = @_;
+    my $staging = tempdir(CLEANUP => 1);
+    my %sources = map { ("$PACKAGED_MODULE_DIR/$_->{relative_path}" => 1) }
+        grep { $_->{kind} eq 'module' } read_file_diffs();
+    for my $path (keys %sources) {
+        next if !-e "$source_root$path";
+        make_path(dirname("$staging$path"));
+        copy("$source_root$path", "$staging$path") or die "Cannot stage $path: $!\n";
+    }
+
+    # Remove the old package's files first. An upgrade may omit a module that a patch needs.
+    for my $entry (@actions) {
+        next if $entry->{action} eq '**CONFIGURE**' || $entry->{old} eq '-';
+        my $package = "$entry->{name}:$entry->{old_arch}";
+        my $files = command_output('dpkg-query', '--listfiles', $package);
+        for my $path (split(/\n/, $files)) {
+            next if !$sources{$path} || !-e "$staging$path";
+            unlink("$staging$path") or die "Cannot remove staged $path: $!\n";
+        }
+    }
+    for my $entry (@actions) {
+        next if $entry->{action} =~ /\A\*\*/;
+        my $archive = tempdir(CLEANUP => 1);
+        system('dpkg-deb', '--extract', $entry->{action}, $archive) == 0
+            or die "Cannot extract $entry->{action}.\n";
+        for my $path (keys %sources) {
+            next if !-e "$archive$path" && !-l "$archive$path";
+            my $resolved = abs_path("$archive$path");
+            die "Package module $path resolves outside its extracted archive.\n"
+                if !defined($resolved) || index($resolved, "$archive/") != 0;
+            make_path(dirname("$staging$path"));
+            copy("$archive$path", "$staging$path") or die "Cannot stage $path: $!\n";
+        }
+    }
+    my $installed_root = $source_root;
+    $source_root = $staging;
+    my $ok = eval { build_patched_files(); 1 };
+    my $error = $@;
+    $source_root = $installed_root;
+    die $error if !$ok;
+}
+
+sub notify_upgrade_conflict {
+    my ($error, $actions) = @_;
+    my $host = hostname();
+    my $packages =
+        join("\n", map { "$_->{name}: $_->{old} -> $_->{new} ($_->{action})" } @$actions);
+    # Proxmox forwards mail for root through its configured notification matchers.
+    local $SIG{ALRM} = sub { die "Timed out submitting the conflict email.\n" };
+    local $SIG{PIPE} = 'IGNORE';
+    alarm(30);
+    my $ok = eval {
+        open(my $mail, '|-', '/usr/sbin/sendmail', '-oi', '-t')
+            or die "Cannot start sendmail: $!\n";
+        print {$mail} "To: root\nSubject: Proxmox overlay blocked an update on $host\n"
+            . "Content-Type: text/plain; charset=UTF-8\n\n"
+            . "APT stopped before installing packages on $host.\n\n$error\n$packages\n"
+            or die "Cannot write the conflict email: $!\n";
+        close($mail) or die "sendmail rejected the conflict email (status $?).\n";
+        1;
+    };
+    my $delivery_error = $@;
+    alarm(0);
+    warn "pve-overlay: $delivery_error" if !$ok;
+}
+
+sub command_pre_install {
+    my @actions;
+    my $ok = eval {
+        @actions = read_package_actions();
+        check_package_actions(@actions);
+        1;
+    };
+    if (!$ok) {
+        my $error = $@;
+        warn "pve-overlay: APT upgrade blocked: $error";
+        notify_upgrade_conflict($error, \@actions);
+        die "Resolve the overlay conflict before retrying the APT transaction.\n";
+    }
+    print "pve-overlay: every patch applies to the proposed package transaction\n";
+}
+
 sub command_apply {
     my $apparmor_enabled = apparmor_is_enabled();
     my $patched = eval { build_patched_files() };
@@ -496,6 +629,15 @@ sub command_apply {
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
+        my $script = abs_path($0);
+        die "The overlay executable path must not contain spaces or quotes.\n"
+            if $script !~ m{\A/[A-Za-z0-9_./-]+\z};
+        write_file(
+            $APT_HOOK_FILE,
+            "DPkg::Pre-Install-Pkgs { \"$script pre-install\"; };\n"
+                . "DPkg::Tools::Options::${script}::Version \"3\";\n"
+                . "DPkg::Tools::Options::${script}::InfoFD \"0\";\n",
+        );
     }
     # apparmor.service loads each profile file at boot. This call loads a new
     # or changed profile before the restarted units use it.
@@ -509,6 +651,9 @@ sub command_apply {
 sub command_remove {
     my $removed_count = remove_copies(apparmor_is_enabled());
     unlink($DPKG_HOOK_FILE) if $system_mode && -e $DPKG_HOOK_FILE;
+    unlink($APT_HOOK_FILE)
+        or die "Cannot remove $APT_HOOK_FILE: $!\n"
+        if $system_mode && -e $APT_HOOK_FILE;
     restart_units() if $removed_count;
     print "removed $removed_count patched copies\n";
 }
@@ -572,6 +717,7 @@ usage: pve-overlay <command> [options]
   check    test that every patch applies, without writing files
   compile  load every patched copy in a taint-mode Perl process
   verify   run apply, then compile
+  pre-install  check the proposed APT transaction and mail root on a conflict
 
   --source-root DIR  read packaged modules below DIR instead of /
   --target-dir DIR   write patched copies to DIR instead of $DEFAULT_TARGET_DIR
@@ -597,6 +743,7 @@ my %commands = (
     check => \&command_check,
     compile => \&command_compile,
     verify => \&command_verify,
+    'pre-install' => \&command_pre_install,
 );
 my $handler = $commands{$command} or usage();
 
@@ -607,5 +754,5 @@ eval { $handler->() };
 if (my $error = $@) {
     warn $error;
     # dpkg aborts the package operation when a hook exits nonzero.
-    exit($hook_mode ? 0 : 1);
+    exit($hook_mode && $command ne 'pre-install' ? 0 : 1);
 }
