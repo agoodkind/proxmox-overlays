@@ -11,7 +11,10 @@ plan skip_all => 'Run only in a disposable container with PVE_OVERLAY_APT_TEST=1
     if !$ENV{PVE_OVERLAY_APT_TEST};
 
 my $root = tempdir(CLEANUP => 1);
-make_path("$root/patches", '/usr/sbin');
+make_path("$root/patches", "$root/templates", '/usr/sbin');
+for my $name ('apt-hook.conf', 'upgrade-conflict.eml') {
+    copy("$FindBin::Bin/../templates/$name", "$root/templates/$name") or die $!;
+}
 copy("$FindBin::Bin/../pve-overlay", "$root/pve-overlay") or die $!;
 chmod(0755, "$root/pve-overlay") or die $!;
 copy("$FindBin::Bin/capture-mail.pl", '/usr/sbin/sendmail') or die $!;
@@ -52,13 +55,8 @@ sub build_package {
     my ($version, $contents) = @_;
     my $directory = "$root/package-$version";
     make_path("$directory/DEBIAN", "$directory/usr/share/perl5/PVE");
-    my $control = <<"CONTROL";
-Package: overlay-guard-fixture
-Version: $version
-Architecture: all
-Maintainer: Test <test\@example.invalid>
-Description: Overlay hook fixture
-CONTROL
+    my $control = read_text("$FindBin::Bin/fixtures/package.control");
+    $control =~ s/\{\{version\}\}/$version/g;
     write_text("$directory/DEBIAN/control", $control);
     write_text("$directory/usr/share/perl5/PVE/GuardFixture.pm", $contents)
         if defined($contents);
@@ -73,15 +71,7 @@ my $compatible = build_package('3', "packaged\n");
 my $missing = build_package('4', undef);
 my ($status, $output) = run('dpkg', '-i', $original);
 is($status, 0, 'install the original fixture package') or diag($output);
-my $fixture_patch = <<'PATCH';
-diff --git a/PVE/GuardFixture.pm b/PVE/GuardFixture.pm
---- a/PVE/GuardFixture.pm
-+++ b/PVE/GuardFixture.pm
-@@ -1 +1 @@
--packaged
-+overlay
-PATCH
-write_text("$root/patches/fixture.patch", $fixture_patch);
+copy("$FindBin::Bin/fixtures/module.patch", "$root/patches/fixture.patch") or die $!;
 ($status, $output) = run("$root/pve-overlay", 'apply');
 is($status, 0, 'install the original overlay') or diag($output);
 my $installed = read_text('/etc/perl/PVE/GuardFixture.pm');
@@ -125,4 +115,32 @@ is(read_text('/etc/perl/PVE/GuardFixture.pm'), $installed,
 is($status, 0, 'remove the installed overlay') or diag($output);
 ok(!-e '/etc/apt/apt.conf.d/80pve-overlay', 'remove deletes the APT hook');
 ok(!-e '/etc/dpkg/dpkg.cfg.d/pve-overlay', 'remove deletes the dpkg hook');
+
+my $installed_templates = '/usr/local/share/pve-overlay/templates';
+make_path('/usr/local/sbin', $installed_templates);
+copy("$root/pve-overlay", '/usr/local/sbin/pve-overlay') or die $!;
+chmod(0755, '/usr/local/sbin/pve-overlay') or die $!;
+copy("$root/patches/fixture.patch", '/usr/local/share/pve-overlay-fixture.patch') or die $!;
+for my $name ('apt-hook.conf', 'upgrade-conflict.eml') {
+    copy("$root/templates/$name", "$installed_templates/$name") or die $!;
+}
+($status, $output) = run('/usr/local/sbin/pve-overlay', 'apply');
+is($status, 0, 'install the overlay with templates from the shared directory') or diag($output);
+write_text('/tmp/overlay-mail', '');
+($status, $output) = run('apt-get', 'install', '-y', '--allow-downgrades', $conflicting);
+isnt($status, 0, 'the installed hook rejects a conflicting downgrade');
+like(
+    read_text('/tmp/overlay-mail'),
+    qr/overlay-guard-fixture: 3 -> 2/,
+    'the installed hook renders its external email template',
+);
+
+unlink("$installed_templates/upgrade-conflict.eml") or die $!;
+($status, $output) = run('/usr/local/sbin/pve-overlay', 'apply');
+isnt($status, 0, 'apply rejects a missing email template');
+is(
+    read_text('/etc/perl/PVE/GuardFixture.pm'),
+    $installed,
+    'a missing template leaves the installed overlay intact',
+);
 done_testing();

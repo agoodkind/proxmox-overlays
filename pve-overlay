@@ -73,6 +73,19 @@ sub write_file {
     rename($temporary_path, $path) or die "cannot rename $temporary_path: $!\n";
 }
 
+sub render_template {
+    my ($name, $values) = @_;
+    my $script_directory = dirname(abs_path($0));
+    my $directory = '/usr/local/share/pve-overlay/templates';
+    $directory = "$script_directory/templates" if -d "$script_directory/patches";
+
+    my $template = read_file("$directory/$name");
+    $template =~ s/\{\{(\w+)\}\}/
+        $values->{$1} \/\/ die "Missing value $1 for template $name.\n"
+    /gex;
+    return $template;
+}
+
 sub host_file_dir_allows {
     my ($relative_path) = @_;
     return 0 if $relative_path =~ m{(?:^|/)\.\.(?:/|\z)};
@@ -570,16 +583,10 @@ sub notify_upgrade_conflict {
             "$entry->{name}: $entry->{old_version} -> $entry->{new_version} ($entry->{action})";
     }
     my $packages = join("\n", @package_changes);
-    my $message = <<"MAIL";
-To: root
-Subject: Proxmox overlay blocked an update on $host
-Content-Type: text/plain; charset=UTF-8
-
-APT stopped before installing packages on $host.
-
-$error
-$packages
-MAIL
+    my $message = render_template(
+        'upgrade-conflict.eml',
+        { host => $host, error => $error, packages => $packages },
+    );
 
     # Proxmox forwards mail for root through its configured notification matchers.
     local $SIG{ALRM} = sub { die "Timed out submitting the conflict email.\n" };
@@ -615,6 +622,15 @@ sub command_pre_install {
 }
 
 sub command_apply {
+    my $apt_hook;
+    if ($system_mode) {
+        my $script = abs_path($0);
+        die "The overlay executable path must not contain spaces or quotes.\n"
+            if $script !~ m{\A/[A-Za-z0-9_./-]+\z};
+        $apt_hook = render_template('apt-hook.conf', { script => $script });
+        render_template('upgrade-conflict.eml', { host => '', error => '', packages => '' });
+    }
+
     my $apparmor_enabled = apparmor_is_enabled();
     my $patched = eval { build_patched_files() };
     if (my $error = $@) {
@@ -661,15 +677,7 @@ sub command_apply {
 
     if ($system_mode) {
         write_file($DPKG_HOOK_FILE, "post-invoke=" . abs_path($0) . " apply --hook\n");
-        my $script = abs_path($0);
-        die "The overlay executable path must not contain spaces or quotes.\n"
-            if $script !~ m{\A/[A-Za-z0-9_./-]+\z};
-        write_file(
-            $APT_HOOK_FILE,
-            "DPkg::Pre-Install-Pkgs { \"$script pre-install\"; };\n"
-                . "DPkg::Tools::Options::${script}::Version \"3\";\n"
-                . "DPkg::Tools::Options::${script}::InfoFD \"0\";\n",
-        );
+        write_file($APT_HOOK_FILE, $apt_hook);
     }
     # apparmor.service loads each profile file at boot. This call loads a new
     # or changed profile before the restarted units use it.

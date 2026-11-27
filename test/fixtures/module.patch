@@ -1,0 +1,6 @@
+diff --git a/PVE/GuardFixture.pm b/PVE/GuardFixture.pm
+--- a/PVE/GuardFixture.pm
++++ b/PVE/GuardFixture.pm
+@@ -1 +1 @@
+-packaged
++overlay

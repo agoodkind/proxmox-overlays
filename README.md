@@ -44,7 +44,7 @@ Run these commands as `root` from a copy of this repository on the node. The dpk
 2. Run `./pve-overlay apply`. The command writes the patched copies, installs the APT and dpkg hooks, and restarts `pvedaemon`, `pveproxy`, `pvestatd`, `pvescheduler`, and `pve-ha-lrm`.
 3. Run `./pve-overlay status`. Each line must show `current`.
 
-A host can also have the files without a repository copy: the script at `/usr/local/sbin/pve-overlay` and each patch at `/usr/local/share/pve-overlay-<component>.patch`. The script reads the patches there when no `patches` directory sits beside it. OpenTofu declares the files this way in `agoodkind/configs`.
+A host can also install the script at `/usr/local/sbin/pve-overlay`, each patch at `/usr/local/share/pve-overlay-<component>.patch`, and the contents of [templates](templates/) at `/usr/local/share/pve-overlay/templates/`. The script uses this layout when its directory does not contain a `patches` directory. Deploy the templates together with the script before running `apply`.
 
 To return to packaged modules, run `./pve-overlay remove`. Packaged `qemu-server` deletes the `vsock` line from a VM config when it rewrites that config.
 
