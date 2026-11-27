@@ -111,8 +111,7 @@ index 7beabaa..2bb04fa 100644
          warn "problem with monitor socket, but continuing anyway: $err\n";
      } elsif (!$success) {
          print_ct_stderr_log($vmid);
-@@ -3417,6 +3478,9 @@ sub vm_start {
-         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
+@@ -3418,5 +3479,8 @@ sub vm_start {
      }
  
 +    my $attachment_lock = lock_hostnics_for_start($conf);
